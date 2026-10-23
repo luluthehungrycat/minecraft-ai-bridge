@@ -25,7 +25,28 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed automatic healing repeatedly selecting golden carrots that the
+  safety-authorized HEAL action rejects. Golden carrots remain eligible for
+  ordinary auto-consumption; healing now selects only supported golden apples.
+
+- Protected in-game chat control commands with a default-deny allowlist based
+  on MCPQ event player metadata. Configure UUIDs where available, or explicit
+  authenticated player names for current MCPQ ChatEvent; `!status` and `!help`
+  remain public. An event UUID overrides name fallback. See `docs/AGENT.md`
+  for single-player setup.
+
 ### Added
+
+- Separated built-in survival reflexes from strategic controller sessions with
+  an in-process safety capability restricted to bounded mob attacks and
+  inventory-backed eating/healing. Effects now require server-confirmed item
+  consumption, item-free generic healing is denied, and combat selectors are
+  bot-relative within six blocks. Authz classifies MCPQ command-simulated
+  movement and mutations as privileged, while legacy local mode remains
+  compatible; the current Authz configuration has no `admin:world` dispatch
+  token, so those simulated actions fail closed when Authz is enabled.
 
 - Added an opt-in local AuthzService gate for the built-in Orchestrator.
   Set `authz.enabled`, `authz.steve_id`, and the finite
@@ -66,6 +87,11 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
   explicit unknown-original-time marker.
 
 ### Fixed
+
+- Fixed attack target injection by restricting targeted and untargeted
+  `/damage` selectors to curated attackable mob types. Player names,
+  selector fragments, unknown types, and protected or critical mobs are
+  rejected without issuing a command.
 
 - Fixed last-admin lockout and unusable declared scopes in the local
   AuthzService. Bootstrap can recover when no valid `admin:steves` credential
@@ -124,11 +150,10 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
   retries/body size/rate, and offline-injectable HTTP transport. Endpoints
   require HTTPS and an exact host allowlist and reject unsafe resolved IPs;
   cursor order is preserved across retries and terminal state is reconciled
-  with the journal after restart. Hostname delivery fails closed unless the
-  injected transport implements the pinned request operation and guarantees
-  use of the checked address set while preserving TLS SNI and HTTP Host; the
-  ordinary AsyncClient request path is never used and stock transports do not
-  qualify.
+  with the journal after restart. The default HTTPX pinned transport connects
+  directly to checked addresses while preserving TLS SNI and HTTP Host, with
+  environment proxies and redirects disabled; compatible custom pinned
+  transports remain injectable.
   There is no subscription management endpoint or external controller
   authorization/admin configuration integration. DNS and transport-pin errors
   remain visible and retry under the configured policy; DNS lookup uses a

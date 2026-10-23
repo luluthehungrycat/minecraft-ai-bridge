@@ -196,6 +196,25 @@ Built-in fallback decomposition plans in `goal_manager.py`:
 
 ### Chat Commands
 
+Control commands (`!goal`, `!stop`, `!goto`, `!follow`, `!come`) are denied
+unless the MCPQ chat event's player metadata matches `chat_control.allowed_uuids`
+or `chat_control.allowed_names`. A supplied UUID is authoritative: if it is
+not allowlisted, a matching name cannot override it. The current MCPQ
+ChatEvent exposes an authenticated player name but no UUID. For a single-player
+server using that API, configure the exact
+server-authenticated online-mode account name:
+
+```yaml
+chat_control:
+  allowed_names:
+    - YourMinecraftAccount
+```
+
+Names are an explicit fallback and are only trustworthy when the server
+authenticates online-mode identities. The allowlist defaults empty. `!status`
+and `!help` are public read-only commands. Formatted chat markup and sender
+strings supplied to direct dispatch never grant authority.
+
 The `chat_commands.py` parser intercepts incoming Minecraft chat messages for live agent control without restarting:
 
 | Command | Purpose |

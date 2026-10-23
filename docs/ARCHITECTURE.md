@@ -153,6 +153,20 @@ until its lease expires. Once an operator confirms the old process is stopped,
 an `admin:steves` administrator can deactivate and reactivate the Steve to
 clear the stale session and advance its fencing generation.
 
+ActionService classifies the MCPQ backend's command-simulated movement,
+block/inventory changes, combat, eating, and healing as privileged-simulated
+actions. A normal controller session cannot invoke them; they require
+`admin:world` authorization. The built-in Authz configuration does not accept
+a world-admin token yet, so enabling it intentionally denies these actions
+until that separate administrative integration exists. Local mode without
+Authz retains the legacy behavior. The safety supervisor uses a distinct,
+in-process capability for only bounded mob ATTACK, inventory-backed EAT, and
+item-limited HEAL reflexes; it does not reuse strategic controller authority,
+so session expiry or revocation does not disable those reactions. The
+capability is not exposed through a transport. It does not create a backend
+watchdog or support an administrative remote freeze; process shutdown
+(including allowlisted `!stop`) stops the supervisor.
+
 Authorization decisions are re-read from persisted state on every check.
 `steve:observe:self` and `steve:control` are Steve bound: the target must be
 the credential's Steve and persisted ownership must be active, unexpired,
@@ -254,21 +268,20 @@ again. Delivery is at least once, never exactly once.
 
 URLs must use HTTPS on port 443, contain no userinfo or fragment, and match an
 exact administrator allowlisted hostname. Literal and DNS-resolved non-global
-addresses are rejected and redirects are disabled. Hostname delivery fails
-closed unless the injected httpx transport implements the async
-`send_webhook_pinned(url, addresses, content, headers, timeout)` operation.
-The service passes the checked address set to this operation and sends through
-it directly; it never falls back to `AsyncClient`'s ordinary hostname
-resolution path. The operation must connect only to one of those exact
-addresses while retaining the original hostname for TLS SNI and HTTP `Host`.
-Stock httpx transports do not implement this contract, so hostname delivery
-with them is retried without a request and eventually dead-lettered. A custom
-transport implementation remains a trusted security boundary; the service
-cannot inspect whether it honors the contract. Offline tests use a MockTransport
-adapter whose request operation only invokes the mock handler and cannot open a
-socket. DNS failures and missing pin operations are recorded and retried under
-the configured policy without sending. Endpoint allowlisting is not
-authorization for who may configure subscriptions. External controller
+addresses are rejected, DNS answers are capped, and redirects are disabled.
+The default `HttpxPinnedTransport` tries only those checked addresses, using an
+IP-literal URL for the connection while setting the original hostname as HTTP
+`Host` and HTTPX's documented `sni_hostname` extension for TLS SNI and
+certificate hostname verification. Its HTTPX transport and client both disable
+environment proxy configuration; connection limits are one with no keep-alive,
+and a process-wide limit bounds concurrent pinned sends. Connect/read/write/pool
+plus whole-operation timeouts are bounded. Tests
+inject HTTPX `MockTransport` through the same request construction path. A
+custom `PinnedWebhookTransport` remains a trusted security boundary; the
+service cannot inspect whether an injected implementation honors its contract.
+DNS and transport errors are recorded and retried under the configured policy
+without falling back to ordinary hostname resolution. Endpoint allowlisting is
+not authorization for who may configure subscriptions. External controller
 authorization and admin configuration integration remain absent; this bounded
 local service does not complete RFC-0001 Phase C.
 
@@ -325,6 +338,12 @@ not be exposed until the
 remaining mutation paths and independent safety requirements are
 covered.
 
+At this boundary, backend command-simulated movement, world/inventory edits,
+combat, and simulated consumption/healing are classified as privileged and
+require `admin:world` under Authz; ordinary controller sessions cannot reach
+them by selecting a different ActionType. Local mode preserves existing CLI
+behavior. Safety reflexes use a distinct bounded capability described above.
+
 ### Independently scheduled preservation (safety prerequisite slice)
 
 `runtime.SafetySupervisor` periodically obtains a world observation and
@@ -341,6 +360,12 @@ requests that have not crossed the backend dispatch boundary; it re-enables
 them after the intervention is consumed. Cancellation can release that lock
 while MCPQ work in an `asyncio.to_thread` call continues, so this is not
 backend mutation fencing.
+
+The safety capability permits only bounded mob attacks and inventory-backed
+eating/healing. EAT and item-backed HEAL require a positive server response
+confirming one item was cleared before applying effects; item-free generic
+HEAL is not available through that capability. ATTACK executes at the bot and
+targets only curated attackable mob types within six blocks.
 
 This makes preservation checks independent of LLM latency while the runtime
 and backend calls remain responsive. It is not the RFC-0001 Phase C safety
