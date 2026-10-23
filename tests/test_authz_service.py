@@ -8,7 +8,9 @@ from unittest.mock import patch
 
 import pytest
 
-from minecraft_ai_bridge.runtime import AuthzService
+from minecraft_ai_bridge.minecraft.actions import ActionType
+from minecraft_ai_bridge.runtime import ActionService, AuthzService
+from tests.conftest import MockMcpqClient
 
 
 def setup_auth(tmp_path):
@@ -1161,4 +1163,155 @@ def test_persistent_owner_can_renew_without_expiry(tmp_path):
             owner_id="owner",
             expires_at=datetime.now(UTC) + timedelta(minutes=1),
         )
+    auth.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalidator", ["revoke", "expire", "transfer", "fence"])
+async def test_cached_action_replay_revalidates_controller_session(tmp_path, invalidator):
+    auth, credential, admin = setup_auth(tmp_path)
+    session = auth.acquire_session(credential.token, "s1", owner_id="owner")
+    world = MockMcpqClient()
+    service = ActionService(world, policy=auth.action_policy(session))
+
+    first = await service.execute(
+        ActionType.CHAT,
+        {"message": "recorded once"},
+        request_id="same-request",
+    )
+    assert first.success
+    assert world.chat_messages_sent == ["recorded once"]
+
+    if invalidator == "revoke":
+        auth.revoke_credential(credential.token)
+    elif invalidator == "expire":
+        auth._db.execute(
+            "UPDATE steves SET session_expires=? WHERE id=?",
+            ((datetime.now(UTC) - timedelta(seconds=1)).isoformat(), "s1"),
+        )
+    elif invalidator == "transfer":
+        auth.transfer_ownership(admin.token, "s1", new_owner_id="new-owner")
+    else:
+        auth.release_session(session)
+        auth.acquire_session(credential.token, "s1", owner_id="owner")
+
+    replay = await service.execute(
+        ActionType.CHAT,
+        {"message": "recorded once"},
+        request_id="same-request",
+    )
+    assert replay.success is False
+    assert "authorization" in replay.message or "fenced" in replay.message
+    assert world.chat_messages_sent == ["recorded once"]
+    assert service.audit_records[-1].allowed is False
+    auth.close()
+
+
+@pytest.mark.asyncio
+async def test_same_request_id_is_not_replayed_to_another_controller(tmp_path):
+    auth, first_credential, admin = setup_auth(tmp_path)
+    auth.register_steve("s2", ownership_mode="persistent", owner_id="peer", admin_token=admin.token)
+    second_credential = auth.create_credential(
+        "s2", "peer", {"steve:control"}, admin_token=admin.token
+    )
+    first_session = auth.acquire_session(first_credential.token, "s1", owner_id="owner")
+    current_session = [first_session]
+
+    def policy(request):
+        return auth.action_policy(current_session[0])(request)
+
+    world = MockMcpqClient()
+    service = ActionService(world, policy=policy)
+    first = await service.execute(
+        ActionType.CHAT,
+        {"message": "private result"},
+        request_id="reused-id",
+    )
+    assert first.success
+    auth.release_session(first_session)
+    second_session = auth.acquire_session(second_credential.token, "s2", owner_id="peer")
+    current_session[0] = second_session
+
+    replay = await service.execute(
+        ActionType.CHAT,
+        {"message": "private result"},
+        request_id="reused-id",
+    )
+    assert replay.success is False
+    assert "another authorized identity" in replay.message
+    assert "private result" not in replay.message
+    assert world.chat_messages_sent == ["private result"]
+    auth.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "action",
+    [
+        ActionType.MOVE_TO,
+        ActionType.MOVE_FORWARD,
+        ActionType.MOVE_BACK,
+        ActionType.WALK_TO,
+        ActionType.TURN_LEFT,
+        ActionType.TURN_RIGHT,
+        ActionType.JUMP,
+        ActionType.SPRINT,
+        ActionType.TELEPORT,
+        ActionType.BREAK_BLOCK,
+        ActionType.PLACE_BLOCK,
+        ActionType.INTERACT,
+        ActionType.EQUIP_ITEM,
+        ActionType.EQUIP_BEST_WEAPON,
+        ActionType.CRAFT_ITEM,
+        ActionType.DROP_ITEM,
+        ActionType.EAT,
+        ActionType.HEAL,
+        ActionType.ATTACK,
+    ],
+)
+async def test_control_session_cannot_run_privileged_simulated_action(tmp_path, action):
+    auth, credential, _admin = setup_auth(tmp_path)
+    session = auth.acquire_session(credential.token, "s1", owner_id="owner")
+    world = MockMcpqClient()
+    service = ActionService(world, policy=auth.action_policy(session))
+
+    result = await service.execute(action, {})
+
+    assert result.success is False
+    assert "admin:world" in result.message
+    assert world.commands_ran == []
+    auth.close()
+
+
+@pytest.mark.asyncio
+async def test_narrow_safety_authority_survives_controller_expiry(tmp_path):
+    auth, credential, _admin = setup_auth(tmp_path)
+    session = auth.acquire_session(credential.token, "s1", owner_id="owner")
+    auth._db.execute(
+        "UPDATE steves SET session_expires=? WHERE id='s1'",
+        ((datetime.now(UTC) - timedelta(seconds=1)).isoformat(),),
+    )
+    world = MockMcpqClient()
+    safety_authority = object()
+    service = ActionService(
+        world,
+        policy=auth.action_policy(session),
+        safety_authority=safety_authority,
+    )
+
+    heal = await service.execute(
+        ActionType.HEAL,
+        {"heal_item": "golden_apple"},
+        safety_authority=safety_authority,
+    )
+    place = await service.execute(
+        ActionType.PLACE_BLOCK,
+        {"x": 1, "y": 64, "z": 1, "block_type": "stone"},
+        safety_authority=safety_authority,
+    )
+
+    assert heal.success
+    assert any("effect give AIBot regeneration" in command for command in world.commands_ran)
+    assert place.success is False
+    assert not any("setblock" in command for command in world.commands_ran)
     auth.close()

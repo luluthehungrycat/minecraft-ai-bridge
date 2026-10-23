@@ -1450,32 +1450,38 @@ async def _eat(mc: WorldAdapter, params: dict) -> ActionResult:
 
     hunger_restored, saturation = _food_value(bare)
 
-    # Step 1: equip the food (best-effort — if the slot lookup fails
-    # we still apply the saturation effect to restore hunger).
-    slot = params.get("slot")
-    if slot is not None:
-        with contextlib.suppress(Exception):
-            await execute_action(
-                mc,
-                ActionType.EQUIP_ITEM,
-                {"slot": int(slot)},
-            )
+    if not await _consume_one_item(mc, bare):
+        return ActionResult(
+            success=False,
+            action=ActionType.EAT,
+            message=f"Could not verify consuming one {bare}; no hunger effect was applied.",
+            data={"food_item": bare, "hunger_restored": 0, "consumed": False},
+        )
 
-    # Step 2: apply saturation effect.  The duration is 1 second
+    # Apply saturation only after the server confirms item consumption. The
+    # duration is 1 second
     # (configurable); the level is rounded up to match the food's
     # saturation value.  This is a headless-friendly approximation:
     # in a real client the player would consume the held item via
     # right-click and the vanilla hunger/saturation system would
     # take over.
     sat_level = max(1, int(saturation / 2 + 0.5))  # 1 level = 2 saturation
-    with contextlib.suppress(Exception):
-        await _cmd(mc, f"effect give @p saturation 1 {sat_level}")
-
-    # Step 3: remove one of the food items from inventory.  In the
-    # real client this is the consequence of the player consuming
-    # the item.  We simulate by clearing one from the inventory.
-    with contextlib.suppress(Exception):
-        await _cmd(mc, f"clear @p minecraft:{bare} 1")
+    try:
+        effect_result = await _cmd(mc, f"effect give @p saturation 1 {sat_level}")
+    except Exception as exc:
+        return ActionResult(
+            success=False,
+            action=ActionType.EAT,
+            message=f"Food was consumed, but the saturation effect failed: {exc}",
+            data={"food_item": bare, "hunger_restored": 0, "consumed": True},
+        )
+    if _command_failed(effect_result):
+        return ActionResult(
+            success=False,
+            action=ActionType.EAT,
+            message="Food was consumed, but the saturation effect failed.",
+            data={"food_item": bare, "hunger_restored": 0, "consumed": True},
+        )
 
     return ActionResult(
         success=True,
@@ -1485,7 +1491,18 @@ async def _eat(mc: WorldAdapter, params: dict) -> ActionResult:
             "food_item": bare,
             "hunger_restored": int(hunger_restored),
             "saturation_points": saturation,
+            "consumed": True,
         },
+    )
+
+
+async def _consume_one_item(mc: WorldAdapter, item: str) -> bool:
+    """Consume one item only when the server confirms the inventory change."""
+    response = await _cmd(mc, f"clear @p minecraft:{item} 1")
+    return bool(
+        response
+        and not _command_failed(response)
+        and re.search(r"\b(?:removed|cleared)\s+1\b", response, flags=re.IGNORECASE)
     )
 
 
@@ -1514,14 +1531,50 @@ async def _heal(mc: WorldAdapter, params: dict) -> ActionResult:
       - ``heal_effects``: list of effect names applied
     """
     heal_item = str(params.get("heal_item", "")).strip().lower().replace("minecraft:", "")
+    if heal_item and heal_item not in {"golden_apple", "enchanted_golden_apple"}:
+        return ActionResult(
+            success=False,
+            action=ActionType.HEAL,
+            message="HEAL accepts only golden_apple or enchanted_golden_apple.",
+            data={"heal_item": heal_item, "heal_effects": [], "consumed": False},
+        )
+    if heal_item and not await _consume_one_item(mc, heal_item):
+        return ActionResult(
+            success=False,
+            action=ActionType.HEAL,
+            message=f"Could not verify consuming one {heal_item}; no healing effect was applied.",
+            data={"heal_item": heal_item, "heal_effects": [], "consumed": False},
+        )
     effects_applied: list[str] = []
     is_gapple = heal_item in ("golden_apple", "enchanted_golden_apple")
 
     # Always apply regeneration
-    with contextlib.suppress(Exception):
-        await _cmd(mc, "effect give @p regeneration 30 2")
-        effects_applied.append("regeneration II (30s)")
-        logger.debug("Applied regeneration effect")
+    try:
+        regeneration_result = await _cmd(mc, "effect give @p regeneration 30 2")
+    except Exception as exc:
+        return ActionResult(
+            success=False,
+            action=ActionType.HEAL,
+            message=f"Healing item was consumed, but regeneration failed: {exc}",
+            data={
+                "heal_item": heal_item or "generic",
+                "heal_effects": [],
+                "consumed": bool(heal_item),
+            },
+        )
+    if _command_failed(regeneration_result):
+        return ActionResult(
+            success=False,
+            action=ActionType.HEAL,
+            message="Healing item was consumed, but regeneration failed.",
+            data={
+                "heal_item": heal_item or "generic",
+                "heal_effects": [],
+                "consumed": bool(heal_item),
+            },
+        )
+    effects_applied.append("regeneration II (30s)")
+    logger.debug("Applied regeneration effect")
 
     # Golden apple bonus effects
     if is_gapple:
@@ -1539,11 +1592,6 @@ async def _heal(mc: WorldAdapter, params: dict) -> ActionResult:
                 await _cmd(mc, "effect give @p resistance 600 0")
                 effects_applied.append("resistance (600s)")
 
-    # Consume the item from inventory (best-effort)
-    if heal_item:
-        with contextlib.suppress(Exception):
-            await _cmd(mc, f"clear @p minecraft:{heal_item} 1")
-
     return ActionResult(
         success=True,
         action=ActionType.HEAL,
@@ -1551,6 +1599,7 @@ async def _heal(mc: WorldAdapter, params: dict) -> ActionResult:
         data={
             "heal_item": heal_item or "generic",
             "heal_effects": effects_applied,
+            "consumed": bool(heal_item),
         },
     )
 
@@ -1843,8 +1892,9 @@ async def _attack(mc: WorldAdapter, params: dict) -> ActionResult:
     instead, which has been available since MC 1.20.5.
 
     Parameters (from ``params``):
-      - ``entity_type`` (optional): name of a player or mob to target
-        specifically. If omitted, attacks the nearest non-player entity.
+      - ``entity_type`` (optional): curated Minecraft mob type to target
+        specifically. Player names and protected/unknown entity types fail
+        closed. If omitted, tries nearby curated attackable mob types.
       - ``damage_amount`` (optional): how much damage to deal, integer
         1-20. Default 4 (= 2 hearts). 20 kills most mobs in one hit.
 
@@ -1857,17 +1907,37 @@ async def _attack(mc: WorldAdapter, params: dict) -> ActionResult:
     # Clamp damage to a sane range. /damage accepts any positive float,
     # but Minecraft's max health caps at 20 (10 hearts) for players and
     # varies for mobs. 64+ is enough to one-shot everything that matters.
-    target = str(params.get("entity_type", "")).strip()
+    raw_target = params.get("entity_type", "")
+    target = raw_target.strip().lower() if isinstance(raw_target, str) else ""
+    # Target only curated bare Minecraft mob types; never place user text in
+    # selector grammar or a raw command argument.
+    target_type = target.removeprefix("minecraft:")
+    valid_target = (
+        (target == target_type or target == f"minecraft:{target_type}")
+        and target_type in _SCAN_ENTITY_TYPES
+        and _should_attack(target_type)
+    )
     try:
         damage = int(params.get("damage_amount", 4))
     except (TypeError, ValueError):
         damage = 4
     damage = max(1, min(damage, 64))
 
-    if target:
+    if target and not valid_target:
+        return ActionResult(
+            success=False,
+            action=ActionType.ATTACK,
+            message="Attack failed — target must be an attackable mob type.",
+            data={"target_name": target, "damage_dealt": damage, "target_hit": False},
+        )
+
+    if valid_target:
         # Target a specific entity with generic damage
         try:
-            cmd = f"damage @e[type=!minecraft:player,name={target},limit=1] {damage}"
+            cmd = (
+                "execute as @p at @s run damage "
+                f"@e[type=minecraft:{target_type},distance=..6,limit=1,sort=nearest] {damage}"
+            )
             resp = await _cmd(mc, cmd)
             if _damage_hit_anything(resp):
                 return ActionResult(
@@ -1885,45 +1955,35 @@ async def _attack(mc: WorldAdapter, params: dict) -> ActionResult:
         except Exception:
             pass
 
-    # Generic attack — try /damage on the nearest non-player entity
-    try:
-        cmd = f"damage @e[type=!minecraft:player,limit=1,sort=nearest] {damage}"
-        resp = await _cmd(mc, cmd)
-        if _damage_hit_anything(resp):
-            return ActionResult(
-                success=True,
-                action=ActionType.ATTACK,
-                message=f"Attacked nearest entity for {damage} damage",
-                data={
-                    "target_type": "mob",
-                    "damage_dealt": damage,
-                    "target_hit": True,
-                    "response": resp,
-                },
-            )
-    except Exception:
-        pass
-
-    # Last resort: raw /damage with the target name (broader selector
-    # that doesn't require the entity-type filter)
-    if target:
+    # A broad non-player selector could still hit villagers, pets, or
+    # protectors, so generic targeting is limited to curated attackable mobs.
+    candidates = (
+        (target_type,)
+        if valid_target
+        else tuple(mob for mob in _SCAN_ENTITY_TYPES if _should_attack(mob))
+    )
+    for mob in candidates:
         try:
-            resp = await _cmd(mc, f"damage {target} {damage}")
+            cmd = (
+                "execute as @p at @s run damage "
+                f"@e[type=minecraft:{mob},distance=..6,limit=1,sort=nearest] {damage}"
+            )
+            resp = await _cmd(mc, cmd)
             if _damage_hit_anything(resp):
                 return ActionResult(
                     success=True,
                     action=ActionType.ATTACK,
-                    message=f"Attacked {target} for {damage} damage",
+                    message=f"Attacked nearest {mob} for {damage} damage",
                     data={
-                        "target_type": "unknown",
-                        "target_name": target,
+                        "target_type": "mob",
+                        "target_name": mob,
                         "damage_dealt": damage,
                         "target_hit": True,
                         "response": resp,
                     },
                 )
         except Exception:
-            pass
+            continue
 
     # Nothing in range hit
     return ActionResult(

@@ -659,6 +659,17 @@ class TestAutoHeal:
         result = await layer.evaluate(world)
         assert result is None  # no golden apples to heal with
 
+    async def test_golden_carrot_is_food_but_not_a_healing_item(self, mock_mc):
+        layer = _make_layer(mock_mc)
+        world = self._world_with_inventory(
+            health=2.0, items=[{"item_id": "golden_carrot", "count": 1}]
+        )
+
+        result = await layer.evaluate(world)
+
+        assert result is None
+        assert not any("effect give" in command for command in mock_mc.commands_ran)
+
     async def test_heal_with_golden_apple_when_critical(self, mock_mc):
         layer = _make_layer(mock_mc)
         world = self._world_with_inventory(

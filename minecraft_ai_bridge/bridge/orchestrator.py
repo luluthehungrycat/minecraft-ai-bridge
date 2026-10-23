@@ -82,6 +82,10 @@ class Orchestrator:
         self._action_policy = action_policy
         self._runtime_action_policy = action_policy
         self._action_service: ActionService | None = None
+        # Capability object shared only with trusted in-process lifecycle and
+        # chat handlers; it is never derived from action names or parameters.
+        self._internal_action_authority = object()
+        self._safety_action_authority = object()
         self._authz_service: AuthzService | None = None
         self._authz_session: AuthzControllerSession | None = None
         self._observer: Observer | None = None
@@ -232,10 +236,13 @@ class Orchestrator:
                                         self._action_service = ActionService(
                                             self._world,
                                             policy=self._runtime_action_policy,
+                                            internal_authority=self._internal_action_authority,
+                                            safety_authority=self._safety_action_authority,
                                         )
                                     follow_result = await self._action_service.execute(
                                         ActionType.FOLLOW_TELEPORT,
                                         {"target": self._follow_target},
+                                        authority=self._internal_action_authority,
                                     )
                                     if follow_result.success:
                                         logger.info(
@@ -600,7 +607,12 @@ class Orchestrator:
             )
 
         if self._action_service is None:
-            self._action_service = ActionService(self._world, policy=self._runtime_action_policy)
+            self._action_service = ActionService(
+                self._world,
+                policy=self._runtime_action_policy,
+                internal_authority=self._internal_action_authority,
+                safety_authority=self._safety_action_authority,
+            )
 
         result = await self._action_service.execute(
             action_type,
@@ -658,7 +670,12 @@ class Orchestrator:
             authz_policy = self._authz_service.action_policy(self._authz_session)
             policy = self._combine_action_policies(authz_policy, self._action_policy)
         self._runtime_action_policy = policy
-        self._action_service = ActionService(self._world, policy=policy)
+        self._action_service = ActionService(
+            self._world,
+            policy=policy,
+            internal_authority=self._internal_action_authority,
+            safety_authority=self._safety_action_authority,
+        )
         self._observer = Observer(self._world)
         self._event_journal = EventJournal(self._config.bridge.event_journal_path)
         logger.info("Connected to MCPQ — player name: %s", api_cfg.player_name)
@@ -736,6 +753,7 @@ class Orchestrator:
             memory=self._memory,
             config=PreservationConfig(),
             action_service=self._action_service,
+            safety_authority=self._safety_action_authority,
         )
 
         # Persist the goal in memory database (N3)
@@ -791,6 +809,7 @@ class Orchestrator:
         """Require local session authorization and any caller-supplied policy."""
 
         async def combined(request):
+            authorization_decision = None
             for index, policy in enumerate((authz_policy, additional_policy)):
                 if policy is None:
                     continue
@@ -799,6 +818,8 @@ class Orchestrator:
                     decision = await decision
                 if not decision.allowed:
                     return decision
+                if index == 0:
+                    authorization_decision = decision
                 if index == 1:
                     # A caller policy may await while the session is revoked,
                     # expires, or is fenced by ownership transfer. Revalidate
@@ -808,7 +829,16 @@ class Orchestrator:
                         final_decision = await final_decision
                     if not final_decision.allowed:
                         return final_decision
-            return PolicyDecision(allowed=True)
+                    authorization_decision = final_decision
+            return PolicyDecision(
+                allowed=True,
+                allow_privileged=bool(
+                    authorization_decision and authorization_decision.allow_privileged
+                ),
+                identity_scope=(
+                    authorization_decision.identity_scope if authorization_decision else None
+                ),
+            )
 
         return combined
 
@@ -832,6 +862,7 @@ class Orchestrator:
             return await self._action_service.execute(
                 ActionType.PROVISION_BOT,
                 {"player_name": player_name},
+                authority=self._internal_action_authority,
             )
         except Exception as provision_err:
             logger.warning(
@@ -865,6 +896,7 @@ class Orchestrator:
                 result = await self._action_service.execute(
                     ActionType.PREPARE_SAFE_SPAWN,
                     {"x": safe_x, "y": safe_y, "z": safe_z},
+                    authority=self._internal_action_authority,
                 )
                 if not result.success:
                     logger.warning(

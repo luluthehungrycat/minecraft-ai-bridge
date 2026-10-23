@@ -9,11 +9,13 @@ safety; those capabilities remain outside this slice.
 
 from .action_service import (
     ActionAuditRecord,
+    ActionClass,
     ActionOutcome,
     ActionPolicy,
     ActionRequest,
     ActionService,
     PolicyDecision,
+    classify_action,
 )
 from .authz import (
     SCOPES,
@@ -44,11 +46,19 @@ from .contracts import (
 )
 from .event_journal import EventCursorExpiredError, EventIdConflictError, EventJournal, EventRecord
 from .safety_supervisor import SafetySupervisor
-from .webhooks import WebhookDelivery, WebhookError, WebhookService, WebhookSubscription
+from .webhooks import (
+    HttpxPinnedTransport,
+    PinnedWebhookTransport,
+    WebhookDelivery,
+    WebhookError,
+    WebhookService,
+    WebhookSubscription,
+)
 from .world_adapter import McpqWorldAdapter, WorldAdapter
 
 __all__ = [
     "ActionAuditRecord",
+    "ActionClass",
     "ActionOutcome",
     "ActionPolicy",
     "ActionRequest",
@@ -76,6 +86,7 @@ __all__ = [
     "MovementMode",
     "PeerGrantAuditEntry",
     "PolicyDecision",
+    "classify_action",
     "SessionStatus",
     "SafetySupervisor",
     "SteveIdentity",
@@ -84,6 +95,8 @@ __all__ = [
     "WorldAdapter",
     "WebhookDelivery",
     "WebhookError",
+    "HttpxPinnedTransport",
+    "PinnedWebhookTransport",
     "WebhookService",
     "WebhookSubscription",
 ]

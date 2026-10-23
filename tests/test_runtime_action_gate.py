@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -84,7 +85,7 @@ class PolicyLog:
 
     def hook(self, request: Any) -> PolicyDecision:
         self.actions.append(request.action)
-        return PolicyDecision(allowed=True)
+        return PolicyDecision(allowed=True, allow_privileged=True)
 
 
 class RecordingLLM:
@@ -126,7 +127,14 @@ async def gate_env(
     orch._goals.set_goal_from_subgoals("Gate test", [{"description": "stay alive"}])
     orch._mc = mock_mc
     orch._world = McpqWorldAdapter(mock_mc)
-    service = ActionService(orch._world, policy=policy_log.hook)
+    orch._internal_action_authority = object()
+    orch._safety_action_authority = object()
+    service = ActionService(
+        orch._world,
+        policy=policy_log.hook,
+        internal_authority=orch._internal_action_authority,
+        safety_authority=orch._safety_action_authority,
+    )
     orch._action_service = service
 
     async def observe() -> WorldState:
@@ -233,6 +241,20 @@ class TestFollowTeleportGate:
 
 @pytest.mark.asyncio
 class TestStartupProvisioningGate:
+    async def test_internal_action_requires_service_capability(
+        self, mock_mc: MockMcpqClient
+    ) -> None:
+        service = ActionService(mock_mc)
+
+        denied = await service.execute(
+            ActionType.PROVISION_BOT,
+            {"player_name": "Bot"},
+        )
+
+        assert denied.success is False
+        assert "trusted runtime authority" in denied.message
+        assert not any("botsummon" in command for command in mock_mc.commands_ran)
+
     async def test_provision_bot_routes_through_service(
         self, gate_env: tuple[Orchestrator, ActionService, PolicyLog]
     ) -> None:
@@ -317,6 +339,7 @@ class _BareHarness:
         self._world = None
         self._action_service = None
         self._action_policy = None
+        self._internal_action_authority = object()
         self._stop_requested = False
         self._follow_target = None
         self._turn = 0
@@ -328,9 +351,15 @@ class TestChatCommandGate:
         self, gate_env: tuple[Orchestrator, ActionService, PolicyLog]
     ) -> None:
         orch, service, policy_log = gate_env
+        orch._config.chat_control.allowed_names = ["SomePlayer"]
         handler = ChatCommandHandler(orch)
 
-        await handler.handle_command("!goto", "TargetPlayer", "SomePlayer")
+        await handler.handle_command(
+            "!goto",
+            "TargetPlayer",
+            "SomePlayer",
+            trusted_player=SimpleNamespace(name="SomePlayer"),
+        )
 
         assert policy_log.actions == [ActionType.GOTO_TELEPORT]
         assert handler._action_service is service
@@ -341,9 +370,15 @@ class TestChatCommandGate:
         self, gate_env: tuple[Orchestrator, ActionService, PolicyLog]
     ) -> None:
         orch, service, policy_log = gate_env
+        orch._config.chat_control.allowed_names = ["SomePlayer"]
         handler = ChatCommandHandler(orch)
 
-        await handler.handle_command("!come", "", "SomePlayer")
+        await handler.handle_command(
+            "!come",
+            "",
+            "SomePlayer",
+            trusted_player=SimpleNamespace(name="SomePlayer"),
+        )
 
         assert policy_log.actions == [ActionType.COME_TELEPORT]
         _assert_succeeded(service, ActionType.COME_TELEPORT)
@@ -352,10 +387,17 @@ class TestChatCommandGate:
         self, mock_mc: MockMcpqClient
     ) -> None:
         harness = _BareHarness(mock_mc)
+        harness._config = AppConfig()
+        harness._config.chat_control.allowed_names = ["SomePlayer"]
         harness._action_policy = lambda request: deny_all(PolicyDeny(request.action))
         handler = ChatCommandHandler(harness)
 
-        await handler.handle_command("!goto", "TargetPlayer", "SomePlayer")
+        await handler.handle_command(
+            "!goto",
+            "TargetPlayer",
+            "SomePlayer",
+            trusted_player=SimpleNamespace(name="SomePlayer"),
+        )
 
         record = handler._action_service.audit_records[-1]
         assert record.action is ActionType.GOTO_TELEPORT
@@ -374,6 +416,7 @@ def _make_layer(
         memory=orch._memory,
         config=PreservationConfig(),
         action_service=service,
+        safety_authority=orch._safety_action_authority,
     )
 
 
@@ -392,8 +435,9 @@ class TestSelfPreservationGate:
 
         assert result is not None
         assert result.action is ActionType.ATTACK
-        assert ActionType.ATTACK in policy_log.actions
+        assert policy_log.actions == []
         assert any("damage" in cmd for cmd in mock_mc.commands_ran)
+        _assert_succeeded(service, ActionType.ATTACK)
 
     async def test_auto_eat_routes_through_service(
         self, gate_env: tuple[Orchestrator, ActionService, PolicyLog]
@@ -411,8 +455,12 @@ class TestSelfPreservationGate:
 
         assert result is not None
         assert result.action is ActionType.EAT
-        assert ActionType.EAT in policy_log.actions
+        assert policy_log.actions == []
         assert any("saturation" in cmd for cmd in mock_mc.commands_ran)
+        assert mock_mc.commands_ran.index("clear AIBot minecraft:bread 1") < next(
+            index for index, command in enumerate(mock_mc.commands_ran) if "saturation" in command
+        )
+        _assert_succeeded(service, ActionType.EAT)
 
     async def test_auto_heal_routes_through_service(
         self, gate_env: tuple[Orchestrator, ActionService, PolicyLog]
@@ -433,11 +481,14 @@ class TestSelfPreservationGate:
         assert result is not None
         assert result.action is ActionType.HEAL
         assert result.success is True
-        assert ActionType.HEAL in policy_log.actions
+        assert policy_log.actions == []
         _assert_succeeded(service, ActionType.HEAL)
+        assert mock_mc.commands_ran.index("clear AIBot minecraft:golden_apple 1") < next(
+            index for index, command in enumerate(mock_mc.commands_ran) if "regeneration" in command
+        )
         assert any("regeneration" in cmd for cmd in mock_mc.commands_ran)
 
-    async def test_policy_deny_blocks_auto_heal(
+    async def test_controller_policy_denial_does_not_disable_reflex_heal(
         self, gate_env: tuple[Orchestrator, ActionService, PolicyLog]
     ) -> None:
         orch, service, policy_log = gate_env
@@ -455,12 +506,12 @@ class TestSelfPreservationGate:
         result = await layer.evaluate(world)
 
         assert result is not None
-        assert result.success is False
-        assert policy_log.actions.count(ActionType.HEAL) == 1
-        _assert_rejected(service, ActionType.HEAL, "test denial")
-        assert not any("effect give" in cmd for cmd in mock_mc.commands_ran)
+        assert result.success is True
+        assert policy_log.actions == []
+        _assert_succeeded(service, ActionType.HEAL)
+        assert any("effect give" in cmd for cmd in mock_mc.commands_ran)
 
-    async def test_policy_deny_blocks_reflex_attack(
+    async def test_controller_policy_denial_does_not_disable_reflex_attack(
         self, gate_env: tuple[Orchestrator, ActionService, PolicyLog]
     ) -> None:
         orch, service, policy_log = gate_env
@@ -473,10 +524,48 @@ class TestSelfPreservationGate:
         result = await layer.evaluate(WorldState(health=15.0, hunger=20))
 
         assert result is not None
-        assert result.success is False
-        assert policy_log.actions.count(ActionType.ATTACK) == 1
-        _assert_rejected(service, ActionType.ATTACK, "test denial")
-        assert not any("damage" in cmd for cmd in mock_mc.commands_ran)
+        assert result.success is True
+        assert policy_log.actions == []
+        _assert_succeeded(service, ActionType.ATTACK)
+        assert any("damage" in cmd for cmd in mock_mc.commands_ran)
+
+
+@pytest.mark.asyncio
+async def test_safety_authority_requires_a_consumed_item_before_healing_or_eating(
+    mock_mc: MockMcpqClient, monkeypatch
+) -> None:
+    safety_authority = object()
+    service = ActionService(mock_mc, safety_authority=safety_authority)
+    commands: list[str] = []
+
+    async def missing_item(command: str) -> str:
+        commands.append(command)
+        if command.startswith("clear "):
+            return "No items were found matching that predicate"
+        return "Given effect to AIBot"
+
+    monkeypatch.setattr(mock_mc, "run_as_player", missing_item)
+
+    generic_heal = await service.execute(ActionType.HEAL, {}, safety_authority=safety_authority)
+    missing_apple = await service.execute(
+        ActionType.HEAL,
+        {"heal_item": "golden_apple"},
+        safety_authority=safety_authority,
+    )
+    missing_bread = await service.execute(
+        ActionType.EAT,
+        {"food_item": "bread"},
+        safety_authority=safety_authority,
+    )
+
+    assert not generic_heal.success
+    assert not missing_apple.success
+    assert not missing_bread.success
+    assert commands == [
+        "clear @p minecraft:golden_apple 1",
+        "clear @p minecraft:bread 1",
+    ]
+    assert not any(command.startswith("effect give") for command in commands)
 
     async def test_observations_stay_outside_policy_and_audit(
         self, gate_env: tuple[Orchestrator, ActionService, PolicyLog]
@@ -489,12 +578,11 @@ class TestSelfPreservationGate:
         await layer.evaluate(WorldState(health=20.0, hunger=20))
         result = await layer.evaluate(WorldState(health=15.0, hunger=20))
 
-        # Only the mutating reflex is policy-checked and audited; the
-        # hurt-source probe and the entity scan that informed the
-        # decision never reach policy or audit.
+        # The reflex receives dedicated safety authorization and an audit
+        # record; the hurt-source probe and entity scan stay read-only.
         assert result is not None
         assert result.action is ActionType.ATTACK
-        assert policy_log.actions == [ActionType.ATTACK]
+        assert policy_log.actions == []
         assert [r.action for r in service.audit_records] == [ActionType.ATTACK]
 
 

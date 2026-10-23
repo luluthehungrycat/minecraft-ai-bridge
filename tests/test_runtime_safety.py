@@ -70,7 +70,7 @@ async def test_action_service_serializes_backend_dispatches(
 
     await asyncio.gather(
         service.execute(ActionType.CHAT, {"message": "second"}),
-        service.execute(ActionType.HEAL),
+        service.execute(ActionType.CHAT, {"message": "third"}),
     )
 
     assert maximum_dispatches == 1
@@ -97,10 +97,18 @@ async def test_action_service_wait_does_not_block_safety_dispatch(
         "minecraft_ai_bridge.runtime.action_service.execute_action",
         track_dispatch,
     )
-    service = ActionService(McpqWorldAdapter(mock_mc))
+    safety_authority = object()
+    service = ActionService(McpqWorldAdapter(mock_mc), safety_authority=safety_authority)
     wait_task = asyncio.create_task(service.execute(ActionType.WAIT, {"seconds": 30}))
     await asyncio.wait_for(wait_started.wait(), timeout=0.2)
-    await asyncio.wait_for(service.execute(ActionType.HEAL), timeout=0.2)
+    await asyncio.wait_for(
+        service.execute(
+            ActionType.HEAL,
+            {"heal_item": "golden_apple"},
+            safety_authority=safety_authority,
+        ),
+        timeout=0.2,
+    )
 
     assert safety_dispatched.is_set()
     wait_task.cancel()
@@ -131,9 +139,17 @@ async def test_safety_dispatch_invalidates_queued_strategic_action(
         "minecraft_ai_bridge.runtime.action_service.execute_action",
         track_dispatch,
     )
-    service = ActionService(McpqWorldAdapter(mock_mc))
+    safety_authority = object()
+    service = ActionService(McpqWorldAdapter(mock_mc), safety_authority=safety_authority)
     service.enable_safety_preemption()
-    heal_task = asyncio.create_task(service.execute(ActionType.HEAL, preemptive=True))
+    heal_task = asyncio.create_task(
+        service.execute(
+            ActionType.HEAL,
+            {"heal_item": "golden_apple"},
+            safety_authority=safety_authority,
+            preemptive=True,
+        )
+    )
     await asyncio.wait_for(heal_started.wait(), timeout=0.2)
     strategic_task = asyncio.create_task(
         service.execute(ActionType.CHAT, {"message": "strategic"}, preemptible=True)
@@ -270,7 +286,8 @@ async def test_run_safety_reflex_preempts_a_blocked_llm_decision(
     monkeypatch.setattr(orch._goals, "set_goal", no_goal)
 
     world = McpqWorldAdapter(mock_mc)
-    service = ActionService(world)
+    safety_authority = object()
+    service = ActionService(world, safety_authority=safety_authority)
     orch._mc = mock_mc
     orch._world = world
     orch._action_service = service
@@ -280,6 +297,7 @@ async def test_run_safety_reflex_preempts_a_blocked_llm_decision(
         orch._memory,
         PreservationConfig(),
         action_service=service,
+        safety_authority=safety_authority,
     )
 
     observations = [
@@ -361,7 +379,8 @@ async def test_reflex_invalidates_llm_mutation_queued_behind_heal(
     monkeypatch.setattr(orch._goals, "set_goal", no_goal)
 
     world = McpqWorldAdapter(mock_mc)
-    service = ActionService(world)
+    safety_authority = object()
+    service = ActionService(world, safety_authority=safety_authority)
     orch._mc = mock_mc
     orch._world = world
     orch._action_service = service
@@ -371,6 +390,7 @@ async def test_reflex_invalidates_llm_mutation_queued_behind_heal(
         orch._memory,
         PreservationConfig(),
         action_service=service,
+        safety_authority=safety_authority,
     )
     decision_handled = asyncio.Event()
     original_decide_with_safety = orch._decide_with_safety
@@ -432,7 +452,8 @@ async def test_safety_supervisor_runs_while_goal_decomposition_is_blocked(
     monkeypatch.setattr(orch, "_disconnect", no_disconnect)
 
     world = McpqWorldAdapter(mock_mc)
-    service = ActionService(world)
+    safety_authority = object()
+    service = ActionService(world, safety_authority=safety_authority)
     orch._mc = mock_mc
     orch._world = world
     orch._action_service = service
@@ -442,6 +463,7 @@ async def test_safety_supervisor_runs_while_goal_decomposition_is_blocked(
         orch._memory,
         PreservationConfig(),
         action_service=service,
+        safety_authority=safety_authority,
     )
     critical_state = WorldState(
         health=2.0,

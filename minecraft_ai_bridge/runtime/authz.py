@@ -982,40 +982,69 @@ class AuthzService:
                 (expiry, steve_id),
             )
 
-    def validate_session(self, session: ControllerSession) -> bool:
+    def validate_session(
+        self,
+        session: ControllerSession,
+        *,
+        required_admin_scope: str | None = None,
+        admin_token: str | None = None,
+    ) -> bool:
         with self._lock:
-            row = self._db.execute(
-                "SELECT s.active,s.session,s.session_credential,s.generation,"
-                "s.owner AS steve_owner,"
-                "s.mode,s.expires,s.session_expires,c.steve AS credential_steve,"
-                "c.owner AS credential_owner,c.revoked AS credential_revoked,"
-                "c.expires AS credential_expires,c.scopes AS credential_scopes "
-                "FROM steves AS s JOIN credentials AS c ON c.id=? WHERE s.id=?",
-                (session.credential_id, session.steve_id),
-            ).fetchone()
-            return bool(
-                row
-                and row["active"]
-                and row["session"] == session.session_id
-                and row["session_credential"] == session.credential_id
-                and row["generation"] == session.generation
-                and row["steve_owner"] == session.owner_id
-                and row["mode"] != "unclaimed"
-                and not _expired(row["expires"])
-                and row["session_expires"] == _dt(session.expires_at)
-                and not _expired(row["session_expires"])
-                and (row["mode"] != "leased" or row["session_expires"] is not None)
-                and (
-                    row["mode"] != "leased"
-                    or datetime.fromisoformat(row["session_expires"])
-                    <= datetime.fromisoformat(row["expires"])
+            owns_transaction = not self._db.in_transaction
+            if owns_transaction:
+                self._db.execute("BEGIN")
+            try:
+                row = self._db.execute(
+                    "SELECT s.active,s.session,s.session_credential,s.generation,"
+                    "s.owner AS steve_owner,"
+                    "s.mode,s.expires,s.session_expires,c.steve AS credential_steve,"
+                    "c.owner AS credential_owner,c.revoked AS credential_revoked,"
+                    "c.expires AS credential_expires,c.scopes AS credential_scopes "
+                    "FROM steves AS s JOIN credentials AS c ON c.id=? WHERE s.id=?",
+                    (session.credential_id, session.steve_id),
+                ).fetchone()
+                valid_session = bool(
+                    row
+                    and row["active"]
+                    and row["session"] == session.session_id
+                    and row["session_credential"] == session.credential_id
+                    and row["generation"] == session.generation
+                    and row["steve_owner"] == session.owner_id
+                    and row["mode"] != "unclaimed"
+                    and not _expired(row["expires"])
+                    and row["session_expires"] == _dt(session.expires_at)
+                    and not _expired(row["session_expires"])
+                    and (row["mode"] != "leased" or row["session_expires"] is not None)
+                    and (
+                        row["mode"] != "leased"
+                        or datetime.fromisoformat(row["session_expires"])
+                        <= datetime.fromisoformat(row["expires"])
+                    )
+                    and row["credential_steve"] == session.steve_id
+                    and row["credential_owner"] == session.owner_id
+                    and not row["credential_revoked"]
+                    and not _expired(row["credential_expires"])
+                    and "steve:control" in row["credential_scopes"].splitlines()
                 )
-                and row["credential_steve"] == session.steve_id
-                and row["credential_owner"] == session.owner_id
-                and not row["credential_revoked"]
-                and not _expired(row["credential_expires"])
-                and "steve:control" in row["credential_scopes"].splitlines()
-            )
+                if not valid_session:
+                    return False
+                if required_admin_scope is None:
+                    return True
+                if admin_token is None:
+                    return False
+                admin = self._db.execute(
+                    "SELECT scopes,revoked,expires FROM admins WHERE token_hash=?",
+                    (_hash(admin_token),),
+                ).fetchone()
+                return bool(
+                    admin
+                    and not admin["revoked"]
+                    and not _expired(admin["expires"])
+                    and required_admin_scope in admin["scopes"].splitlines()
+                )
+            finally:
+                if owns_transaction and self._db.in_transaction:
+                    self._db.execute("ROLLBACK")
 
     def release_session(self, session: ControllerSession) -> None:
         with self._tx() as db:
@@ -1061,12 +1090,32 @@ class AuthzService:
                 (new_owner_id, ownership_mode, expiry, steve_id),
             )
 
-    def action_policy(self, session: ControllerSession):
-        from .action_service import PolicyDecision
+    def action_policy(self, session: ControllerSession, *, admin_token: str | None = None):
+        from .action_service import ActionClass, PolicyDecision, classify_action
 
-        def policy(_request: ActionRequest) -> PolicyDecision:
+        def policy(request: ActionRequest) -> PolicyDecision:
+            privileged = classify_action(request.action) is ActionClass.PRIVILEGED_SIMULATED
+            authorized = self.validate_session(
+                session,
+                required_admin_scope="admin:world" if privileged else None,
+                admin_token=admin_token,
+            )
             return PolicyDecision(
-                self.validate_session(session), "controller session invalid or fenced"
+                authorized,
+                (
+                    "admin:world required for privileged simulated backend action"
+                    if privileged and not authorized
+                    else "controller session invalid or fenced"
+                ),
+                allow_privileged=authorized if privileged else False,
+                identity_scope=(
+                    "controller",
+                    session.steve_id,
+                    session.owner_id,
+                    session.credential_id,
+                    session.session_id,
+                    str(session.generation),
+                ),
             )
 
         return policy

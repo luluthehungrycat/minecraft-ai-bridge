@@ -1,9 +1,10 @@
-"""Shared policy boundary for strategic Minecraft actions.
+"""Shared policy boundary for mediated Minecraft actions.
 
-This runtime slice wraps the existing action dispatcher with a policy hook, a
-bounded in-memory audit trace, and process-local idempotency for explicit
-request IDs. It is not yet an authorization or safety system, and callers
-that still use the dispatcher directly remain outside this boundary.
+The service wraps the existing dispatcher with action classification, policy
+hooks, bounded in-memory audit, and process-local request-ID idempotency. Its
+in-process lifecycle and safety capabilities are narrow trust boundaries for
+the built-in orchestrator; this is not external transport authentication or
+complete mediation of callers that still use the dispatcher directly.
 """
 
 from __future__ import annotations
@@ -17,12 +18,20 @@ from collections import OrderedDict, deque
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from enum import StrEnum
 from inspect import isawaitable
 from math import isfinite
 from typing import Any
 from uuid import uuid4
 
-from ..minecraft.actions import ActionResult, ActionType, execute_action
+from ..minecraft.actions import (
+    _HOSTILE_MOBS,
+    ActionResult,
+    ActionType,
+    _is_food,
+    _should_attack,
+    execute_action,
+)
 from ..minecraft.world_types import WorldAdapter
 
 logger = logging.getLogger(__name__)
@@ -36,6 +45,82 @@ class ActionRequest:
     params: Mapping[str, Any] = field(default_factory=dict)
     correlation_id: str = field(default_factory=lambda: str(uuid4()))
     requested_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    trusted_internal: bool = False
+    trusted_safety: bool = False
+
+
+class ActionClass(StrEnum):
+    """Authoritative runtime classification used before backend dispatch."""
+
+    OBSERVATION = "observation"
+    SURVIVAL = "survival"
+    PRIVILEGED_SIMULATED = "privileged_simulated"
+    INTERNAL_CONTROL = "internal_control"
+    LIFECYCLE_INTERNAL = "lifecycle_internal"
+
+
+_OBSERVATION_ACTIONS = frozenset(
+    {
+        ActionType.CHECK_INVENTORY,
+        ActionType.SCAN_ENTITIES,
+        ActionType.SCAN,
+        ActionType.CHECK_TIME,
+        ActionType.CHECK_WEATHER,
+        ActionType.CHECK_HEALTH,
+        ActionType.CHECK_HUNGER,
+        ActionType.CHECK_POSITION,
+        ActionType.LIST_PLAYERS,
+    }
+)
+_PRIVILEGED_SIMULATED_ACTIONS = frozenset(
+    {
+        # The MCPQ implementation moves by issuing privileged teleport
+        # commands, even when the action is named as ordinary movement.
+        ActionType.MOVE_TO,
+        ActionType.MOVE_FORWARD,
+        ActionType.MOVE_BACK,
+        ActionType.WALK_TO,
+        ActionType.TURN_LEFT,
+        ActionType.TURN_RIGHT,
+        ActionType.JUMP,
+        ActionType.SPRINT,
+        ActionType.TELEPORT,
+        # These handlers edit blocks/inventory or simulate survival effects
+        # through server commands rather than genuine player interactions.
+        ActionType.BREAK_BLOCK,
+        ActionType.PLACE_BLOCK,
+        ActionType.INTERACT,
+        ActionType.EQUIP_ITEM,
+        ActionType.EQUIP_BEST_WEAPON,
+        ActionType.CRAFT_ITEM,
+        ActionType.DROP_ITEM,
+        ActionType.EAT,
+        ActionType.HEAL,
+        ActionType.ATTACK,
+    }
+)
+_INTERNAL_CONTROL_ACTIONS = frozenset(
+    {
+        ActionType.FOLLOW_TELEPORT,
+        ActionType.GOTO_TELEPORT,
+        ActionType.COME_TELEPORT,
+    }
+)
+_LIFECYCLE_INTERNAL_ACTIONS = frozenset({ActionType.PROVISION_BOT, ActionType.PREPARE_SAFE_SPAWN})
+_SAFETY_ACTIONS = frozenset({ActionType.ATTACK, ActionType.EAT, ActionType.HEAL})
+
+
+def classify_action(action: ActionType) -> ActionClass:
+    """Return the security class enforced by ActionService for an action."""
+    if action in _OBSERVATION_ACTIONS:
+        return ActionClass.OBSERVATION
+    if action in _PRIVILEGED_SIMULATED_ACTIONS:
+        return ActionClass.PRIVILEGED_SIMULATED
+    if action in _INTERNAL_CONTROL_ACTIONS:
+        return ActionClass.INTERNAL_CONTROL
+    if action in _LIFECYCLE_INTERNAL_ACTIONS:
+        return ActionClass.LIFECYCLE_INTERNAL
+    return ActionClass.SURVIVAL
 
 
 @dataclass(frozen=True)
@@ -44,6 +129,10 @@ class PolicyDecision:
 
     allowed: bool
     reason: str = ""
+    allow_privileged: bool = False
+    # Stable identity returned by trusted authorization policy, never copied
+    # from untrusted action parameters.
+    identity_scope: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -88,6 +177,7 @@ class _InflightEntry:
     """Fingerprint and completion future for a dispatch in progress."""
 
     fingerprint: str
+    identity_scope: tuple[str, ...]
     future: asyncio.Future[ActionOutcome]
 
 
@@ -96,6 +186,7 @@ class _TerminalEntry:
     """Fingerprint and outcome for a finished request ID."""
 
     fingerprint: str
+    identity_scope: tuple[str, ...]
     outcome: ActionOutcome
 
 
@@ -170,7 +261,7 @@ def _request_fingerprint(action: ActionType, params: Mapping[str, Any]) -> str:
 def _allow_all(_request: ActionRequest) -> PolicyDecision:
     """Preserve current CLI behavior until a deployment supplies policy."""
 
-    return PolicyDecision(allowed=True)
+    return PolicyDecision(allowed=True, allow_privileged=True)
 
 
 class ActionService:
@@ -213,9 +304,17 @@ class ActionService:
         policy: ActionPolicy | None = None,
         *,
         max_terminal_records: int = 1024,
+        internal_authority: object | None = None,
+        safety_authority: object | None = None,
     ) -> None:
         self._world = world
         self._policy = policy or _allow_all
+        self._default_identity_scope = ("service", str(uuid4()))
+        self._internal_authority = (
+            internal_authority if internal_authority is not None else object()
+        )
+        self._safety_authority = safety_authority if safety_authority is not None else object()
+        self._safety_identity_scope = ("safety", str(uuid4()))
         self._max_terminal_records = max_terminal_records
         # Serialize dispatch coroutines; WAIT is deliberately exempt so its
         # non-mutating sleep cannot block a safety reflex. Cancelling an
@@ -243,6 +342,8 @@ class ActionService:
         *,
         correlation_id: str | None = None,
         request_id: str | None = None,
+        authority: object | None = None,
+        safety_authority: object | None = None,
         preemptive: bool = False,
         preemptible: bool = False,
     ) -> ActionResult:
@@ -270,6 +371,13 @@ class ActionService:
                 action=action,
                 params=copy.deepcopy(dict(params or {})),
                 correlation_id=correlation_id or str(uuid4()),
+                trusted_internal=(
+                    action in _INTERNAL_CONTROL_ACTIONS | _LIFECYCLE_INTERNAL_ACTIONS
+                    and authority is self._internal_authority
+                ),
+                trusted_safety=(
+                    action in _SAFETY_ACTIONS and safety_authority is self._safety_authority
+                ),
             )
             if action is ActionType.WAIT:
                 outcome = await self._dispatch(
@@ -290,22 +398,48 @@ class ActionService:
             action=action,
             params=copy.deepcopy(dict(params or {})),
             correlation_id=correlation_id or str(uuid4()),
+            trusted_internal=(
+                action in _INTERNAL_CONTROL_ACTIONS | _LIFECYCLE_INTERNAL_ACTIONS
+                and authority is self._internal_authority
+            ),
+            trusted_safety=(
+                action in _SAFETY_ACTIONS and safety_authority is self._safety_authority
+            ),
         )
         _validate_params(request.params)
         fingerprint = _request_fingerprint(request.action, request.params)
 
+        # Idempotency is an authorization-sensitive read. Check current
+        # authority before consulting either cache and bind the record to an
+        # identity emitted by the trusted policy, never by request params.
+        decision, denied = await self._evaluate_policy(request, request_id=request_id)
+        if denied is not None:
+            return denied.result
+        assert decision is not None
+        identity_scope = decision.identity_scope or self._default_identity_scope
+
         entry = self._inflight.get(request_id)
         if entry is not None:
-            return await self._replay_inflight(entry, request, fingerprint, request_id)
+            if entry.identity_scope != identity_scope:
+                return self._identity_conflict_result(request, request_id, in_flight=True)
+            return await self._replay_inflight(
+                entry, request, fingerprint, request_id, identity_scope
+            )
 
         terminal = self._terminal.get(request_id)
         if terminal is not None:
+            if terminal.identity_scope != identity_scope:
+                return self._identity_conflict_result(request, request_id, in_flight=False)
             return self._replay_terminal(terminal, request, fingerprint, request_id)
 
         # No awaits occur between the checks above and this claim, so two
         # coroutines cannot both become the leader for one request_id.
         future: asyncio.Future[ActionOutcome] = asyncio.get_running_loop().create_future()
-        self._inflight[request_id] = _InflightEntry(fingerprint=fingerprint, future=future)
+        self._inflight[request_id] = _InflightEntry(
+            fingerprint=fingerprint,
+            identity_scope=identity_scope,
+            future=future,
+        )
 
         try:
             if action is ActionType.WAIT:
@@ -313,6 +447,7 @@ class ActionService:
                     request,
                     request_id=request_id,
                     preemptible=preemptible,
+                    expected_identity_scope=identity_scope,
                 )
             else:
                 async with self._dispatch_lock:
@@ -320,6 +455,7 @@ class ActionService:
                         request,
                         request_id=request_id,
                         preemptible=preemptible,
+                        expected_identity_scope=identity_scope,
                     )
         except asyncio.CancelledError:
             if request_id not in self._dispatch_started:
@@ -446,6 +582,7 @@ class ActionService:
         request: ActionRequest,
         fingerprint: str,
         request_id: str,
+        identity_scope: tuple[str, ...],
     ) -> ActionResult:
         """Coalesce onto an in-flight dispatch for the same request_id."""
 
@@ -454,6 +591,13 @@ class ActionService:
         # Shield the shared future: cancelling this waiter must not cancel
         # the dispatch future that other coalesced waiters are awaiting.
         outcome = await asyncio.shield(entry.future)
+        decision, denied = await self._evaluate_policy(request, request_id=request_id)
+        if denied is not None:
+            return denied.result
+        assert decision is not None
+        current_scope = decision.identity_scope or self._default_identity_scope
+        if current_scope != identity_scope:
+            return self._identity_conflict_result(request, request_id, in_flight=False)
         status = outcome.status
         self._record(
             request,
@@ -494,6 +638,24 @@ class ActionService:
         reason = (
             f"request_id {request_id!r} is already {state} with a different action or parameters"
         )
+        self._record(
+            request,
+            allowed=False,
+            succeeded=False,
+            reason=reason,
+            request_id=request_id,
+        )
+        result = ActionResult(success=False, action=request.action, message=reason)
+        result.data["correlation_id"] = request.correlation_id
+        result.data["request_id"] = request_id
+        return result
+
+    def _identity_conflict_result(
+        self, request: ActionRequest, request_id: str, *, in_flight: bool
+    ) -> ActionResult:
+        """Refuse request-ID reuse by a different authorized identity."""
+        state = "in flight" if in_flight else "completed"
+        reason = f"request_id {request_id!r} is already {state} for another authorized identity"
         self._record(
             request,
             allowed=False,
@@ -552,9 +714,20 @@ class ActionService:
         )
         if not entry.future.done():
             entry.future.set_result(stored)
-        self._store_terminal(request_id, entry.fingerprint, stored)
+        self._store_terminal(
+            request_id,
+            entry.fingerprint,
+            entry.identity_scope,
+            stored,
+        )
 
-    def _store_terminal(self, request_id: str, fingerprint: str, outcome: ActionOutcome) -> None:
+    def _store_terminal(
+        self,
+        request_id: str,
+        fingerprint: str,
+        identity_scope: tuple[str, ...],
+        outcome: ActionOutcome,
+    ) -> None:
         """Store a terminal outcome, evicting oldest records when full.
 
         Only completed outcomes are stored here; in-flight entries live in a
@@ -565,6 +738,7 @@ class ActionService:
 
         self._terminal[request_id] = _TerminalEntry(
             fingerprint=fingerprint,
+            identity_scope=identity_scope,
             outcome=ActionOutcome(
                 result=self._snapshot_result(outcome.result),
                 status=outcome.status,
@@ -580,51 +754,22 @@ class ActionService:
         *,
         request_id: str | None,
         preemptible: bool,
+        expected_identity_scope: tuple[str, ...] | None = None,
     ) -> ActionOutcome:
         """Run policy evaluation, dispatch an allowed action, and audit it."""
 
-        try:
-            decision = self._policy(request)
-            if isawaitable(decision):
-                decision = await decision
-        except Exception as exc:
-            logger.exception(
-                "Action policy failed correlation_id=%s",
-                request.correlation_id,
-            )
-            reason = f"Action policy evaluation failed: {exc}"
-            self._record(
+        decision, denied = await self._evaluate_policy(request, request_id=request_id)
+        if denied is not None:
+            return denied
+        assert decision is not None
+        identity_scope = decision.identity_scope or self._default_identity_scope
+        if expected_identity_scope is not None and identity_scope != expected_identity_scope:
+            return self._rejection_outcome(
                 request,
-                allowed=False,
-                succeeded=False,
-                reason=reason,
-                request_id=request_id,
+                request_id,
+                "Action authorization identity changed before backend dispatch",
+                status="rejected",
             )
-            result = ActionResult(
-                success=False,
-                action=request.action,
-                message=reason,
-            )
-            result.data["correlation_id"] = request.correlation_id
-            return ActionOutcome(result=result, status="policy_error", allowed=False)
-
-        if not decision.allowed:
-            result = ActionResult(
-                success=False,
-                action=request.action,
-                message=decision.reason or "Action rejected by policy",
-            )
-            result.data["correlation_id"] = request.correlation_id
-            if request_id is not None:
-                result.data["request_id"] = request_id
-            self._record(
-                request,
-                allowed=False,
-                succeeded=False,
-                reason=decision.reason,
-                request_id=request_id,
-            )
-            return ActionOutcome(result=result, status="rejected", allowed=False)
 
         if (
             preemptible
@@ -663,6 +808,130 @@ class ActionService:
         status = "succeeded" if result.success else "failed"
         result.data.setdefault("correlation_id", request.correlation_id)
         return ActionOutcome(result=result, status=status, allowed=True)
+
+    async def _evaluate_policy(
+        self,
+        request: ActionRequest,
+        *,
+        request_id: str | None,
+    ) -> tuple[PolicyDecision | None, ActionOutcome | None]:
+        """Evaluate current policy and audit denials/errors consistently."""
+        action_class = classify_action(request.action)
+        if request.trusted_safety:
+            if not self._safety_params_allowed(request.action, request.params):
+                return None, self._rejection_outcome(
+                    request,
+                    request_id,
+                    "Safety authority parameters exceed its deterministic action limits",
+                    status="rejected",
+                )
+            return (
+                PolicyDecision(
+                    allowed=True,
+                    reason="narrow built-in safety authority",
+                    allow_privileged=True,
+                    identity_scope=self._safety_identity_scope,
+                ),
+                None,
+            )
+        if (
+            action_class in {ActionClass.INTERNAL_CONTROL, ActionClass.LIFECYCLE_INTERNAL}
+            and not request.trusted_internal
+        ):
+            return None, self._rejection_outcome(
+                request,
+                request_id,
+                f"{request.action.value} requires trusted runtime authority",
+                status="rejected",
+            )
+        try:
+            decision = self._policy(request)
+            if isawaitable(decision):
+                decision = await decision
+        except Exception as exc:
+            logger.exception("Action policy failed correlation_id=%s", request.correlation_id)
+            return None, self._rejection_outcome(
+                request,
+                request_id,
+                f"Action policy evaluation failed: {exc}",
+                status="policy_error",
+            )
+        if not decision.allowed:
+            return None, self._rejection_outcome(
+                request,
+                request_id,
+                decision.reason or "Action rejected by policy",
+                status="rejected",
+            )
+        if action_class is ActionClass.PRIVILEGED_SIMULATED and not decision.allow_privileged:
+            return None, self._rejection_outcome(
+                request,
+                request_id,
+                f"{request.action.value} requires privileged backend authorization",
+                status="rejected",
+            )
+        return decision, None
+
+    @staticmethod
+    def _safety_params_allowed(action: ActionType, params: Mapping[str, Any]) -> bool:
+        """Constrain the built-in emergency capability independently of caller policy."""
+        if action is ActionType.ATTACK:
+            target = params.get("entity_type")
+            damage = params.get("damage_amount", 8)
+            if (
+                not isinstance(target, str)
+                or isinstance(damage, bool)
+                or not isinstance(damage, int)
+            ):
+                return False
+            mob = target.lower().removeprefix("minecraft:")
+            return mob in _HOSTILE_MOBS and _should_attack(mob) and 1 <= damage <= 8
+        if action is ActionType.EAT:
+            food = params.get("food_item")
+            slot = params.get("slot")
+            return bool(
+                isinstance(food, str)
+                and _is_food(food.lower().removeprefix("minecraft:"))
+                and (
+                    slot is None
+                    or (isinstance(slot, int) and not isinstance(slot, bool) and 0 <= slot <= 35)
+                )
+            )
+        if action is ActionType.HEAL:
+            item = params.get("heal_item", "")
+            slot = params.get("slot")
+            return bool(
+                isinstance(item, str)
+                and item.lower().removeprefix("minecraft:")
+                in {"golden_apple", "enchanted_golden_apple"}
+                and (
+                    slot is None
+                    or (isinstance(slot, int) and not isinstance(slot, bool) and 0 <= slot <= 35)
+                )
+            )
+        return False
+
+    def _rejection_outcome(
+        self,
+        request: ActionRequest,
+        request_id: str | None,
+        reason: str,
+        *,
+        status: str,
+    ) -> ActionOutcome:
+        """Build and audit a fail-closed policy result."""
+        self._record(
+            request,
+            allowed=False,
+            succeeded=False,
+            reason=reason,
+            request_id=request_id,
+        )
+        result = ActionResult(success=False, action=request.action, message=reason)
+        result.data["correlation_id"] = request.correlation_id
+        if request_id is not None:
+            result.data["request_id"] = request_id
+        return ActionOutcome(result=result, status=status, allowed=False)
 
     def _record(
         self,

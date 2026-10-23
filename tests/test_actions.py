@@ -561,8 +561,39 @@ class TestCombat:
         assert result.success is True  # mock returns "Damaged 1 entity"
 
     async def test_attack_with_target(self, mock_mc):
-        result = await execute_action(mock_mc, ActionType.ATTACK, {"entity_type": "TestPlayer"})
+        result = await execute_action(mock_mc, ActionType.ATTACK, {"entity_type": "zombie"})
         assert result.success is True
+
+    async def test_attack_is_anchored_to_bot_and_limited_to_six_blocks(self, mock_mc):
+        await execute_action(mock_mc, ActionType.ATTACK, {"entity_type": "zombie"})
+        assert any(
+            "execute as AIBot at @s run damage "
+            "@e[type=minecraft:zombie,distance=..6,limit=1,sort=nearest]" in command
+            for command in mock_mc.commands_ran
+        )
+
+    async def test_attack_rejects_selector_and_command_injection(self, mock_mc):
+        for target in ("@a", "zombie],limit=100", "zombie; kill @a", "Player Name"):
+            before = len(mock_mc.commands_ran)
+            result = await execute_action(mock_mc, ActionType.ATTACK, {"entity_type": target})
+            assert not result.success
+            assert len(mock_mc.commands_ran) == before
+
+    async def test_attack_rejects_protected_targets(self, mock_mc):
+        for target in ("minecraft:villager", "iron_golem", "warden", "wither"):
+            result = await execute_action(mock_mc, ActionType.ATTACK, {"entity_type": target})
+            assert not result.success
+
+    async def test_attack_empty_target_uses_non_player_selector(self, mock_mc):
+        result = await execute_action(mock_mc, ActionType.ATTACK, {"entity_type": ""})
+        assert result.success
+        damage_commands = [command for command in mock_mc.commands_ran if "damage" in command]
+        assert damage_commands
+        assert all("type=minecraft:" in command for command in damage_commands)
+
+    async def test_attack_missing_target_uses_default(self, mock_mc):
+        result = await execute_action(mock_mc, ActionType.ATTACK, {})
+        assert result.success
 
     async def test_attack_custom_damage(self, mock_mc):
         """Custom damage_amount should be reflected in the response."""

@@ -119,6 +119,7 @@ class SelfPreservationLayer:
         memory: AgentMemory,
         config: PreservationConfig | None = None,
         action_service: ActionService | None = None,
+        safety_authority: object | None = None,
     ) -> None:
         self._mc = mc
         self._goals = goal_manager
@@ -133,6 +134,7 @@ class SelfPreservationLayer:
         # (SCAN_ENTITIES, get_hurt_by_entity) are never routed through
         # the service.
         self._action_service = action_service
+        self._safety_authority = safety_authority
         # Last seen health — used to detect sudden drops. None means
         # the first observation hasn't happened yet.
         self._previous_health: float | None = None
@@ -152,7 +154,12 @@ class SelfPreservationLayer:
         behavior. Observation calls are never dispatched through here.
         """
         if self._action_service is not None:
-            return await self._action_service.execute(action, params, preemptive=True)
+            return await self._action_service.execute(
+                action,
+                params,
+                safety_authority=self._safety_authority,
+                preemptive=True,
+            )
         return await execute_action(self._mc, action, params)
 
     async def evaluate(self, world: WorldState) -> ActionResult | None:
@@ -547,12 +554,11 @@ class SelfPreservationLayer:
     # ── Auto-heal ─────────────────────────────────────────────────
 
     async def _maybe_auto_heal(self, world: WorldState) -> ActionResult | None:
-        """Auto-heal when health is critically low and a healing item
-        (golden apple, golden carrot, etc.) is in inventory.
+        """Auto-heal when health is critical and a supported apple is present.
 
         Uses the ``HEAL`` action rather than ``EAT``, which applies
         regeneration, absorption, and instant-health effects.
-        Skips if no golden apples/golden carrots are in inventory.
+        Skips if no golden apple or enchanted golden apple is in inventory.
 
         ``enable_auto_heal`` must be True in ``PreservationConfig``
         (default True).
@@ -578,13 +584,12 @@ class SelfPreservationLayer:
     def _pick_healing_item(inventory: list[InventorySlot]) -> tuple[str, int] | None:
         """Return (item_id, slot) for the best healing item in inventory.
 
-        Priority: enchanted_golden_apple > golden_apple > golden_carrot.
+        Priority: enchanted_golden_apple > golden_apple.
         Returns None if no healing item is present.
         """
         priority = {
             "enchanted_golden_apple": 3,
             "golden_apple": 2,
-            "golden_carrot": 1,
         }
         best_priority = -1
         best_item: str | None = None
