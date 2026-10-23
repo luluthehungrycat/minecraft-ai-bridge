@@ -8,6 +8,7 @@ import hmac
 import json
 import threading
 import time
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
 import httpx
@@ -61,29 +62,46 @@ async def _wait_for_dns_capacity_release(timeout=2.0):
     webhook_runtime._DNS_CAPACITY.release()
 
 
-def _client(handler, *, pinned=True):
+@asynccontextmanager
+async def _client(handler, *, pinned=True):
+    if not pinned:
+        yield object()
+        return
     transport = httpx.MockTransport(handler)
-    if pinned:
-        # MockTransport never resolves/connects; this operation is the only
-        # route used by the service and therefore cannot escape to the network.
-        async def send_webhook_pinned(*, url, addresses, content, headers, timeout):
-            assert addresses
-            request = httpx.Request("POST", url, content=content, headers=headers)
-            request.extensions["timeout"] = {
-                "connect": timeout,
-                "read": timeout,
-                "write": timeout,
-                "pool": timeout,
-            }
-            response = await transport.handle_async_request(request)
-            try:
-                await response.aread()
-                return response.status_code
-            finally:
-                await response.aclose()
+    yield webhook_runtime.HttpxPinnedTransport(transport_factory=lambda: transport)
 
-        transport.send_webhook_pinned = send_webhook_pinned
-    return httpx.AsyncClient(transport=transport)
+
+@pytest.mark.asyncio
+async def test_httpx_pinned_transport_uses_ip_host_and_tls_name_without_redirects():
+    requests = []
+
+    async def handler(request):
+        requests.append(request)
+        return httpx.Response(302, headers={"Location": "https://attacker.invalid/"})
+
+    transport = webhook_runtime.HttpxPinnedTransport(
+        transport_factory=lambda: httpx.MockTransport(handler)
+    )
+    status = await transport.send_webhook_pinned(
+        url="https://hooks.example.test/events?batch=2",
+        addresses=("93.184.216.34",),
+        content=b"{}",
+        headers={"X-Test": "yes", "host": "attacker.invalid"},
+        timeout=1.0,
+    )
+
+    assert status == 302
+    assert len(requests) == 1
+    request = requests[0]
+    assert str(request.url) == "https://93.184.216.34/events?batch=2"
+    assert request.headers["Host"] == "hooks.example.test"
+    assert request.extensions["sni_hostname"] == "hooks.example.test"
+    assert request.extensions["timeout"] == {
+        "connect": 1.0,
+        "read": 1.0,
+        "write": 1.0,
+        "pool": 1.0,
+    }
 
 
 @pytest.mark.asyncio
@@ -103,7 +121,7 @@ async def test_signature_timestamp_delivery_id_and_success_ack(tmp_path, monkeyp
             journal,
             str(tmp_path / "deliveries.db"),
             subscriptions=[_subscription()],
-            client=client,
+            pinned_transport=client,
             clock=lambda: now[0],
         )
         assert await service.run_once() == 1
@@ -142,7 +160,7 @@ async def test_overlapping_delivery_passes_cannot_overwrite_terminal_state(tmp_p
             journal,
             str(tmp_path / "deliveries.db"),
             subscriptions=[_subscription()],
-            client=client,
+            pinned_transport=client,
         )
         first = asyncio.create_task(service.run_once())
         second = asyncio.create_task(service.run_once())
@@ -188,7 +206,7 @@ async def test_retry_schedule_restart_and_stable_id_for_uncertain_duplicate(
             journal,
             str(delivery_path),
             subscriptions=[_subscription()],
-            client=client,
+            pinned_transport=client,
             clock=lambda: now[0],
         )
         assert await service.run_once() == 1
@@ -200,7 +218,7 @@ async def test_retry_schedule_restart_and_stable_id_for_uncertain_duplicate(
             journal,
             str(delivery_path),
             subscriptions=[_subscription()],
-            client=client,
+            pinned_transport=client,
             clock=lambda: now[0],
         )
         assert restored.deliveries()[0] == pending
@@ -227,7 +245,7 @@ async def test_max_attempts_dead_letters_and_acknowledges(tmp_path, monkeypatch)
             journal,
             str(tmp_path / "deliveries.db"),
             subscriptions=[_subscription()],
-            client=client,
+            pinned_transport=client,
             clock=lambda: now[0],
         )
         for tick in (10, 12, 16):
@@ -257,7 +275,7 @@ async def test_rate_limit_and_body_limit_are_terminal(tmp_path, monkeypatch) -> 
             journal,
             str(tmp_path / "deliveries.db"),
             subscriptions=[_subscription(events_per_minute=1)],
-            client=client,
+            pinned_transport=client,
             max_body_bytes=1024,
             clock=lambda: 100,
         )
@@ -274,7 +292,7 @@ async def test_rate_limit_and_body_limit_are_terminal(tmp_path, monkeypatch) -> 
             journal,
             str(tmp_path / "oversize-delivery.db"),
             subscriptions=[_subscription()],
-            client=client,
+            pinned_transport=client,
             max_body_bytes=1,
         )
         assert await service.run_once() == 0
@@ -315,7 +333,10 @@ async def test_private_dns_resolution_fails_closed(tmp_path, monkeypatch) -> Non
 
     async with _client(fail_if_called) as client:
         service = WebhookService(
-            journal, str(tmp_path / "deliveries.db"), subscriptions=[_subscription()], client=client
+            journal,
+            str(tmp_path / "deliveries.db"),
+            subscriptions=[_subscription()],
+            pinned_transport=client,
         )
         assert await service.run_once() == 0
         pending = service.deliveries()[0]
@@ -344,7 +365,7 @@ async def test_retry_backoff_blocks_later_cursor_until_head_is_acked(tmp_path, m
             journal,
             str(tmp_path / "deliveries.db"),
             subscriptions=[_subscription()],
-            client=client,
+            pinned_transport=client,
             clock=lambda: now[0],
         )
         assert await service.run_once() == 1
@@ -395,7 +416,7 @@ async def test_restart_reconciles_terminal_state_before_journal_ack(
             journal,
             str(tmp_path / "deliveries.db"),
             subscriptions=[_subscription()],
-            client=client,
+            pinned_transport=client,
             max_body_bytes=body_limit,
         )
         real_ack = journal.ack_event
@@ -414,7 +435,7 @@ async def test_restart_reconciles_terminal_state_before_journal_ack(
             journal,
             str(tmp_path / "deliveries.db"),
             subscriptions=[_subscription()],
-            client=client,
+            pinned_transport=client,
             max_body_bytes=body_limit,
         )
         await restored.run_once()
@@ -441,7 +462,7 @@ async def test_hostname_delivery_fails_closed_without_pinning_transport(tmp_path
             journal,
             str(tmp_path / "deliveries.db"),
             subscriptions=[_subscription()],
-            client=client,
+            pinned_transport=client,
             clock=lambda: 100.0,
         )
         assert await service.run_once() == 0
@@ -485,7 +506,7 @@ async def test_retention_during_awaited_send_recovers_without_replaying_success(
                 _subscription(),
                 _subscription(subscription_id="second-hook", secret=b"t" * 32),
             ],
-            client=client,
+            pinned_transport=client,
         )
         in_flight = asyncio.create_task(service.run_once())
         try:
@@ -543,7 +564,7 @@ async def test_slow_dns_is_bounded_off_loop_and_observable(tmp_path, monkeypatch
             journal,
             str(tmp_path / "deliveries.db"),
             subscriptions=[_subscription()],
-            client=client,
+            pinned_transport=client,
             dns_timeout_seconds=0.02,
             clock=lambda: 100.0,
         )
@@ -606,7 +627,7 @@ async def test_repeated_dns_timeouts_do_not_spawn_unbounded_workers(tmp_path, mo
             journal,
             str(tmp_path / "deliveries.db"),
             subscriptions=[_subscription()],
-            client=client,
+            pinned_transport=client,
             dns_timeout_seconds=0.01,
             clock=lambda: now[0],
         )

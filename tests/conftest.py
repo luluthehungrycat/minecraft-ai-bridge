@@ -239,10 +239,12 @@ class MockMcpqClient:
         if "give" in cmd and ("aibot" in cmd or "@p" in cmd):
             return f"Gave 1 {cmd.split()[2]} to AIBot"
         if "clear" in cmd and ("aibot" in cmd or "@p" in cmd):
-            return "Cleared items"
+            return "Removed 1 item from AIBot's inventory"
         if cmd.startswith("summon item"):
             return "Spawned item entity"
         if cmd.startswith("damage"):
+            return "Damaged 1 entity"
+        if "run damage @e[" in cmd:
             return "Damaged 1 entity"
         if cmd.startswith("effect give"):
             # saturation/regeneration/etc. effects — return a success

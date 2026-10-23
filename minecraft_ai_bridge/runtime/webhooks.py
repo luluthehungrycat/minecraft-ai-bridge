@@ -16,8 +16,10 @@ import socket
 import sqlite3
 import threading
 import time
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
+from typing import Protocol
 from urllib.parse import urlsplit
 from uuid import UUID, uuid5
 
@@ -28,6 +30,8 @@ from .event_journal import EventCursorExpiredError, EventJournal
 __all__ = [
     "WebhookDelivery",
     "WebhookError",
+    "HttpxPinnedTransport",
+    "PinnedWebhookTransport",
     "WebhookService",
     "WebhookSubscription",
 ]
@@ -35,6 +39,9 @@ __all__ = [
 _DELIVERY_NAMESPACE = UUID("a5870ad5-4dab-4a1a-9684-88da266770d3")
 _DNS_WORKER_LIMIT = 1
 _DNS_CAPACITY = threading.BoundedSemaphore(_DNS_WORKER_LIMIT)
+_MAX_PINNED_ADDRESSES = 16
+_WEBHOOK_TIMEOUT_SECONDS = 10.0
+_HTTP_CAPACITY = threading.BoundedSemaphore(4)
 _ID_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
 _UNSAFE_NETWORKS = tuple(
     ipaddress.ip_network(value)
@@ -70,6 +77,129 @@ def _finite_positive_number(value: object) -> bool:
 
 class WebhookError(ValueError):
     """Invalid webhook configuration or persisted delivery state."""
+
+
+class PinnedWebhookTransport(Protocol):
+    """Transport operation that connects only to prevalidated IP addresses."""
+
+    async def send_webhook_pinned(
+        self,
+        *,
+        url: str,
+        addresses: tuple[str, ...],
+        content: bytes,
+        headers: dict[str, str],
+        timeout: float,
+    ) -> int: ...
+
+
+class HttpxPinnedTransport:
+    """HTTPX transport that pins TCP to supplied IPs and keeps HTTPS identity."""
+
+    def __init__(
+        self,
+        *,
+        transport_factory: Callable[[], httpx.AsyncBaseTransport] | None = None,
+    ) -> None:
+        self._transport_factory = transport_factory
+
+    async def send_webhook_pinned(
+        self,
+        *,
+        url: str,
+        addresses: tuple[str, ...],
+        content: bytes,
+        headers: dict[str, str],
+        timeout: float,
+    ) -> int:
+        if not _finite_positive_number(timeout):
+            raise WebhookError("pinned request timeout must be finite and positive")
+        if not addresses or len(addresses) > _MAX_PINNED_ADDRESSES:
+            raise WebhookError("pinned address set must contain 1-16 addresses")
+        try:
+            normalized: tuple[str, ...] = tuple(
+                dict.fromkeys(str(ipaddress.ip_address(address)) for address in addresses)
+            )
+        except ValueError as exc:
+            raise WebhookError("pinned address set contains an invalid IP") from exc
+        if len(normalized) != len(addresses) or any(_unsafe_ip(address) for address in normalized):
+            raise WebhookError("pinned address set contains duplicates or unsafe IPs")
+        try:
+            original = httpx.URL(url)
+        except (TypeError, ValueError) as exc:
+            raise WebhookError("invalid pinned webhook URL") from exc
+        if (
+            original.scheme != "https"
+            or not original.host
+            or original.username
+            or original.password
+            or original.fragment
+            or original.port not in (None, 443)
+        ):
+            raise WebhookError("pinned URL must be credential-free HTTPS on port 443")
+        hostname = original.host
+        if not hostname:
+            raise WebhookError("pinned URL has no hostname")
+        timeout_value = float(timeout)
+        request_timeout = httpx.Timeout(
+            timeout_value,
+            connect=timeout_value,
+            read=timeout_value,
+            write=timeout_value,
+            pool=timeout_value,
+        )
+        last_error: httpx.HTTPError | None = None
+        if not _HTTP_CAPACITY.acquire(blocking=False):
+            raise WebhookError("pinned webhook transport capacity is exhausted")
+        try:
+            if self._transport_factory:
+                transport = self._transport_factory()
+            else:
+                transport = httpx.AsyncHTTPTransport(
+                    trust_env=False,
+                    http2=False,
+                    retries=0,
+                    limits=httpx.Limits(max_connections=1, max_keepalive_connections=0),
+                )
+            async with asyncio.timeout(timeout_value):
+                async with httpx.AsyncClient(
+                    transport=transport,
+                    trust_env=False,
+                    follow_redirects=False,
+                    timeout=request_timeout,
+                ) as client:
+                    for address in normalized:
+                        ip = ipaddress.ip_address(address)
+                        host_for_url = f"[{ip}]" if ip.version == 6 else str(ip)
+                        pinned_url = original.copy_with(host=host_for_url, port=443)
+                        request_headers = httpx.Headers(headers)
+                        request_headers["Host"] = hostname
+                        request = client.build_request(
+                            "POST",
+                            pinned_url,
+                            content=content,
+                            headers=request_headers,
+                            timeout=request_timeout,
+                            extensions={"sni_hostname": hostname},
+                        )
+                        try:
+                            response = await client.send(
+                                request, stream=True, follow_redirects=False
+                            )
+                        except httpx.HTTPError as exc:
+                            last_error = exc
+                            continue
+                        try:
+                            return response.status_code
+                        finally:
+                            await response.aclose()
+        except TimeoutError as exc:
+            raise WebhookError("pinned webhook request timed out") from exc
+        finally:
+            _HTTP_CAPACITY.release()
+        if last_error is not None:
+            raise last_error
+        raise WebhookError("pinned webhook request did not produce a response")
 
 
 @dataclass(frozen=True)
@@ -173,8 +303,15 @@ def _check_resolved_addresses(host: str) -> tuple[str, ...]:
         answers = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
     except OSError as exc:
         raise WebhookError("webhook host DNS resolution failed") from exc
-    addresses = tuple(sorted({answer[4][0] for answer in answers}))
-    if not addresses or any(_unsafe_ip(address) for address in addresses):
+    raw_addresses = {answer[4][0] for answer in answers}
+    if any(not isinstance(address, str) for address in raw_addresses):
+        raise WebhookError("webhook DNS returned an invalid address")
+    addresses = tuple(sorted(address for address in raw_addresses if isinstance(address, str)))
+    if (
+        not addresses
+        or len(addresses) > _MAX_PINNED_ADDRESSES
+        or any(_unsafe_ip(address) for address in addresses)
+    ):
         raise WebhookError("webhook host resolves to an unsafe IP address")
     return addresses
 
@@ -192,13 +329,12 @@ async def _resolve_addresses(host: str, *, timeout: float) -> tuple[str, ...]:
     result: asyncio.Future[tuple[str, ...]] = loop.create_future()
 
     def resolve() -> None:
+        resolved: tuple[str, ...] | None = None
+        error: Exception | None = None
         try:
-            try:
-                addresses = _check_resolved_addresses(host)
-            except Exception as exc:
-                resolved, error = None, exc
-            else:
-                resolved, error = addresses, None
+            resolved = _check_resolved_addresses(host)
+        except Exception as exc:
+            error = exc
         finally:
             # The blocking resolver has returned before admission is reopened.
             _DNS_CAPACITY.release()
@@ -233,12 +369,9 @@ def _finish_resolution(
 class WebhookService:
     """SQLite-backed, per-subscription at-least-once HTTP delivery worker.
 
-    ``run_once`` sends at most one currently due item per subscription. Inject
-    an httpx AsyncClient (typically using MockTransport) for offline operation.
-    Its transport must implement async ``send_webhook_pinned(url, addresses,
-    content, headers, timeout)``. That operation itself must connect only to
-    the supplied addresses while retaining the URL hostname for TLS SNI and
-    HTTP Host; the ordinary AsyncClient request path is never used.
+    ``run_once`` sends at most one currently due item per subscription. By
+    default, delivery uses :class:`HttpxPinnedTransport`; tests or deployments
+    may inject another implementation of :class:`PinnedWebhookTransport`.
     """
 
     def __init__(
@@ -247,7 +380,7 @@ class WebhookService:
         db_path: str,
         *,
         subscriptions: tuple[WebhookSubscription, ...] | list[WebhookSubscription],
-        client: httpx.AsyncClient,
+        pinned_transport: PinnedWebhookTransport | None = None,
         max_body_bytes: int = 256_000,
         dns_timeout_seconds: float = 2.0,
         clock=time.time,
@@ -262,7 +395,9 @@ class WebhookService:
         if len(set(ids)) != len(ids):
             raise WebhookError("subscription IDs must be unique")
         self.journal = journal
-        self.client = client
+        self._pinned_transport = (
+            pinned_transport if pinned_transport is not None else HttpxPinnedTransport()
+        )
         self.max_body_bytes = max_body_bytes
         self.dns_timeout_seconds = float(dns_timeout_seconds)
         self._clock = clock
@@ -386,8 +521,7 @@ class WebhookService:
         content: bytes,
         headers: dict[str, str],
     ) -> int:
-        transport = getattr(self.client, "_transport", None)
-        sender = getattr(transport, "send_webhook_pinned", None)
+        sender = getattr(self._pinned_transport, "send_webhook_pinned", None)
         if sender is None:
             raise WebhookError(
                 "HTTP transport has no pinned webhook request operation; request was not sent"
@@ -485,8 +619,7 @@ class WebhookService:
                     subscription, delivery, "event body exceeds configured maximum", None
                 )
                 continue
-            transport = getattr(self.client, "_transport", None)
-            if not callable(getattr(transport, "send_webhook_pinned", None)):
+            if not callable(getattr(self._pinned_transport, "send_webhook_pinned", None)):
                 self._retry_or_dead(
                     subscription,
                     delivery,
