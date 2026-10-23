@@ -6,6 +6,9 @@ import asyncio
 import hashlib
 import hmac
 import json
+import shutil
+import ssl
+import subprocess
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -102,6 +105,111 @@ async def test_httpx_pinned_transport_uses_ip_host_and_tls_name_without_redirect
         "write": 1.0,
         "pool": 1.0,
     }
+
+
+@pytest.mark.asyncio
+async def test_httpx_pinned_transport_performs_tls_to_pinned_ip_with_original_identity(
+    tmp_path, monkeypatch
+):
+    openssl = shutil.which("openssl")
+    if openssl is None:
+        pytest.skip("openssl CLI is required to create an ephemeral test certificate")
+
+    cert_path = tmp_path / "server.pem"
+    key_path = tmp_path / "server.key"
+    subprocess.run(
+        [
+            openssl,
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            str(key_path),
+            "-out",
+            str(cert_path),
+            "-days",
+            "1",
+            "-subj",
+            "/CN=hooks.example.test",
+            "-addext",
+            "subjectAltName=DNS:hooks.example.test",
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+    server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_context.load_cert_chain(cert_path, key_path)
+    observed_sni = []
+    server_context.set_servername_callback(
+        lambda _socket, server_name, _context: observed_sni.append(server_name)
+    )
+    observed_requests = []
+
+    async def handle(reader, writer):
+        request_line = await reader.readline()
+        headers = {}
+        while line := await reader.readline():
+            if line == b"\r\n":
+                break
+            name, value = line.decode("ascii").split(":", 1)
+            headers[name.lower()] = value.strip()
+        content_length = int(headers.get("content-length", "0"))
+        body = await reader.readexactly(content_length) if content_length else b""
+        observed_requests.append((request_line.decode("ascii").strip(), headers, body))
+        writer.write(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    try:
+        server = await asyncio.start_server(handle, "127.0.0.1", 0, ssl=server_context)
+    except OSError as exc:
+        pytest.skip(f"local TLS sockets are unavailable in this environment: {exc}")
+    port = server.sockets[0].getsockname()[1]
+    monkeypatch.setattr(webhook_runtime, "_unsafe_ip", lambda _address: False)
+    client_context = ssl.create_default_context(cafile=str(cert_path))
+
+    class LocalPortTransport(httpx.AsyncHTTPTransport):
+        async def handle_async_request(self, request):
+            local_url = request.url.copy_with(port=port)
+            local_request = httpx.Request(
+                request.method,
+                local_url,
+                headers=request.headers,
+                stream=request.stream,
+                extensions=request.extensions,
+            )
+            return await super().handle_async_request(local_request)
+
+    transport = webhook_runtime.HttpxPinnedTransport(
+        transport_factory=lambda: LocalPortTransport(
+            verify=client_context,
+            trust_env=False,
+            http2=False,
+            retries=0,
+        )
+    )
+
+    try:
+        status = await transport.send_webhook_pinned(
+            url="https://hooks.example.test/events?batch=2",
+            addresses=("127.0.0.1",),
+            content=b"payload",
+            headers={"X-Test": "yes"},
+            timeout=2.0,
+        )
+        assert status == 204
+        assert observed_sni == ["hooks.example.test"]
+        assert len(observed_requests) == 1
+        assert observed_requests[0][0] == "POST /events?batch=2 HTTP/1.1"
+        assert observed_requests[0][2] == b"payload"
+        assert observed_requests[0][1]["host"] == "hooks.example.test"
+    finally:
+        server.close()
+        await server.wait_closed()
 
 
 @pytest.mark.asyncio
