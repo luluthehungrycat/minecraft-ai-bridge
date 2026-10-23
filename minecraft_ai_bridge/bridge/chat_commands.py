@@ -30,9 +30,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Pattern for parsing chat messages that look like command invocations.
-# Matches:  "<PlayerName> !command args" or "<PlayerName> !command"
-_COMMAND_RE = re.compile(r"<([^>]+)>\s+((?:/[!\u00a7]?|!)\w+)(.*)")
+_COMMAND_RE = re.compile(r"^\s*((?:/[!\u00a7]?|!)\w+)(.*)$")
+_PUBLIC_COMMANDS = {"!status", "!help"}
 
 # Commands the handler recognises
 COMMANDS = {
@@ -69,6 +68,7 @@ class ChatCommandHandler:
         # adapter and no raw client) resolves the world from that service
         # so polling, status, and replies still work.
         service = getattr(orchestrator, "_action_service", None)
+        internal_authority = getattr(orchestrator, "_internal_action_authority", None)
         world = getattr(orchestrator, "_world", None)
         if world is None:
             mc = getattr(orchestrator, "_mc", None)
@@ -83,10 +83,18 @@ class ChatCommandHandler:
                     "world adapter, an ActionService, or a raw MCPQ client"
                 )
             policy = getattr(orchestrator, "_action_policy", None)
-            service = ActionService(world, policy=policy)
+            service = ActionService(
+                world,
+                policy=policy,
+                internal_authority=internal_authority,
+            )
         self._action_service = service
+        self._internal_action_authority = internal_authority
         self._world = world
         self._last_check: str | None = None
+        config = getattr(orchestrator, "_config", None)
+        chat_control = getattr(config, "chat_control", None)
+        self._chat_control = chat_control
 
     # ── Polling ──────────────────────────────────────────────────────
 
@@ -109,37 +117,67 @@ class ChatCommandHandler:
             return
 
         for event in events:
-            # Each ChatEvent has .player.name and .message
-            sender = getattr(event, "player", None)
-            sender_name = getattr(sender, "name", "?") if sender else "?"
+            player = getattr(event, "player", None)
+            sender_name = getattr(player, "name", "") if player else ""
             message = getattr(event, "message", "")
-            line = f"<{sender_name}> {message}"
-            await self._process_line(line.strip())
+            await self._process_message(message, sender_name, player)
+
+    async def _process_message(self, message: str, sender_name: str, player: object | None) -> None:
+        """Process message text while deriving authority only from event metadata."""
+        match = _COMMAND_RE.match(message)
+        if not match:
+            return
+        command = match.group(1).strip().lower().removeprefix("/")
+        args = match.group(2).strip()
+        if command not in COMMANDS:
+            return
+        if command not in _PUBLIC_COMMANDS and not self._authorized_player(player):
+            logger.warning("Denied chat control command %s from untrusted player metadata", command)
+            return
+        await self.handle_command(command, args, sender_name, trusted_player=player)
+
+    def _authorized_player(self, player: object | None) -> bool:
+        if player is None:
+            return False
+        player_uuid = getattr(player, "uuid", None) or getattr(player, "unique_id", None)
+        allowed_uuids = {
+            str(value).strip().casefold()
+            for value in getattr(self._chat_control, "allowed_uuids", [])
+            if str(value).strip()
+        }
+        allowed_names = {
+            str(value).strip().casefold()
+            for value in getattr(self._chat_control, "allowed_names", [])
+            if str(value).strip()
+        }
+        if player_uuid is not None and str(player_uuid).strip():
+            # An event that supplies a UUID has a stronger identity than its
+            # display name. Never let an unlisted/malformed UUID fall back to
+            # a name allowlist entry; that would permit name-based spoofing.
+            return str(player_uuid).strip().casefold() in allowed_uuids
+        name = getattr(player, "name", None)
+        return bool(name and str(name).strip().casefold() in allowed_names)
 
     async def _process_line(self, line: str) -> None:
-        """Parse a single chat line and dispatch any command found."""
-        m = _COMMAND_RE.match(line)
-        if not m:
-            return
-
-        sender = m.group(1)
-        raw_cmd = m.group(2).strip().lower()
-        args = m.group(3).strip()
-
-        # Strip leading slash if present (some server formats include one)
-        if raw_cmd.startswith("/"):
-            raw_cmd = raw_cmd[1:]
-
-        if raw_cmd not in COMMANDS:
-            return
-
-        logger.info("Chat command from %s: %s %s", sender, raw_cmd, args)
-        await self.handle_command(raw_cmd, args, sender)
+        """Compatibility parser; formatted chat lines carry no trusted identity."""
+        match = re.match(r"^<([^>]+)>\s+(.*)$", line)
+        if match:
+            await self._process_message(match.group(2), match.group(1), None)
 
     # ── Dispatch ─────────────────────────────────────────────────────
 
-    async def handle_command(self, command: str, args: str, sender: str) -> None:
+    async def handle_command(
+        self,
+        command: str,
+        args: str,
+        sender: str,
+        *,
+        trusted_player: object | None = None,
+    ) -> None:
         """Route a parsed command to the appropriate handler."""
+        if command not in _PUBLIC_COMMANDS and not self._authorized_player(trusted_player):
+            logger.warning("Denied direct chat control dispatch without trusted player identity")
+            return
         dispatch = {
             "!status": self._cmd_status,
             "!stop": self._cmd_stop,
@@ -202,6 +240,7 @@ class ChatCommandHandler:
         result = await self._action_service.execute(
             ActionType.GOTO_TELEPORT,
             {"target": target},
+            authority=self._internal_action_authority,
         )
         if result.success:
             await self._send(f"@{sender} Teleported to {target}")
@@ -227,6 +266,7 @@ class ChatCommandHandler:
         result = await self._action_service.execute(
             ActionType.COME_TELEPORT,
             {"sender": sender},
+            authority=self._internal_action_authority,
         )
         if result.success:
             await self._send(f"@{sender} You have been teleported to me!")

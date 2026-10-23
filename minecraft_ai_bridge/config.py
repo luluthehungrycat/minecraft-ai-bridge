@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import math
+import re
 from pathlib import Path
 from typing import Literal
+from uuid import UUID
 
 import yaml
 from pydantic import Field, SecretStr, field_validator
@@ -122,6 +124,30 @@ class AuthzConfig(BaseSettings):
             raise ValueError("enabled authz requires steve_id and AUTHZ_CONTROLLER_TOKEN")
 
 
+class ChatControlConfig(BaseSettings):
+    """Explicit allowlist for state-changing commands received in chat."""
+
+    allowed_uuids: list[str] = Field(default_factory=list)
+    allowed_names: list[str] = Field(default_factory=list)
+
+    model_config = SettingsConfigDict(env_prefix="chat_control_")
+
+    @field_validator("allowed_uuids")
+    @classmethod
+    def normalize_allowed_uuids(cls, values: list[str]) -> list[str]:
+        try:
+            return [str(UUID(value.strip())) for value in values]
+        except (AttributeError, ValueError) as exc:
+            raise ValueError("chat control UUIDs must be valid UUIDs") from exc
+
+    @field_validator("allowed_names")
+    @classmethod
+    def validate_allowed_names(cls, values: list[str]) -> list[str]:
+        if any(not re.fullmatch(r"[A-Za-z0-9_]{1,16}", value) for value in values):
+            raise ValueError("chat control names must be Minecraft usernames")
+        return values
+
+
 class GoalConfig(BaseSettings):
     default: str = "Explore the world and gather resources"
     max_depth: int = 5
@@ -135,6 +161,7 @@ class AppConfig(BaseSettings):
     llm: LLMConfig = Field(default_factory=LLMConfig)
     bridge: BridgeConfig = Field(default_factory=BridgeConfig)
     authz: AuthzConfig = Field(default_factory=AuthzConfig)
+    chat_control: ChatControlConfig = Field(default_factory=ChatControlConfig)
     goals: GoalConfig = Field(default_factory=GoalConfig)
 
     model_config = SettingsConfigDict(env_prefix="app_")
@@ -164,7 +191,15 @@ class AppConfig(BaseSettings):
             raw = {}
 
         env_lookup = {key.casefold(): value for key, value in _os.environ.items()}
-        for section_name in ("minecraft", "mc_api", "llm", "bridge", "authz", "goals"):
+        for section_name in (
+            "minecraft",
+            "mc_api",
+            "llm",
+            "bridge",
+            "authz",
+            "chat_control",
+            "goals",
+        ):
             yaml_data = raw.get(section_name, {})
             if section_name == "authz" and "controller_token" in yaml_data:
                 raise ValueError(
