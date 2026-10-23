@@ -662,7 +662,7 @@ def _command_failed(response: str) -> bool:
 _PLAYER_TARGET_RE = re.compile(r"^[A-Za-z0-9_]{1,16}$")
 
 
-def _sanitize_player_target(target: str) -> str:
+def _sanitize_player_target(target: object) -> str:
     """Return a command-safe single-player target, or raise `ValueError`.
 
     Accepts Minecraft-style usernames only: letters, digits, and

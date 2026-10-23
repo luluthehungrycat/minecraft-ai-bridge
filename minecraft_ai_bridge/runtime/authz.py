@@ -677,7 +677,11 @@ class AuthzService:
             # ownership or shared Steve binding is not authority to revoke a
             # sibling credential (RFC-0001 section 5 assigns revoke to admins).
             is_self = authority_token is None or authority_token == token
-            if not is_self and not _has_admin(db, authority_token, "admin:steves"):
+            if (
+                authority_token is not None
+                and authority_token != token
+                and not _has_admin(db, authority_token, "admin:steves")
+            ):
                 raise PermissionError("admin:steves required to revoke another credential")
             if is_self:
                 presented = admin_target if admin_target else target

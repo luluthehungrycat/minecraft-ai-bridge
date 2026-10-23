@@ -29,6 +29,24 @@ from minecraft_ai_bridge.minecraft.observer import InventorySlot
 
 
 class TestExecuteAction:
+    @pytest.mark.parametrize(
+        ("action", "params"),
+        [
+            (ActionType.FOLLOW_TELEPORT, {"target": None}),
+            (ActionType.PROVISION_BOT, {"player_name": ["Bot"]}),
+            (ActionType.GOTO_TELEPORT, {"target": 42}),
+            (ActionType.COME_TELEPORT, {"sender": {"name": "Player"}}),
+        ],
+    )
+    async def test_internal_player_target_actions_reject_non_strings_without_dispatch(
+        self, mock_mc, action, params
+    ):
+        result = await execute_action(mock_mc, action, params)
+
+        assert not result.success
+        assert "invalid" in result.message.lower()
+        assert mock_mc.commands_ran == []
+
     async def test_unknown_action(self, mock_mc):
         result = await execute_action(mock_mc, ActionType.SCAN, {"radius": 5})
         assert result.success is True  # scan always succeeds

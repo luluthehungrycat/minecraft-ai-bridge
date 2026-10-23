@@ -201,6 +201,9 @@ class Orchestrator:
         Returns True if the agent should stop.
         """
         logger.info("─── Turn %d ───", self._turn)
+        world_adapter = self._world
+        if world_adapter is None:
+            raise RuntimeError("Orchestrator must connect before starting a step")
 
         # ── Check for in-game commands (N4) ──────────────────────
         if self._cmd_handler:
@@ -212,11 +215,11 @@ class Orchestrator:
         # ── Follow-mode support (N4) ─────────────────────────────
         if self._follow_target:
             try:
-                my_pos = await self._world.get_player_pos()
+                my_pos = await world_adapter.get_player_pos()
                 if my_pos is None:
                     pass
                 else:
-                    target_pos_raw = await self._world.run_command_blocking(
+                    target_pos_raw = await world_adapter.run_command_blocking(
                         f"data get entity {self._follow_target} Pos"
                     )
                     if target_pos_raw:
@@ -234,7 +237,7 @@ class Orchestrator:
                                 if dist > 4.0:
                                     if self._action_service is None:
                                         self._action_service = ActionService(
-                                            self._world,
+                                            world_adapter,
                                             policy=self._runtime_action_policy,
                                             internal_authority=self._internal_action_authority,
                                             safety_authority=self._safety_action_authority,
