@@ -6,15 +6,27 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import logging
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 
 from ..config import AppConfig
 from ..llm.client import LLMClient, OpenCodeServerClient, create_llm_client
 from ..llm.models import LLMResponse, Message, Role
 from ..llm.prompts import SYSTEM_PROMPT, format_failure_hint, format_state
-from ..minecraft import ActionResult, ActionType, McpqClient, Observer, WorldState, execute_action
+from ..minecraft import ActionResult, ActionType, McpqClient, Observer, WorldState
+from ..runtime import (
+    ActionPolicy,
+    ActionService,
+    AuthzControllerSession,
+    AuthzService,
+    EventJournal,
+    McpqWorldAdapter,
+    PolicyDecision,
+    SafetySupervisor,
+)
 from .chat_commands import ChatCommandHandler
 from .goal_manager import GoalManager
 from .inventory_manager import InventoryManager
@@ -22,6 +34,16 @@ from .memory import AgentMemory
 from .self_preservation import PreservationConfig, SelfPreservationLayer
 
 logger = logging.getLogger(__name__)
+
+_INTERNAL_ACTION_TYPES = frozenset(
+    {
+        ActionType.FOLLOW_TELEPORT,
+        ActionType.PROVISION_BOT,
+        ActionType.PREPARE_SAFE_SPAWN,
+        ActionType.GOTO_TELEPORT,
+        ActionType.COME_TELEPORT,
+    }
+)
 
 
 @dataclass
@@ -48,10 +70,20 @@ class Orchestrator:
         await orch.run("Build a house")
     """
 
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        action_policy: ActionPolicy | None = None,
+    ) -> None:
         self._config = config
         self._llm: LLMClient = create_llm_client(config)
         self._mc: McpqClient | None = None
+        self._world: McpqWorldAdapter | None = None
+        self._action_policy = action_policy
+        self._runtime_action_policy = action_policy
+        self._action_service: ActionService | None = None
+        self._authz_service: AuthzService | None = None
+        self._authz_session: AuthzControllerSession | None = None
         self._observer: Observer | None = None
         self._memory = AgentMemory(window=config.bridge.memory_window)
         self._goals = GoalManager(
@@ -80,6 +112,10 @@ class Orchestrator:
         # Self-preservation layer — reflex attack + find-food injection
         # Initialised lazily in _connect() once we have an MC client.
         self._preservation: SelfPreservationLayer | None = None
+        self._safety_supervisor: SafetySupervisor | None = None
+        self._safety_stop_event: asyncio.Event | None = None
+        self._safety_task: asyncio.Task[None] | None = None
+        self._event_journal: EventJournal | None = None
 
     # ── Public API ───────────────────────────────────────────────────
 
@@ -99,56 +135,59 @@ class Orchestrator:
             api_cfg.host,
             api_cfg.port,
         )
-        await self._connect()
-        logger.info("MCPQ connected — controlling player: %s", api_cfg.player_name)
+        try:
+            await self._connect()
+            logger.info("MCPQ connected — controlling player: %s", api_cfg.player_name)
+            self._start_safety_supervisor()
 
-        # 2. Set up goal hierarchy
-        logger.info("Decomposing goal into sub-tasks via LLM ...")
-        await self._goals.set_goal(goal_text)
-        logger.info("Goal decomposition complete — %d sub-goals", self._goals.sub_goal_count)
+            # 2. Set up goal hierarchy
+            logger.info("Decomposing goal into sub-tasks via LLM ...")
+            await self._goals.set_goal(goal_text)
+            logger.info("Goal decomposition complete — %d sub-goals", self._goals.sub_goal_count)
 
-        # 3. Main loop
-        done = False
-        while not done and self._turn < self._max_iterations:
-            self._turn += 1
-            try:
-                done = await self._step()
-            except Exception as exc:
-                self._consecutive_failures += 1
-                logger.exception(
-                    "Fatal error on turn %d (consecutive failures: %d)",
-                    self._turn,
-                    self._consecutive_failures,
-                )
-                await self._chat(
-                    f"Error on turn {self._turn}: {exc}. "
-                    f"Consecutive failures: {self._consecutive_failures}"
-                )
-
-                # Backoff sleep after unexpected crashes
-                await asyncio.sleep(min(5 * self._consecutive_failures, 30))
-
-            # Check for graceful shutdown on consecutive failures
-            if self._stop_requested or self._consecutive_failures >= self._max_failures:
-                if self._stop_requested:
-                    logger.info("Stop requested via in-game command.")
-                    await self._chat("Shutting down as requested.")
-                else:
-                    logger.error(
-                        "Too many consecutive failures (%d). Shutting down.",
+            # 3. Main loop
+            done = False
+            while not done and self._turn < self._max_iterations:
+                self._turn += 1
+                try:
+                    done = await self._step()
+                except Exception as exc:
+                    self._consecutive_failures += 1
+                    logger.exception(
+                        "Fatal error on turn %d (consecutive failures: %d)",
+                        self._turn,
                         self._consecutive_failures,
                     )
                     await self._chat(
-                        f"Too many errors ({self._consecutive_failures}). Shutting down."
+                        f"Error on turn {self._turn}: {exc}. "
+                        f"Consecutive failures: {self._consecutive_failures}"
                     )
-                break
 
-        logger.info(
-            "Agent finished after %d turns. Goal complete: %s",
-            self._turn,
-            self._goals.is_complete,
-        )
-        await self._disconnect()
+                    # Backoff sleep after unexpected crashes
+                    await asyncio.sleep(min(5 * self._consecutive_failures, 30))
+
+                if self._stop_requested or self._consecutive_failures >= self._max_failures:
+                    if self._stop_requested:
+                        logger.info("Stop requested via in-game command.")
+                        await self._chat("Shutting down as requested.")
+                    else:
+                        logger.error(
+                            "Too many consecutive failures (%d). Shutting down.",
+                            self._consecutive_failures,
+                        )
+                        await self._chat(
+                            f"Too many errors ({self._consecutive_failures}). Shutting down."
+                        )
+                    break
+
+            logger.info(
+                "Agent finished after %d turns. Goal complete: %s",
+                self._turn,
+                self._goals.is_complete,
+            )
+        finally:
+            await self._stop_safety_supervisor()
+            await self._disconnect()
 
     # ── Core step ────────────────────────────────────────────────────
 
@@ -169,11 +208,11 @@ class Orchestrator:
         # ── Follow-mode support (N4) ─────────────────────────────
         if self._follow_target:
             try:
-                my_pos = await self._mc.get_player_pos()
+                my_pos = await self._world.get_player_pos()
                 if my_pos is None:
                     pass
                 else:
-                    target_pos_raw = await self._mc.run_command_blocking(
+                    target_pos_raw = await self._world.run_command_blocking(
                         f"data get entity {self._follow_target} Pos"
                     )
                     if target_pos_raw:
@@ -189,10 +228,24 @@ class Orchestrator:
                                 dz = tz - my_pos[2]
                                 dist = (dx * dx + dz * dz) ** 0.5
                                 if dist > 4.0:
-                                    await self._mc.run_as_player(
-                                        f"execute as {self._follow_target} at @s "
-                                        f"run tp @p ^-3 ^ ^-3"
+                                    if self._action_service is None:
+                                        self._action_service = ActionService(
+                                            self._world,
+                                            policy=self._runtime_action_policy,
+                                        )
+                                    follow_result = await self._action_service.execute(
+                                        ActionType.FOLLOW_TELEPORT,
+                                        {"target": self._follow_target},
                                     )
+                                    if follow_result.success:
+                                        logger.info(
+                                            "Follow-mode teleport: %s", follow_result.message
+                                        )
+                                    else:
+                                        logger.warning(
+                                            "Follow-mode teleport failed: %s",
+                                            follow_result.message,
+                                        )
             except Exception:
                 pass
 
@@ -211,7 +264,9 @@ class Orchestrator:
         # the result via the regular last_action_result context on
         # the NEXT turn.
         reflex_result: ActionResult | None = None
-        if self._preservation is not None:
+        if self._safety_supervisor is not None:
+            reflex_result = self._safety_supervisor.take_nowait()
+        elif self._preservation is not None:
             reflex_result = await self._preservation.evaluate(world)
 
         retry_was_pending = self._retry_pending
@@ -242,15 +297,27 @@ class Orchestrator:
         if context.retry_hint:
             messages.append(Message(role=Role.USER, content=context.retry_hint))
 
-        response = await self._llm.decide(
-            system_prompt=SYSTEM_PROMPT,
-            messages=messages,
-        )
+        if reflex_result is not None:
+            response = LLMResponse(action="wait")
+        elif self._safety_supervisor is None:
+            response = await self._llm.decide(system_prompt=SYSTEM_PROMPT, messages=messages)
+        else:
+            response, safety_result = await self._decide_with_safety(messages)
+            if safety_result is not None:
+                reflex_result = safety_result
 
         if self._verbose:
             logger.info(
                 "LLM decision: %s → %s", response.action, json.dumps(response.action_params)
             )
+
+        completed_result: ActionResult | None = None
+        if (
+            reflex_result is None
+            and self._safety_supervisor is not None
+            and response.action == ActionType.WAIT.value
+        ):
+            completed_result, reflex_result = await self._wait_or_safety(response)
 
         # ── Act ───────────────────────────────────────────────────
         # A retry is evaluated on the following turn, but this block
@@ -271,6 +338,10 @@ class Orchestrator:
                 data={"retry_rejected": "identical_action"},
             )
             self._last_result = result
+            response_action = response.action
+            self._clear_retry()
+        elif completed_result is not None:
+            result = completed_result
             response_action = response.action
             self._clear_retry()
         else:
@@ -330,6 +401,122 @@ class Orchestrator:
         self._memory.record_observation(state)
         return state
 
+    async def _decide_with_safety(
+        self, messages: list[Message]
+    ) -> tuple[LLMResponse, ActionResult | None]:
+        """Race one LLM decision against an independently scheduled intervention."""
+        supervisor = self._safety_supervisor
+        assert supervisor is not None
+        pending = supervisor.take_nowait()
+        if pending is not None:
+            return LLMResponse(action="wait"), pending
+
+        decision_task = asyncio.create_task(
+            self._llm.decide(system_prompt=SYSTEM_PROMPT, messages=messages)
+        )
+        intervention_task = asyncio.create_task(supervisor.wait_for_intervention())
+        try:
+            done, _ = await asyncio.wait(
+                {decision_task, intervention_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if intervention_task in done:
+                intervention = intervention_task.result()
+                decision_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await decision_task
+                return LLMResponse(action="wait"), intervention
+
+            response = decision_task.result()
+            intervention_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await intervention_task
+            # Resolve a result published at the same instant as the LLM.
+            pending = supervisor.take_nowait()
+            if pending is not None:
+                return LLMResponse(action="wait"), pending
+            return response, None
+        except BaseException:
+            decision_task.cancel()
+            intervention_task.cancel()
+            await asyncio.gather(decision_task, intervention_task, return_exceptions=True)
+            raise
+
+    async def _wait_or_safety(
+        self, response: LLMResponse
+    ) -> tuple[ActionResult | None, ActionResult | None]:
+        """Run a strategic WAIT unless the supervisor publishes an intervention."""
+        supervisor = self._safety_supervisor
+        assert supervisor is not None
+        pending = supervisor.take_nowait()
+        if pending is not None:
+            return None, pending
+
+        wait_task = asyncio.create_task(self._act(response))
+        intervention_task = asyncio.create_task(supervisor.wait_for_intervention())
+        try:
+            done, _ = await asyncio.wait(
+                {wait_task, intervention_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if intervention_task in done:
+                intervention = intervention_task.result()
+                wait_task.cancel()
+                await asyncio.gather(wait_task, return_exceptions=True)
+                return None, intervention
+
+            result = wait_task.result()
+            intervention_task.cancel()
+            await asyncio.gather(intervention_task, return_exceptions=True)
+            pending = supervisor.take_nowait()
+            if pending is not None:
+                return None, pending
+            return result, None
+        except BaseException:
+            wait_task.cancel()
+            intervention_task.cancel()
+            await asyncio.gather(wait_task, intervention_task, return_exceptions=True)
+            raise
+
+    def _start_safety_supervisor(self) -> None:
+        """Start periodic preservation checks after runtime wiring is ready."""
+        if self._preservation is None or self._safety_task is not None:
+            return
+        if self._action_service is not None:
+            self._action_service.enable_safety_preemption()
+        self._safety_supervisor = SafetySupervisor(
+            self._observe,
+            self._preservation.evaluate,
+            on_intervention_consumed=(
+                self._action_service.acknowledge_safety_intervention
+                if self._action_service is not None
+                else None
+            ),
+            event_sink=(self._event_journal.append if self._event_journal is not None else None),
+        )
+        self._safety_stop_event = asyncio.Event()
+        self._safety_task = asyncio.create_task(
+            self._safety_supervisor.run(self._safety_stop_event),
+            name="minecraft-ai-bridge-safety-supervisor",
+        )
+
+    async def _stop_safety_supervisor(self) -> None:
+        """Stop the polling task before disconnecting the world adapter."""
+        if self._safety_stop_event is not None:
+            self._safety_stop_event.set()
+        if self._safety_task is not None:
+            await self._safety_task
+        if self._safety_supervisor is not None:
+            await self._safety_supervisor.close()
+        if self._action_service is not None:
+            self._action_service.disable_safety_preemption()
+        if self._event_journal is not None:
+            self._event_journal.close()
+            self._event_journal = None
+        self._safety_task = None
+        self._safety_stop_event = None
+        self._safety_supervisor = None
+
     def _build_context(self, world: WorldState) -> AgentContext:
         """Build structured context for the LLM prompt."""
         state_dict = world.__dict__ if hasattr(world, "__dict__") else {}
@@ -384,8 +571,9 @@ class Orchestrator:
             return ActionType.WAIT
 
     async def _act(self, response: LLMResponse) -> ActionResult:
-        """Execute the LLM's chosen action via the MCPQ plugin."""
+        """Execute the LLM's chosen action through the runtime action gate."""
         assert self._mc is not None
+        assert self._world is not None
 
         try:
             action_type = ActionType(response.action)
@@ -397,10 +585,27 @@ class Orchestrator:
                 message=f"Unknown action: {response.action}",
             )
 
-        result = await execute_action(
-            self._mc,
+        if action_type in _INTERNAL_ACTION_TYPES:
+            # Internal-only actions (follow teleport, startup provisioning,
+            # and the !goto/!come chat-command teleports) must never be
+            # reachable from an LLM response, even though they exist in the
+            # ActionType enum. Reject them at the dispatch boundary so
+            # policy/audit cannot be reached with the identity of a trusted
+            # orchestrator-issued action.
+            logger.warning("LLM attempted internal action: %s", response.action)
+            return ActionResult(
+                success=False,
+                action=ActionType.WAIT,
+                message=f"Internal action not available: {response.action}",
+            )
+
+        if self._action_service is None:
+            self._action_service = ActionService(self._world, policy=self._runtime_action_policy)
+
+        result = await self._action_service.execute(
             action_type,
             response.action_params,
+            preemptible=True,
         )
 
         self._last_result = result
@@ -418,14 +623,15 @@ class Orchestrator:
 
     async def _chat(self, message: str) -> None:
         """Send a chat message as the agent."""
-        if self._mc and self._mc.connected:
+        if self._world and self._world.connected:
             with contextlib.suppress(Exception):
-                await self._mc.post_to_chat(message)
+                await self._world.post_to_chat(message)
 
     # ── Connection management ────────────────────────────────────────
 
     async def _connect(self) -> None:
         """Connect to the Minecraft server via the MCPQ plugin."""
+        self._config.authz.validate_controller_credentials()
         api_cfg = self._config.mc_api
         self._mc = McpqClient(
             host=api_cfg.host,
@@ -433,7 +639,28 @@ class Orchestrator:
             player_name=api_cfg.player_name,
         )
         await self._mc.connect()
-        self._observer = Observer(self._mc)
+        # Exactly one adapter wraps the connected client; raw MCPQ access
+        # stays confined to connection lifecycle (connect/disconnect).
+        self._world = McpqWorldAdapter(self._mc)
+        policy = self._action_policy
+        if self._config.authz.enabled:
+            authz_config = self._config.authz
+            self._authz_service = AuthzService(authz_config.database_path)
+            token = authz_config.controller_token.get_secret_value()
+            credential = self._authz_service.authenticate(token)
+            self._authz_session = self._authz_service.acquire_session(
+                token,
+                authz_config.steve_id,
+                owner_id=credential.owner_id,
+                lease_expires_at=datetime.now(UTC)
+                + timedelta(seconds=authz_config.session_lease_seconds),
+            )
+            authz_policy = self._authz_service.action_policy(self._authz_session)
+            policy = self._combine_action_policies(authz_policy, self._action_policy)
+        self._runtime_action_policy = policy
+        self._action_service = ActionService(self._world, policy=policy)
+        self._observer = Observer(self._world)
+        self._event_journal = EventJournal(self._config.bridge.event_journal_path)
         logger.info("Connected to MCPQ — player name: %s", api_cfg.player_name)
 
         # ── Ensure a fake player entity exists ────────────────────────
@@ -445,7 +672,7 @@ class Orchestrator:
 
         try:
             # Try getting the player's position — if it works, they exist
-            pos = await self._mc.get_player_pos()
+            pos = await self._world.get_player_pos()
             if pos is not None:
                 logger.info("Player '%s' already present at %s", player_name, pos)
             else:
@@ -453,23 +680,22 @@ class Orchestrator:
         except Exception:
             # Player doesn't exist yet — spawn via /botsummon
             logger.info("Player '%s' not found — summoning bot …", player_name)
-            try:
-                spawn_result = await self._mc.run_command_blocking(f"botsummon {player_name}")
-                logger.info("Bot summon command: %s", spawn_result or "OK")
-            except Exception as spawn_err:
-                logger.warning(
-                    "Failed to summon bot via /botsummon: %s  "
-                    "Continuing anyway — some MCPQ ops will fail "
-                    "without a player entity.",
-                    spawn_err,
-                )
 
+            provision_result = await self._provision_bot(player_name)
+            logger.warning(
+                "Bot provisioning: %s",
+                provision_result.message,
+            )
+            if not provision_result.success:
+                logger.warning(
+                    "Continuing anyway — some MCPQ ops will fail without a player entity.",
+                )
             # Poll until the player entity is confirmed present
             logger.info("Waiting for player '%s' to be registered …", player_name)
             for _poll_attempt in range(10):
                 await asyncio.sleep(1)
                 try:
-                    pos = await self._mc.get_player_pos()
+                    pos = await self._world.get_player_pos()
                     if pos is not None:
                         logger.info("Player '%s' confirmed at %s", player_name, pos)
                         break
@@ -485,47 +711,13 @@ class Orchestrator:
         # The fake player often spawns underwater or in unsafe terrain.
         # We teleport to a high Y (above any terrain) and build a solid
         # platform underneath so the bot stands on dry land.
-        safe_x, safe_y, safe_z = 0, 65, 0
-        logger.info(
-            "Teleporting player '%s' to (%d, %d, %d) …",
-            player_name,
-            safe_x,
-            safe_y,
-            safe_z,
-        )
-        for attempt in range(3):
-            try:
-                await self._mc.teleport_player(float(safe_x), float(safe_y), float(safe_z))
-                # Build a 3×3 solid platform under the player
-                for dx in (-1, 0, 1):
-                    for dz in (-1, 0, 1):
-                        with contextlib.suppress(Exception):
-                            await self._mc.set_block(
-                                "dirt",
-                                safe_x + dx,
-                                safe_y - 1,
-                                safe_z + dz,
-                            )
-                await asyncio.sleep(2)
-                safe_pos = await self._mc.get_player_pos()
-                if safe_pos:
-                    logger.info(
-                        "Player at (%.1f, %.1f, %.1f) — feet: %s",
-                        *safe_pos,
-                        await self._mc.get_block(
-                            int(safe_pos[0]),
-                            int(safe_pos[1]) - 1,
-                            int(safe_pos[2]),
-                        ),
-                    )
-                    break
-                logger.warning("Teleport attempt %d: position unknown", attempt + 1)
-            except Exception as safe_err:
-                logger.warning("Safe teleport attempt %d failed: %s", attempt + 1, safe_err)
-                await asyncio.sleep(2)
 
+        # Routed through the action service as the internal
+        # `prepare_safe_spawn` action so policy and audit can distinguish
+        # trusted startup provisioning from ordinary gameplay mutations.
+        await self._prepare_safe_spawn()
         # Initialise sub-systems (N1 inventory, N4 chat commands)
-        self._inventory = InventoryManager(self._mc)
+        self._inventory = InventoryManager(self._world)
         try:
             await self._inventory.refresh()
             logger.info("Initial inventory: %s", self._inventory.summary)
@@ -534,12 +726,16 @@ class Orchestrator:
 
         self._cmd_handler = ChatCommandHandler(self)
 
-        # Self-preservation layer (reflex attack + find-food injection)
+        # Self-preservation layer (reflex attack + find-food injection).
+        # The shared action service is passed so the layer's mutating
+        # reflexes (ATTACK, EAT, HEAL) use the same policy/audit boundary
+        # as LLM-selected actions; its observation checks stay direct.
         self._preservation = SelfPreservationLayer(
-            mc=self._mc,
+            mc=self._world,
             goal_manager=self._goals,
             memory=self._memory,
             config=PreservationConfig(),
+            action_service=self._action_service,
         )
 
         # Persist the goal in memory database (N3)
@@ -551,21 +747,154 @@ class Orchestrator:
 
     async def _disconnect(self) -> None:
         """Clean up the MCPQ connection, memory database, and other resources."""
-        if self._mc:
-            await self._chat("AI Agent signing off.")
-            await self._mc.disconnect()
+        try:
+            if self._authz_service is not None:
+                try:
+                    if self._authz_session is not None:
+                        with contextlib.suppress(PermissionError):
+                            self._authz_service.release_session(self._authz_session)
+                finally:
+                    try:
+                        self._authz_service.close()
+                    finally:
+                        self._authz_service = None
+                        self._authz_session = None
+        finally:
+            try:
+                if self._mc:
+                    try:
+                        await self._chat("AI Agent signing off.")
+                    finally:
+                        await self._mc.disconnect()
+            finally:
+                try:
+                    if self._event_journal is not None:
+                        self._event_journal.close()
+                        self._event_journal = None
+                finally:
+                    try:
+                        # Persist memory database (N3).
+                        if hasattr(self._memory, "close"):
+                            with contextlib.suppress(Exception):
+                                self._memory.close()
+                    finally:
+                        # Clean up OpenCodeServerClient HTTP session if applicable.
+                        if isinstance(self._llm, OpenCodeServerClient):
+                            with contextlib.suppress(Exception):
+                                await self._llm.close()
 
-        # Persist memory database (N3)
-        if hasattr(self._memory, "close"):
-            with contextlib.suppress(Exception):
-                self._memory.close()
+    @staticmethod
+    def _combine_action_policies(
+        authz_policy: ActionPolicy,
+        additional_policy: ActionPolicy | None,
+    ) -> ActionPolicy:
+        """Require local session authorization and any caller-supplied policy."""
 
-        # Clean up OpenCodeServerClient HTTP session if applicable
-        if isinstance(self._llm, OpenCodeServerClient):
-            with contextlib.suppress(Exception):
-                await self._llm.close()
+        async def combined(request):
+            for index, policy in enumerate((authz_policy, additional_policy)):
+                if policy is None:
+                    continue
+                decision = policy(request)
+                if inspect.isawaitable(decision):
+                    decision = await decision
+                if not decision.allowed:
+                    return decision
+                if index == 1:
+                    # A caller policy may await while the session is revoked,
+                    # expires, or is fenced by ownership transfer. Revalidate
+                    # at the dispatch boundary after that await completes.
+                    final_decision = authz_policy(request)
+                    if inspect.isawaitable(final_decision):
+                        final_decision = await final_decision
+                    if not final_decision.allowed:
+                        return final_decision
+            return PolicyDecision(allowed=True)
+
+        return combined
 
     # ── Logging ──────────────────────────────────────────────────────
+
+    async def _provision_bot(self, player_name: str) -> ActionResult:
+        """Summon the bot entity through the action gate (startup-only).
+
+        Uses the internal `provision_bot` action so the trusted startup
+        provisioning path is visible to policy and audit. The player name
+        is validated as a strict Minecraft username before command
+        interpolation. Returns the service's ActionResult unchanged: a
+        failed result is logged by the caller and startup continues,
+        preserving the previous degraded-start behavior.
+        """
+        assert self._mc is not None
+        assert self._world is not None
+        assert self._action_service is not None
+
+        try:
+            return await self._action_service.execute(
+                ActionType.PROVISION_BOT,
+                {"player_name": player_name},
+            )
+        except Exception as provision_err:
+            logger.warning(
+                "Failed to summon bot via /botsummon: %s  "
+                "Continuing anyway — some MCPQ ops will fail "
+                "without a player entity.",
+                provision_err,
+            )
+            return ActionResult(
+                success=False,
+                action=ActionType.PROVISION_BOT,
+                message=f"Failed to summon bot via /botsummon: {provision_err}",
+            )
+
+    async def _prepare_safe_spawn(self) -> None:
+        """Teleport to the startup spawn point and place a 3x3 dirt platform."""
+        assert self._mc is not None
+        assert self._world is not None
+        assert self._action_service is not None
+        player_name = self._config.mc_api.player_name
+        safe_x, safe_y, safe_z = 0, 65, 0
+        logger.info(
+            "Teleporting player '%s' to (%d, %d, %d) …",
+            player_name,
+            safe_x,
+            safe_y,
+            safe_z,
+        )
+        for attempt in range(3):
+            try:
+                result = await self._action_service.execute(
+                    ActionType.PREPARE_SAFE_SPAWN,
+                    {"x": safe_x, "y": safe_y, "z": safe_z},
+                )
+                if not result.success:
+                    logger.warning(
+                        "Safe teleport attempt %d: %s",
+                        attempt + 1,
+                        result.message,
+                    )
+                    await asyncio.sleep(2)
+                    continue
+                await asyncio.sleep(2)
+                safe_pos = await self._world.get_player_pos()
+                if safe_pos:
+                    logger.info(
+                        "Player at (%.1f, %.1f, %.1f) — feet: %s",
+                        *safe_pos,
+                        await self._world.get_block(
+                            int(safe_pos[0]),
+                            int(safe_pos[1]) - 1,
+                            int(safe_pos[2]),
+                        ),
+                    )
+                    return
+                logger.warning("Teleport attempt %d: position unknown", attempt + 1)
+            except Exception as safe_err:
+                logger.warning(
+                    "Safe teleport attempt %d failed: %s",
+                    attempt + 1,
+                    safe_err,
+                )
+                await asyncio.sleep(2)
 
     def _log_context(self, ctx: AgentContext) -> None:
         """Pretty-print context in verbose mode."""

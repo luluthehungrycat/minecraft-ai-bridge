@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .actions import ActionResult, ActionType, execute_action
-from .mc_api import McpqClient
+from .world_types import WorldAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +61,7 @@ class Observer:
     the same action-execution layer.
     """
 
-    def __init__(self, mc: McpqClient) -> None:
+    def __init__(self, mc: WorldAdapter) -> None:
         self._mc = mc
         self._biome_cache: dict[tuple[str, int, int, int], str] = {}
 

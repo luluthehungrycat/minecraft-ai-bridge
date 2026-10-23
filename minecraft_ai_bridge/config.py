@@ -1,10 +1,13 @@
 """Configuration management via YAML + environment variable overrides."""
 
+from __future__ import annotations
+
+import math
 from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import Field, field_validator
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -89,8 +92,34 @@ class BridgeConfig(BaseSettings):
     cycle_delay: float = 1.0
     memory_window: int = 20
     verbose: bool = True
+    event_journal_path: str = "data/safety-events.sqlite3"
 
     model_config = SettingsConfigDict(env_prefix="bridge_")
+
+
+class AuthzConfig(BaseSettings):
+    """Optional local credential gate for the built-in controller session."""
+
+    enabled: bool = False
+    database_path: str = "data/authz.sqlite3"
+    steve_id: str = ""
+    controller_token: SecretStr = SecretStr("")
+    session_lease_seconds: float = 3600
+
+    model_config = SettingsConfigDict(env_prefix="authz_")
+
+    @field_validator("session_lease_seconds")
+    @classmethod
+    def validate_session_lease(cls, value: float) -> float:
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("authz session lease must be a finite positive number")
+        return value
+
+    def validate_controller_credentials(self) -> None:
+        if self.enabled and (
+            not self.steve_id.strip() or not self.controller_token.get_secret_value()
+        ):
+            raise ValueError("enabled authz requires steve_id and AUTHZ_CONTROLLER_TOKEN")
 
 
 class GoalConfig(BaseSettings):
@@ -105,12 +134,13 @@ class AppConfig(BaseSettings):
     mc_api: MCPQConfig = Field(default_factory=MCPQConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     bridge: BridgeConfig = Field(default_factory=BridgeConfig)
+    authz: AuthzConfig = Field(default_factory=AuthzConfig)
     goals: GoalConfig = Field(default_factory=GoalConfig)
 
     model_config = SettingsConfigDict(env_prefix="app_")
 
     @classmethod
-    def from_yaml(cls, path: str | Path = "config.yaml") -> "AppConfig":
+    def from_yaml(cls, path: str | Path = "config.yaml") -> AppConfig:
         """Load config from a YAML file with env-var overrides.
 
         Priority: environment vars > YAML > field defaults.
@@ -120,25 +150,33 @@ class AppConfig(BaseSettings):
         path = Path(path)
 
         # Start from pure env-resolved config (env > defaults)
-        cfg = cls()
+        # Defer cross-field AuthzConfig validation until YAML and environment
+        # values have been merged. Otherwise env-enabled authz can fail on
+        # this intermediate object before its Steve ID is read from YAML.
+        cfg = cls(authz=AuthzConfig(enabled=False))
 
-        if not path.exists():
-            return cfg
-
-        with open(path) as f:
-            raw = yaml.safe_load(f) or {}
+        if path.exists():
+            with open(path) as f:
+                raw = yaml.safe_load(f) or {}
+        else:
+            raw = {}
         if not isinstance(raw, dict):
-            return cfg
+            raw = {}
 
-        for section_name in ("minecraft", "mc_api", "llm", "bridge", "goals"):
+        env_lookup = {key.casefold(): value for key, value in _os.environ.items()}
+        for section_name in ("minecraft", "mc_api", "llm", "bridge", "authz", "goals"):
             yaml_data = raw.get(section_name, {})
+            if section_name == "authz" and "controller_token" in yaml_data:
+                raise ValueError(
+                    "authz.controller_token must be supplied by an environment variable"
+                )
 
             # Gather env-var overrides for this section
             section_model_cls = type(getattr(cfg, section_name))
             prefix: str = section_model_cls.model_config.get("env_prefix", "")
             env_data: dict = {}
             for field_name in section_model_cls.model_fields:
-                env_val = _os.getenv((prefix + field_name).upper())
+                env_val = env_lookup.get((prefix + field_name).casefold())
                 if env_val is not None:
                     env_data[field_name] = env_val
 
@@ -150,4 +188,5 @@ class AppConfig(BaseSettings):
                 merged = section_model_cls(**merged_data)
                 setattr(cfg, section_name, merged)
 
+        cfg.authz.validate_controller_credentials()
         return cfg

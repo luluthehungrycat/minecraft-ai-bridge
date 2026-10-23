@@ -66,6 +66,8 @@ services:
       LLM_OPENROUTER_API_KEY: "${OPENROUTER_API_KEY}"
       # Persistent memory database (SQLite)
       AGENT_MEMORY_DB: /app/data/agent_memory.db
+      # Durable safety intervention event journal
+      BRIDGE_EVENT_JOURNAL_PATH: /app/data/safety-events.sqlite3
     # Array form keeps the goal as a single argument (no shell splitting)
     command: ["--verbose", "${GOAL:-Explore the area and report what you see}"]
     # The bridge has built-in retry logic (20 attempts with backoff),

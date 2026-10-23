@@ -31,6 +31,15 @@ bridge:
   cycle_delay: 1.0
   memory_window: 20
   verbose: true
+  event_journal_path: data/safety-events.sqlite3
+
+# Optional local AuthzService gate for the built-in controller. Keep the
+# bearer token in AUTHZ_CONTROLLER_TOKEN, never in this YAML file.
+authz:
+  enabled: false
+  database_path: data/authz.sqlite3
+  steve_id: ""
+  session_lease_seconds: 3600
 
 goals:
   default: "Explore the world and gather resources"

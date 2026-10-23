@@ -22,6 +22,9 @@ import logging
 import re
 from typing import TYPE_CHECKING
 
+from ..minecraft.actions import ActionType
+from ..runtime import ActionService, McpqWorldAdapter
+
 if TYPE_CHECKING:
     from .orchestrator import Orchestrator
 
@@ -55,6 +58,34 @@ class ChatCommandHandler:
 
     def __init__(self, orchestrator: Orchestrator) -> None:
         self._orch = orchestrator
+        # Resolve the world reference once: the orchestrator's adapter when
+        # present, otherwise a wrapper around a legacy raw MCPQ client so
+        # harness/direct construction keeps polling, status, and chat replies
+        # working. Use the orchestrator's shared ActionService when present
+        # so chat teleports share the same policy hook and audit trace as
+        # other mutations; direct/test construction falls back to a local
+        # service bound to the resolved world (no direct run_as_player
+        # bypass). A harness exposing only an ActionService (with no
+        # adapter and no raw client) resolves the world from that service
+        # so polling, status, and replies still work.
+        service = getattr(orchestrator, "_action_service", None)
+        world = getattr(orchestrator, "_world", None)
+        if world is None:
+            mc = getattr(orchestrator, "_mc", None)
+            if mc is not None:
+                world = McpqWorldAdapter(mc)
+        if world is None and service is not None:
+            world = service.world
+        if service is None:
+            if world is None:
+                raise ValueError(
+                    "ChatCommandHandler requires an orchestrator with a "
+                    "world adapter, an ActionService, or a raw MCPQ client"
+                )
+            policy = getattr(orchestrator, "_action_policy", None)
+            service = ActionService(world, policy=policy)
+        self._action_service = service
+        self._world = world
         self._last_check: str | None = None
 
     # ── Polling ──────────────────────────────────────────────────────
@@ -65,12 +96,12 @@ class ChatCommandHandler:
         Uses MCPQ's ``ChatEvent`` polling API to catch in-game chat
         messages.  Should be called once per agent turn.
         """
-        mc = getattr(self._orch, "_mc", None)
-        if mc is None:
+        world = self._world
+        if world is None:
             return
 
         try:
-            events = await mc.get_chat_events()
+            events = await world.get_chat_events()
         except Exception:
             return
 
@@ -133,10 +164,10 @@ class ChatCommandHandler:
             f"  Turns: {getattr(orch, '_turn', 0)}",
         ]
         # Add position if available
-        mc = getattr(orch, "_mc", None)
-        if mc and mc.connected:
+        world = self._world
+        if world and world.connected:
             try:
-                pos = await mc.get_player_pos()
+                pos = await world.get_player_pos()
                 if pos:
                     lines.append(f"  Position: ({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f})")
             except Exception:
@@ -168,13 +199,17 @@ class ChatCommandHandler:
             await self._send(f"@{sender} Usage: !goto <player>")
             return
         target = args.split()[0]
-        mc = getattr(self._orch, "_mc", None)
-        if mc and mc.connected:
-            try:
-                await mc.run_as_player(f"tp @p {target}")
-                await self._send(f"@{sender} Teleported to {target}")
-            except Exception as exc:
-                await self._send(f"@{sender} Could not teleport to {target}: {exc}")
+        result = await self._action_service.execute(
+            ActionType.GOTO_TELEPORT,
+            {"target": target},
+        )
+        if result.success:
+            await self._send(f"@{sender} Teleported to {target}")
+        else:
+            # ActionService reports failures as results (and handler
+            # exceptions become failed results in execute_action), so the
+            # chat response must surface them explicitly.
+            await self._send(f"@{sender} Could not teleport to {target}: {result.message}")
 
     async def _cmd_follow(self, args: str, sender: str) -> None:
         """Toggle follow-mode for a named player."""
@@ -189,13 +224,14 @@ class ChatCommandHandler:
 
     async def _cmd_come(self, args: str, sender: str) -> None:
         """Teleport the sender to the agent's position."""
-        mc = getattr(self._orch, "_mc", None)
-        if mc and mc.connected:
-            try:
-                await mc.run_as_player(f"tp {sender} @p")
-                await self._send(f"@{sender} You have been teleported to me!")
-            except Exception as exc:
-                await self._send(f"@{sender} Could not teleport you: {exc}")
+        result = await self._action_service.execute(
+            ActionType.COME_TELEPORT,
+            {"sender": sender},
+        )
+        if result.success:
+            await self._send(f"@{sender} You have been teleported to me!")
+        else:
+            await self._send(f"@{sender} Could not teleport you: {result.message}")
 
     async def _cmd_help(self, args: str, sender: str) -> None:
         """List available commands."""
@@ -209,8 +245,8 @@ class ChatCommandHandler:
     # ── Helper ───────────────────────────────────────────────────────
 
     async def _send(self, message: str) -> None:
-        """Send a chat message via the MCPQ client."""
-        mc = getattr(self._orch, "_mc", None)
-        if mc and mc.connected:
+        """Send a chat message through the world adapter."""
+        world = self._world
+        if world and world.connected:
             with contextlib.suppress(Exception):
-                await mc.post_to_chat(message)
+                await world.post_to_chat(message)

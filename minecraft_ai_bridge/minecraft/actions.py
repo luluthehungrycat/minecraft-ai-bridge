@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from .observer import InventorySlot
 
-from .mc_api import McpqClient
+from .world_types import WorldAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +37,22 @@ class ActionType(StrEnum):
     JUMP = "jump"
     SPRINT = "sprint"  # faster forward movement (1.0-block steps)
     TELEPORT = "teleport"
+    # Internal-only: dispatched by the orchestrator for `!follow` mode.
+    # Deliberately omitted from the LLM action space (ACTION_TOOL enum).
+    FOLLOW_TELEPORT = "follow_teleport"
+    # Internal-only: dispatched by the orchestrator for trusted startup
+    # provisioning (bot summon and safe-spawn platform). Deliberately
+    # omitted from the LLM action space (ACTION_TOOL enum).
+    PROVISION_BOT = "provision_bot"
+    PREPARE_SAFE_SPAWN = "prepare_safe_spawn"
+    # Internal-only: dispatched by the built-in chat command handler for
+    # !goto (bot teleports to a named player) and !come (sender teleports
+    # to the bot). Deliberately omitted from the LLM action space
+    # (ACTION_TOOL enum); the orchestrator rejects them if a model names
+    # them, so chat-issued teleports keep distinct policy/audit identities
+    # from LLM strategic teleports.
+    GOTO_TELEPORT = "goto_teleport"
+    COME_TELEPORT = "come_teleport"
 
     # ── Interaction ─────────────────────────────────────────────────
     BREAK_BLOCK = "break_block"
@@ -393,7 +409,7 @@ def _is_artificial(block_id: str) -> bool:
 
 
 async def _can_move_to(
-    mc: McpqClient,
+    mc: WorldAdapter,
     x: int,
     y: int,
     z: int,
@@ -425,7 +441,7 @@ async def _can_move_to(
 
 
 async def _walk_toward(
-    mc: McpqClient,
+    mc: WorldAdapter,
     target_x: float,
     target_z: float,
     step_size: float = 0.5,
@@ -575,13 +591,13 @@ async def _walk_toward(
 
 # ── Action execution ────────────────────────────────────────────────────
 
-# Handlers now receive an McpqClient instead of RCONClient.  MCPQ gives
-# direct world-manipulation and player-control APIs — much richer than
-# what was possible through RCON commands alone.
+# Handlers receive a transport-independent WorldAdapter instead of the
+# legacy RCONClient. MCPQ gives direct world-manipulation and
+# player-control APIs — much richer than RCON commands alone.
 
 
 async def execute_action(
-    mc: McpqClient,
+    mc: WorldAdapter,
     action_type: ActionType,
     params: dict[str, Any] | None = None,
 ) -> ActionResult:
@@ -614,10 +630,10 @@ async def execute_action(
 
 # ── Individual action handlers ─────────────────────────────────────────
 
-Handler = Callable[[McpqClient, dict[str, Any]], Awaitable[ActionResult]]
+Handler = Callable[[WorldAdapter, dict[str, Any]], Awaitable[ActionResult]]
 
 
-async def _cmd(mc: McpqClient, cmd: str) -> str:
+async def _cmd(mc: WorldAdapter, cmd: str) -> str:
     """Run a command as the configured player and return stripped response.
 
     Substitutes ``@p`` with the actual player name so commands always
@@ -643,10 +659,29 @@ def _command_failed(response: str) -> bool:
     return any(marker in normalized for marker in _COMMAND_FAILURE_MARKERS)
 
 
+_PLAYER_TARGET_RE = re.compile(r"^[A-Za-z0-9_]{1,16}$")
+
+
+def _sanitize_player_target(target: str) -> str:
+    """Return a command-safe single-player target, or raise `ValueError`.
+
+    Accepts Minecraft-style usernames only: letters, digits, and
+    underscores, at most 16 characters. Selectors (`@a`, `@e[...]`),
+    quotes, whitespace, and command metacharacters are rejected so a
+    target can never alter command structure when embedded in
+    `execute as <target>` or `data get entity <target>` commands.
+    """
+    if not isinstance(target, str):
+        raise ValueError("target must be a string")
+    if not _PLAYER_TARGET_RE.fullmatch(target):
+        raise ValueError(f"target {target!r} is not a valid Minecraft username")
+    return target
+
+
 # ── Movement ────────────────────────────────────────────────────────────
 
 
-async def _move_to(mc: McpqClient, params: dict) -> ActionResult:
+async def _move_to(mc: WorldAdapter, params: dict) -> ActionResult:
     x = params.get("x", 0)
     y = params.get("y", 0)
     z = params.get("z", 0)
@@ -659,7 +694,7 @@ async def _move_to(mc: McpqClient, params: dict) -> ActionResult:
     )
 
 
-async def _move_forward(mc: McpqClient, params: dict) -> ActionResult:
+async def _move_forward(mc: WorldAdapter, params: dict) -> ActionResult:
     """Move forward in small steps with collision detection.
 
     Uses caret-relative teleport for small (0.5 block) steps, checking
@@ -736,7 +771,7 @@ async def _move_forward(mc: McpqClient, params: dict) -> ActionResult:
     )
 
 
-async def _move_back(mc: McpqClient, params: dict) -> ActionResult:
+async def _move_back(mc: WorldAdapter, params: dict) -> ActionResult:
     """Move backward in small steps with collision detection."""
     steps = params.get("steps", 2)
     step_size = 0.5
@@ -789,7 +824,7 @@ async def _move_back(mc: McpqClient, params: dict) -> ActionResult:
     )
 
 
-async def _sprint(mc: McpqClient, params: dict) -> ActionResult:
+async def _sprint(mc: WorldAdapter, params: dict) -> ActionResult:
     """Sprint forward — faster forward movement with 1.0-block steps.
 
     Uses larger steps than ``move_forward``, ideal for open terrain.
@@ -848,7 +883,7 @@ async def _sprint(mc: McpqClient, params: dict) -> ActionResult:
     )
 
 
-async def _walk_to(mc: McpqClient, params: dict) -> ActionResult:
+async def _walk_to(mc: WorldAdapter, params: dict) -> ActionResult:
     """Walk to a target coordinate step-by-step with collision detection.
 
     For short-to-medium distances (up to ~50 blocks), this uses
@@ -909,7 +944,7 @@ async def _walk_to(mc: McpqClient, params: dict) -> ActionResult:
     )
 
 
-async def _turn_left(mc: McpqClient, params: dict) -> ActionResult:
+async def _turn_left(mc: WorldAdapter, params: dict) -> ActionResult:
     """Turn left by 15 degrees (gradual rotation).
 
     The space after the third ``~`` is critical — without it Minecraft
@@ -925,7 +960,7 @@ async def _turn_left(mc: McpqClient, params: dict) -> ActionResult:
     )
 
 
-async def _turn_right(mc: McpqClient, params: dict) -> ActionResult:
+async def _turn_right(mc: WorldAdapter, params: dict) -> ActionResult:
     """Turn right by 15 degrees (gradual rotation)."""
     resp = await _cmd(mc, "tp @p ~ ~ ~ ~15 ~")
     return ActionResult(
@@ -936,7 +971,7 @@ async def _turn_right(mc: McpqClient, params: dict) -> ActionResult:
     )
 
 
-async def _jump(mc: McpqClient, params: dict) -> ActionResult:
+async def _jump(mc: WorldAdapter, params: dict) -> ActionResult:
     """Jump up one block (teleport-based)."""
     resp = await _cmd(mc, "tp @p ~ ~1 ~")
     return ActionResult(
@@ -947,15 +982,198 @@ async def _jump(mc: McpqClient, params: dict) -> ActionResult:
     )
 
 
-async def _teleport(mc: McpqClient, params: dict) -> ActionResult:
+async def _teleport(mc: WorldAdapter, params: dict) -> ActionResult:
     """Instant teleport to coordinates (bypasses collision)."""
     return await _move_to(mc, params)
+
+
+async def _follow_teleport(mc: WorldAdapter, params: dict) -> ActionResult:
+    """Teleport the bot alongside its `!follow` target.
+
+    The orchestrator performs the distance check and passes only a
+    target name; this handler validates it before embedding it in the
+    command, keeping the follow-mode mutation inside the registered
+    action space so policy can identify it.
+    """
+    try:
+        target = _sanitize_player_target(params.get("target"))
+    except ValueError as exc:
+        return ActionResult(
+            success=False,
+            action=ActionType.FOLLOW_TELEPORT,
+            message=f"Invalid follow target: {exc}",
+            data={"target": params.get("target")},
+        )
+    resp = await _cmd(mc, f"execute as {target} at @s run tp @p ^-3 ^ ^-3")
+    if _command_failed(resp):
+        return ActionResult(
+            success=False,
+            action=ActionType.FOLLOW_TELEPORT,
+            message=f"Could not follow {target}: {resp[:80]}",
+            data={"target": target, "raw": resp},
+        )
+    return ActionResult(
+        success=True,
+        action=ActionType.FOLLOW_TELEPORT,
+        message=f"Moved alongside {target}",
+        data={"target": target, "raw": resp},
+    )
+
+
+async def _provision_bot(mc: WorldAdapter, params: dict) -> ActionResult:
+    """Summon the bot entity via the MCPQ-Bot plugin's `/botsummon` command.
+
+    The orchestrator is the only caller; this internal action exists so the
+    trusted startup provisioning path is visible to the action policy and
+    audit trace as a distinct action. The player name is validated as a
+    strict Minecraft username before it is embedded in the command.
+    """
+    try:
+        player_name = _sanitize_player_target(params.get("player_name"))
+    except ValueError as exc:
+        return ActionResult(
+            success=False,
+            action=ActionType.PROVISION_BOT,
+            message=f"Invalid bot player name: {exc}",
+            data={"player_name": params.get("player_name")},
+        )
+    resp = await mc.run_command_blocking(f"botsummon {player_name}")
+    if _command_failed(resp):
+        return ActionResult(
+            success=False,
+            action=ActionType.PROVISION_BOT,
+            message=f"Could not summon bot {player_name}: {resp[:80]}",
+            data={"player_name": player_name, "raw": resp},
+        )
+    return ActionResult(
+        success=True,
+        action=ActionType.PROVISION_BOT,
+        message=f"Summoned bot {player_name}",
+        data={"player_name": player_name, "raw": resp},
+    )
+
+
+async def _prepare_safe_spawn(mc: WorldAdapter, params: dict) -> ActionResult:
+    """Teleport the bot to its startup spawn point and place a 3x3 platform.
+
+    Internal startup-only action: see the ActionService docstring for why
+    this provisioning mutation is exposed as a distinct typed action. The
+    spawn point is fixed (0, 65, 0) — one block above the platform layer.
+    """
+    x = int(params.get("x", 0))
+    y = int(params.get("y", 65))
+    z = int(params.get("z", 0))
+    await mc.teleport_player(float(x), float(y), float(z))
+    placed = 0
+    failures: list[dict[str, str]] = []
+    for dx in (-1, 0, 1):
+        for dz in (-1, 0, 1):
+            # Each write is attempted independently so one failed corner
+            # cannot skip the rest of the platform (including the block
+            # beneath the bot). Failures are recorded instead of swallowed
+            # so the result reflects whether the support platform exists.
+            bx, by, bz = x + dx, y - 1, z + dz
+            try:
+                await mc.set_block("dirt", bx, by, bz)
+                placed += 1
+            except Exception as exc:
+                failures.append({"x": str(bx), "y": str(by), "z": str(bz), "error": str(exc)})
+    if failures:
+        return ActionResult(
+            success=False,
+            action=ActionType.PREPARE_SAFE_SPAWN,
+            message=(
+                f"Platform incomplete at ({x}, {y - 1}, {z}): "
+                f"{len(failures)} of 9 support blocks failed to place"
+            ),
+            data={
+                "x": x,
+                "y": y,
+                "z": z,
+                "blocks_placed": placed,
+                "blocks_failed": len(failures),
+                "failed_blocks": failures,
+            },
+        )
+    return ActionResult(
+        success=True,
+        action=ActionType.PREPARE_SAFE_SPAWN,
+        message=f"Placed 3x3 platform at ({x}, {y - 1}, {z})",
+        data={"x": x, "y": y, "z": z, "blocks_placed": placed, "blocks_failed": 0},
+    )
 
 
 # ── Interaction ─────────────────────────────────────────────────────────
 
 
-async def _break_block(mc: McpqClient, params: dict) -> ActionResult:
+async def _goto_teleport(mc: WorldAdapter, params: dict) -> ActionResult:
+    """Teleport the bot to a named player (!goto chat command).
+
+    Internal chat-command action: the target comes from untrusted chat
+    text, so it is validated as a strict Minecraft username before it is
+    interpolated into the teleport command. The built-in chat handler is
+    the only caller and reports the returned failure result to the chat.
+    """
+    try:
+        target = _sanitize_player_target(params.get("target"))
+    except ValueError as exc:
+        return ActionResult(
+            success=False,
+            action=ActionType.GOTO_TELEPORT,
+            message=f"Invalid goto target: {exc}",
+            data={"target": params.get("target")},
+        )
+    resp = await _cmd(mc, f"tp @p {target}")
+    if _command_failed(resp):
+        return ActionResult(
+            success=False,
+            action=ActionType.GOTO_TELEPORT,
+            message=f"Could not teleport to {target}: {resp[:80]}",
+            data={"target": target, "raw": resp},
+        )
+    return ActionResult(
+        success=True,
+        action=ActionType.GOTO_TELEPORT,
+        message=f"Teleported to {target}",
+        data={"target": target, "raw": resp},
+    )
+
+
+async def _come_teleport(mc: WorldAdapter, params: dict) -> ActionResult:
+    """Teleport the chat sender to the bot (!come chat command).
+
+    Internal chat-command action: the sender name is parsed from an
+    untrusted chat line, so it is validated as a strict Minecraft
+    username before it is interpolated into the teleport command. The
+    built-in chat handler is the only caller and reports the returned
+    failure result to the chat.
+    """
+    try:
+        sender = _sanitize_player_target(params.get("sender"))
+    except ValueError as exc:
+        return ActionResult(
+            success=False,
+            action=ActionType.COME_TELEPORT,
+            message=f"Invalid come sender: {exc}",
+            data={"sender": params.get("sender")},
+        )
+    resp = await _cmd(mc, f"tp {sender} @p")
+    if _command_failed(resp):
+        return ActionResult(
+            success=False,
+            action=ActionType.COME_TELEPORT,
+            message=f"Could not teleport {sender}: {resp[:80]}",
+            data={"sender": sender, "raw": resp},
+        )
+    return ActionResult(
+        success=True,
+        action=ActionType.COME_TELEPORT,
+        message=f"Teleported {sender} to the bot",
+        data={"sender": sender, "raw": resp},
+    )
+
+
+async def _break_block(mc: WorldAdapter, params: dict) -> ActionResult:
     x = params.get("x")
     y = params.get("y")
     z = params.get("z")
@@ -975,7 +1193,7 @@ async def _break_block(mc: McpqClient, params: dict) -> ActionResult:
     )
 
 
-async def _place_block(mc: McpqClient, params: dict) -> ActionResult:
+async def _place_block(mc: WorldAdapter, params: dict) -> ActionResult:
     x = params.get("x")
     y = params.get("y")
     z = params.get("z")
@@ -995,7 +1213,7 @@ async def _place_block(mc: McpqClient, params: dict) -> ActionResult:
         return ActionResult(success=False, action=ActionType.PLACE_BLOCK, message=str(exc))
 
 
-async def _interact(mc: McpqClient, params: dict) -> ActionResult:
+async def _interact(mc: WorldAdapter, params: dict) -> ActionResult:
     # Use /execute as @p run interact — works on Paper
     resp = await _cmd(mc, "execute as @p at @p run interact")
     return ActionResult(
@@ -1009,7 +1227,7 @@ async def _interact(mc: McpqClient, params: dict) -> ActionResult:
 # ── Inventory / Items ───────────────────────────────────────────────────
 
 
-async def _check_inventory(mc: McpqClient, params: dict) -> ActionResult:
+async def _check_inventory(mc: WorldAdapter, params: dict) -> ActionResult:
     resp = await _cmd(mc, "data get entity @p Inventory")
     success = not _command_failed(resp)
     return ActionResult(
@@ -1020,7 +1238,7 @@ async def _check_inventory(mc: McpqClient, params: dict) -> ActionResult:
     )
 
 
-async def _equip_item(mc: McpqClient, params: dict) -> ActionResult:
+async def _equip_item(mc: WorldAdapter, params: dict) -> ActionResult:
     slot = params.get("slot", 0)
     if isinstance(slot, bool) or not isinstance(slot, int) or not 0 <= slot <= 8:
         return ActionResult(
@@ -1046,7 +1264,7 @@ async def _equip_item(mc: McpqClient, params: dict) -> ActionResult:
     )
 
 
-async def _equip_best_weapon(mc: McpqClient, params: dict) -> ActionResult:
+async def _equip_best_weapon(mc: WorldAdapter, params: dict) -> ActionResult:
     """Equip the strongest supported weapon already in the hotbar."""
     from .observer import _parse_inventory_nbt
 
@@ -1115,7 +1333,7 @@ async def _equip_best_weapon(mc: McpqClient, params: dict) -> ActionResult:
     )
 
 
-async def _craft_item(mc: McpqClient, params: dict) -> ActionResult:
+async def _craft_item(mc: WorldAdapter, params: dict) -> ActionResult:
     """Give items to the player (creative-mode /give).
 
     NOTE: This uses /give under the hood, which requires OP permissions or
@@ -1141,7 +1359,7 @@ async def _craft_item(mc: McpqClient, params: dict) -> ActionResult:
         )
 
 
-async def _drop_item(mc: McpqClient, params: dict) -> ActionResult:
+async def _drop_item(mc: WorldAdapter, params: dict) -> ActionResult:
     """Drop items from inventory as entities in the world.
 
     Uses /replaceitem to clear the slot and /summon to create the item
@@ -1190,7 +1408,7 @@ async def _drop_item(mc: McpqClient, params: dict) -> ActionResult:
 # ── Eating ─────────────────────────────────────────────────────────────
 
 
-async def _eat(mc: McpqClient, params: dict) -> ActionResult:
+async def _eat(mc: WorldAdapter, params: dict) -> ActionResult:
     """Eat a food item from the player's inventory.
 
     Parameters (from ``params``):
@@ -1274,7 +1492,7 @@ async def _eat(mc: McpqClient, params: dict) -> ActionResult:
 # ── Healing ─────────────────────────────────────────────────────────────
 
 
-async def _heal(mc: McpqClient, params: dict) -> ActionResult:
+async def _heal(mc: WorldAdapter, params: dict) -> ActionResult:
     """Apply healing effects to restore health.
 
     Uses ``/effect give @p regeneration`` and optionally
@@ -1531,7 +1749,7 @@ def _should_attack(mob_type: str) -> bool:
     return _get_threat_level(mob_type) != "critical"
 
 
-async def _scan_entities(mc: McpqClient, params: dict) -> ActionResult:
+async def _scan_entities(mc: WorldAdapter, params: dict) -> ActionResult:
     """Detect hostile mobs near the player.
 
     Iterates over a curated list of common hostile mob types and runs
@@ -1617,7 +1835,7 @@ async def _scan_entities(mc: McpqClient, params: dict) -> ActionResult:
     )
 
 
-async def _attack(mc: McpqClient, params: dict) -> ActionResult:
+async def _attack(mc: WorldAdapter, params: dict) -> ActionResult:
     """Attack a target entity using ``/damage``.
 
     Paper 26.x broke ``execute as @p at @p run attack`` (throws
@@ -1726,7 +1944,7 @@ async def _attack(mc: McpqClient, params: dict) -> ActionResult:
 # ── Information ─────────────────────────────────────────────────────────
 
 
-async def _scan(mc: McpqClient, params: dict) -> ActionResult:
+async def _scan(mc: WorldAdapter, params: dict) -> ActionResult:
     radius = min(params.get("radius", 5), 16)  # cap at 16 to avoid spam
 
     # Get player position first
@@ -1797,7 +2015,7 @@ async def _scan(mc: McpqClient, params: dict) -> ActionResult:
     )
 
 
-async def _check_time(mc: McpqClient, params: dict) -> ActionResult:
+async def _check_time(mc: WorldAdapter, params: dict) -> ActionResult:
     resp = await mc.get_time()
     return ActionResult(
         success=True,
@@ -1807,7 +2025,7 @@ async def _check_time(mc: McpqClient, params: dict) -> ActionResult:
     )
 
 
-async def _check_weather(mc: McpqClient, params: dict) -> ActionResult:
+async def _check_weather(mc: WorldAdapter, params: dict) -> ActionResult:
     resp = await _cmd(mc, "weather query")
     return ActionResult(
         success=True,
@@ -1841,7 +2059,7 @@ def _parse_health_response(raw: str | None) -> float | None:
     return value if math.isfinite(value) and value >= 0 else None
 
 
-async def _check_health(mc: McpqClient, params: dict) -> ActionResult:
+async def _check_health(mc: WorldAdapter, params: dict) -> ActionResult:
     """Check the player's health.
 
     Uses ``/data get entity @p Health`` first, which works for real players.
@@ -1905,7 +2123,7 @@ async def _check_health(mc: McpqClient, params: dict) -> ActionResult:
     )
 
 
-async def _check_hunger(mc: McpqClient, params: dict) -> ActionResult:
+async def _check_hunger(mc: WorldAdapter, params: dict) -> ActionResult:
     """Check the player's hunger (foodLevel, 0-20).
 
     Uses ``/data get entity @p foodLevel`` first. Falls back to
@@ -1967,7 +2185,7 @@ async def _check_hunger(mc: McpqClient, params: dict) -> ActionResult:
     )
 
 
-async def _check_position(mc: McpqClient, params: dict) -> ActionResult:
+async def _check_position(mc: WorldAdapter, params: dict) -> ActionResult:
     pos = await mc.get_player_pos()
     if pos:
         msg = f"Position: ({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f})"
@@ -1982,7 +2200,7 @@ async def _check_position(mc: McpqClient, params: dict) -> ActionResult:
     )
 
 
-async def _list_players(mc: McpqClient, params: dict) -> ActionResult:
+async def _list_players(mc: WorldAdapter, params: dict) -> ActionResult:
     players = await mc.get_players_online()
     msg = f"Online players ({len(players)}): {', '.join(players)}"
     return ActionResult(
@@ -1993,7 +2211,7 @@ async def _list_players(mc: McpqClient, params: dict) -> ActionResult:
     )
 
 
-async def _chat(mc: McpqClient, params: dict) -> ActionResult:
+async def _chat(mc: WorldAdapter, params: dict) -> ActionResult:
     message = params.get("message", "")
     if message:
         await mc.post_to_chat(message)
@@ -2005,7 +2223,7 @@ async def _chat(mc: McpqClient, params: dict) -> ActionResult:
     )
 
 
-async def _wait(mc: McpqClient, params: dict) -> ActionResult:
+async def _wait(mc: WorldAdapter, params: dict) -> ActionResult:
     import asyncio as _asyncio
 
     seconds = params.get("seconds", 2.0)
@@ -2018,7 +2236,7 @@ async def _wait(mc: McpqClient, params: dict) -> ActionResult:
     )
 
 
-async def _done(mc: McpqClient, params: dict) -> ActionResult:
+async def _done(mc: WorldAdapter, params: dict) -> ActionResult:
     message = params.get("message", "Task complete")
     return ActionResult(
         success=True,
@@ -2040,6 +2258,11 @@ _HANDLERS: dict[ActionType, Handler] = {
     ActionType.JUMP: _jump,
     ActionType.SPRINT: _sprint,
     ActionType.TELEPORT: _teleport,
+    ActionType.FOLLOW_TELEPORT: _follow_teleport,
+    ActionType.PROVISION_BOT: _provision_bot,
+    ActionType.PREPARE_SAFE_SPAWN: _prepare_safe_spawn,
+    ActionType.GOTO_TELEPORT: _goto_teleport,
+    ActionType.COME_TELEPORT: _come_teleport,
     ActionType.BREAK_BLOCK: _break_block,
     ActionType.PLACE_BLOCK: _place_block,
     ActionType.INTERACT: _interact,

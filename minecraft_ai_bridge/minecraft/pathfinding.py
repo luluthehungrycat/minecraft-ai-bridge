@@ -1,4 +1,4 @@
-"""Grid-based A* pathfinding over the Minecraft world via MCPQ block queries.
+"""Grid-based A* pathfinding over the Minecraft world via block queries.
 
 The pathfinder builds a local walkability grid around the player-to-goal
 corridor, runs A* (or BFS where movement costs are uniform), and returns a
@@ -20,7 +20,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
-from .mc_api import McpqClient
+from .world_types import WorldAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +62,7 @@ class Pathfinder:
 
     def __init__(
         self,
-        mc: McpqClient,
+        mc: WorldAdapter,
         max_nodes: int = _MAX_NODES,
         batch_size: int = _SCAN_BATCH_SIZE,
     ) -> None:
@@ -398,7 +398,7 @@ class Pathfinder:
 
 
 async def find_walk_path(
-    mc: McpqClient,
+    mc: WorldAdapter,
     start_x: float,
     start_z: float,
     goal_x: float,

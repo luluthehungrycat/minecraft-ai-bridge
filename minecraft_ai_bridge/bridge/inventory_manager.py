@@ -20,8 +20,8 @@ from collections import Counter
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ..minecraft.mc_api import McpqClient
     from ..minecraft.observer import InventorySlot
+    from ..runtime import WorldAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +32,7 @@ class InventoryManager:
     Call ``refresh()`` before each use to sync with the server.
     """
 
-    def __init__(self, mc: McpqClient) -> None:
+    def __init__(self, mc: WorldAdapter) -> None:
         self._mc = mc
         self._items: list[InventorySlot] = []
         self._raw: str = ""

@@ -27,6 +27,290 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
 
 ### Added
 
+- Added an opt-in local AuthzService gate for the built-in Orchestrator.
+  Set `authz.enabled`, `authz.steve_id`, and the finite
+  `authz.session_lease_seconds` in configuration, and provide the scoped
+  bearer token only through `AUTHZ_CONTROLLER_TOKEN`. Startup requires a valid
+  `steve:control` credential and exclusive session before provisioning;
+  subsequent ActionService requests revalidate that session. Shutdown releases
+  it. The gate is disabled by default, and its session lease is not renewed
+  automatically. If a process exits uncleanly, startup reports an active
+  session; after confirming the prior process stopped, an administrator can
+  deactivate and reactivate the Steve to clear stale session state. This adds
+  no external transport or backend watchdog.
+
+- Added a local SQLite AuthzService foundation for scoped credentials,
+  per-Steve ownership, exclusive controller sessions, and monotonic fencing.
+  Plaintext credentials are returned once and only SHA-256 digests persist;
+  global admin identities use one trusted local bootstrap and `admin:world`
+  remains distinct from `admin:steves`. The ActionPolicy binding checks
+  current session/credential state on each request. This adds no transport,
+  network exposure, TLS, task persistence, or backend-local watchdog and does
+  not complete RFC-0001 Phase B.
+
+- Added in-place lease renewal for owned Steves through
+  `AuthzService.renew_ownership`. A renewal must carry a timezone-aware
+  expiry strictly in the future and strictly later than the persisted one,
+  so a lease is only ever extended. Inactive, unclaimed, wrong-owner, and
+  already expired ownership are refused; a lapsed lease is recovered by an
+  administrator transfer under `admin:steves`. A renewal clears any active
+  session and advances the fencing generation, so a session bound to the
+  previous lease stops validating.
+
+- Added append-only SQLite audit history for effective peer-observation
+  grants and revocations. Entries include the holder and peer Steve IDs, the
+  credential ID, actual administrator principal, event, and UTC timestamp.
+  Duplicate no-op grant/revoke calls add no entries. An `admin:steves`-only
+  API reads history by holder Steve ID, including after credential rotation.
+  A one-time transactional migration records active legacy grants with an
+  explicit unknown-original-time marker.
+
+### Fixed
+
+- Fixed last-admin lockout and unusable declared scopes in the local
+  AuthzService. Bootstrap can recover when no valid `admin:steves` credential
+  remains, even if an independent `admin:world` credential survives; bootstrap
+  itself must include `admin:steves` and stays closed while provisioning
+  authority exists. The last valid `admin:steves`
+  credential cannot self-revoke until a replacement peer is confirmed.
+  `steve:observe:shared` now requires an explicit administrator grant for
+  each named peer Steve, while `events:read` is service level and requires a
+  valid credential bound to an active Steve without binding the queried
+  target. `steve:observe:self` and `steve:control` remain bound to the
+  credential's Steve and persisted owner. This remains local authorization:
+  there is no external MCP or network transport, network exposure, TLS,
+  backend watchdog or fencing of dispatched work, task persistence,
+  dispatch-time capability filtering. The built-in Orchestrator can opt into
+  the local gate through `AuthzConfig`.
+
+- Fixed additional Phase B authorization edge cases. Shared observation and
+  `events:read` require the originating Steve to remain active, owned by its
+  recorded owner, and unexpired; shared observation also requires an explicit
+  active-peer grant. Scope authentication and evaluation share the process
+  lock and a SQLite read snapshot, rotation migrates peer grants atomically,
+  peer grants are
+  idempotent and revocable with the granting admin principal recorded, and a
+  Steve can be reactivated by an administrator without reviving an expired
+  lease. Steve IDs cannot be empty. Failed SQLite commits are rolled back
+  before the service lock is released. An `admin:world`-only credential may
+  self-revoke without affecting the last-admin:steves guard.
+
+- Fixed scope checks that ignored a Steve's current owner. Steve-bound scope
+  checks now re-read persisted state and fail closed unless the Steve is
+  active, its ownership is unexpired, and the persisted owner still matches
+  the credential, so an ownership transfer immediately invalidates the former
+  owner's credentials for scope checks as well as for session acquisition.
+
+- Fixed revocation that could be performed by any credential sharing a
+  Steve and owner with the target. A non-admin credential can no longer revoke
+  a different credential; revoking another credential, including an admin
+  credential, requires a global admin holding `admin:steves`. A presented
+  credential may still rotate or revoke itself.
+
+- Fixed admin credentials that could neither rotate nor revoke themselves.
+  Admin rotation preserves the principal, scopes, and expiry, revokes the old
+  token exactly once, and returns a working replacement; a valid admin
+  credential can also revoke itself without passing its token twice. An
+  `admin:world` credential still cannot act as `admin:steves`.
+
+- Fixed a write-lock leak when a transaction could not start. A failed
+  `BEGIN IMMEDIATE` now releases the service lock and attempts a safe
+  rollback, so a transient database lock surfaces as an error instead of
+  blocking every later call.
+
+- Added administrator-configured outbound webhook delivery over the local
+  EventJournal. Per-subscription cursors and durable pending/retry/delivered/
+  dead-letter state provide at-least-once delivery, HMAC signatures, bounded
+  retries/body size/rate, and offline-injectable HTTP transport. Endpoints
+  require HTTPS and an exact host allowlist and reject unsafe resolved IPs;
+  cursor order is preserved across retries and terminal state is reconciled
+  with the journal after restart. Hostname delivery fails closed unless the
+  injected transport implements the pinned request operation and guarantees
+  use of the checked address set while preserving TLS SNI and HTTP Host; the
+  ordinary AsyncClient request path is never used and stock transports do not
+  qualify.
+  There is no subscription management endpoint or external controller
+  authorization/admin configuration integration. DNS and transport-pin errors
+  remain visible and retry under the configured policy; DNS lookup uses a
+  process-wide single-worker limit with immediate rejection at capacity.
+  Timed-out lookups retain capacity until they finish, preventing thread
+  buildup, while their results are discarded. Expired journal consumers
+  reset to retained history, with
+  lost pending payloads dead-lettered and prior terminal deliveries not replayed.
+  Concurrent delivery passes on one service are serialized so a late duplicate
+  cannot overwrite terminal state. Retry interval configuration rejects
+  non-finite values. This is not full RFC-0001 Phase C completion.
+
+- Added a SQLite-backed `EventJournal` for the RFC-0001 Event envelope.
+  Events have durable monotonic cursors and idempotent event IDs; consumer
+  polling is at-least-once until acknowledgment, and bounded payload
+  retention expires lagging consumers explicitly so they must reset before
+  resuming. Compact event-ID fingerprints remain after payload pruning to
+  preserve duplicate detection. This local journal does not add auth, MCP
+  transport, webhooks, safety event producers, or task integration.
+
+- Added a built-in `SafetySupervisor` that periodically evaluates the existing
+  self-preservation layer independently of the strategic LLM loop. A pending
+  intervention preempts and cancels an outstanding LLM decision before a stale
+  strategic action can dispatch; the supervisor pauses while its single
+  intervention slot is occupied. A strategic WAIT is interruptible and does
+  not hold the ActionService dispatch lock. Other dispatch coroutines are
+  serialized, and strategic requests queued but not yet dispatched are
+  invalidated when a reflex starts. A canceled awaiter can still leave MCPQ
+  thread work running.
+  This is a runtime safety prerequisite slice, not completion of RFC-0001
+  Phase C: it does not watchdog a blocked/disconnected backend, guarantee that
+  an already-dispatched MCPQ call stopped on coroutine cancellation, or make
+  flee decisions independent of the LLM.
+
+- Added the `safety.intervened` event producer to the built-in
+  `SafetySupervisor`. Events contain only the actual action and success flag,
+  use HIGH severity on success and CRITICAL on failure/denial, and are
+  appended to the configured persistent SQLite journal off the event loop.
+  Pending writes are drained during orderly shutdown, and a reflex evaluation
+  already in progress at shutdown is still recorded when it completes. Other
+  RFC-0001 event producers remain unimplemented.
+
+- `McpqWorldAdapter` now advertises a read-only `Capabilities` profile for
+  simulated teleport movement, privileged-simulated crafting, and world-edit
+  support. It leaves live version/dimension discovery and hazard sensors
+  unclaimed; capability reporting does not grant authorization or provide
+  independent safety assurance.
+
+- Added RFC-0001 Phase A contract schemas in
+  `minecraft_ai_bridge/runtime/contracts.py`: Pydantic v2 models for
+  SteveIdentity, ControllerSession, Capabilities, Task, and Event,
+  plus the ActionRequestSchema/ActionResultSchema action envelope (the
+  Schema suffix avoids colliding with the unchanged runtime
+  ActionRequest/ActionResult dataclasses). Strict identifier/status
+  validation, timezone-aware timestamps, and safe defaults; these are
+  schema definitions only: no authorization, fencing, persistence, event
+  journal, task service, MCP transport, or conversion to the dispatcher
+  dataclasses is included (later-phase RFC-0001 work).
+- Added a transport-independent `WorldAdapter` Protocol and `McpqWorldAdapter`
+  composition wrapper in `minecraft_ai_bridge/runtime/world_adapter.py`
+  (RFC-0001 Phase A). The orchestrator creates exactly one adapter around its
+  connected `McpqClient` and passes it to `ActionService`, `Observer`,
+  `InventoryManager`, `ChatCommandHandler`, and `SelfPreservationLayer`;
+  built-in runtime reads (position/info, hurt source, chat events,
+  run-as-player and blocking commands, teleport, get/set block, chat post,
+  time, online players, biome, connected) route through the adapter. The raw
+  client remains only for connection lifecycle. Action handler, helper,
+  dispatcher, pathfinding, and ActionService inputs are annotated against
+  the transport-independent WorldAdapter contract rather than McpqClient;
+  McpqWorldAdapter itself stays typed against McpqClient. Public APIs and
+  direct mock construction are preserved; the protocol is a Phase A slice
+  covering only the consumed method set, not a Mineflayer or other-backend
+  contract, and no external MCP surface is added.
+
+- Routed the built-in chat handler's !goto and !come teleport mutations
+  through ActionService as two new internal-only actions (goto_teleport
+  and come_teleport), so policy and audit distinguish chat-issued
+  teleports from LLM strategic teleports. The target and sender names
+  are untrusted chat-derived strings and are validated with the same
+  strict Minecraft username validator used by follow-mode teleports and
+  bot provisioning before command interpolation. Chat responses and
+  error handling are preserved: ActionService and the dispatcher report
+  failures as failed results rather than raising, so the handler now
+  surfaces those results to the chat instead of only catching exceptions.
+  A handler constructed without an orchestrator ActionService falls back
+  to a local ActionService bound to its resolved world adapter, and a
+  harness exposing only a raw MCPQ client has that client wrapped in
+  McpqWorldAdapter automatically, so direct/test harness construction
+  keeps working without a raw command bypass and legacy _mc-only
+  harnesses keep polling, status, and chat replies working. Both new
+  identities are rejected if a model response names them, joining the
+  existing internal-action guard. Routing and input validation do not
+  add authenticated chat sender authorization: RFC-0001 ownership and
+  authorization requirements remain open.
+
+- Introduced a policy hook and bounded in-memory audit trace for strategic
+  actions routed from the built-in agent loop through `ActionService`.
+  The default policy preserves existing behavior; external MCP access and
+  complete mediation of non-strategic mutation paths are not part of this
+  increment.
+- Added process-local idempotency for `ActionService` calls that pass an
+  explicit `request_id`: identical action+params payloads replay the stored
+  terminal outcome, conflicting reuse is rejected without dispatching, and
+  concurrent identical requests share a single backend dispatch. A dispatch
+  interrupted after backend work started preserves an outcome-unknown
+  terminal record so the same ID cannot repeat a possibly applied mutation.
+  Records are in-memory only and are lost on process restart; calls without
+  `request_id` keep the previous behavior.
+  - Idempotency hardening: coalesced waiters no longer cancel the shared
+    dispatch when one caller is cancelled; cancellation before backend
+    dispatch started records a failed (not unknown) outcome; terminal
+    records are isolated from returned results so caller mutation cannot
+    corrupt replays; explicit-ID params must be JSON values only
+    (`ValueError` otherwise) so distinct payloads can never fingerprint
+    as equal; coalesced waiters now receive a snapshot of the outcome
+    instead of the leader-owned result object; dispatch-started markers
+    are cleared on every terminal outcome (including cancellation and
+    eviction paths), preventing misclassification after ID reuse; and
+    replay audits use the permission decision recorded with the original
+    outcome instead of inferring it from status alone.
+  - Fingerprint collision fix: canonical fingerprints previously folded
+    tuples into lists, so a tuple and a JSON list that serialize to the
+    same JSON both validated and fingerprinted equal under one
+    `request_id`, replaying the first payload and skipping policy for the
+    changed one. Explicit-ID params now accept JSON values only (tuples
+    and non-finite floats raise `ValueError`), and the fingerprint
+    preserves the exact validated payload, so the fingerprinted,
+    policy-checked, and dispatched semantics always match.
+  Accepted params are deep-copied before policy evaluation and
+  fingerprinting so caller-side mutation of the original mapping cannot
+  desynchronize the dispatched payload from the recorded one, and
+  policy-rejected results now carry correlation (and request-ID) metadata
+  consistent with other failure paths.
+
+- Added an internal `follow_teleport` action and routed the built-in
+  orchestrator's follow-mode teleport through `ActionService` so policy can
+  identify it as a distinct action. The `!follow` target is validated as a
+  plain Minecraft username (letters, digits, and underscores; entity
+  selectors and command metacharacters are rejected) before it is embedded
+  in the teleport command. Follow-mode behavior is otherwise unchanged:
+  teleports happen only when the target is more than four blocks away, and
+  read-only observation calls remain direct.
+- Routed the orchestrator's trusted startup provisioning (the `/botsummon`
+  bot summon and the teleport-plus-3x3-platform safe-spawn preparation)
+  through `ActionService` as two additional internal actions
+  (`provision_bot` and `prepare_safe_spawn`) so policy and audit distinguish
+  startup provisioning from ordinary gameplay. The bot player name is
+  validated as a strict Minecraft username before command interpolation.
+  Retry timing, poll behavior, and degraded-start logging are unchanged;
+  a failed provisioning result is logged deliberately instead of silently
+  treated as success. Neither provisioning action is exposed to the LLM
+  action space.
+- Routed the self-preservation layer's mutating reflexes — reflex ATTACK,
+  auto EAT, and auto HEAL — through the orchestrator's shared ActionService
+  so they use the same policy hook and bounded audit trace as LLM-selected
+  actions. Heuristic decision order and default behavior are unchanged, and
+  read-only observation calls (SCAN_ENTITIES, LastHurtByEntity damage-source
+  check) remain direct. A layer constructed directly without an
+  ActionService keeps the previous dispatcher behavior, so this is still
+  not complete mediation of the mutation surface, independent safety
+  enforcement, or MCP/auth coverage.
+- Added deterministic acceptance tests for the RFC-0001 Phase A action gate
+  (`tests/test_runtime_action_gate.py`) covering strategic actions,
+  follow-mode teleport, startup provisioning and safe-spawn preparation,
+  chat-command teleports, and self-preservation reflexes, including policy
+  denial paths (audited rejection without world mutation), internal-action
+  protection, observation exclusion, and a production-wiring test that runs
+  `Orchestrator._connect()` against the mock MCPQ client and asserts one
+  shared ActionService across chat, self-preservation, and startup audit.
+  - Internal-action guard: `provision_bot`, `prepare_safe_spawn`, and the
+    existing `follow_teleport` are rejected at the LLM dispatch boundary in
+    `_act` even if a model response names them, so text/JSON parsing cannot
+    reach the trusted provisioning or follow identities with the same
+    policy/audit action type as orchestrator-issued calls.
+  - Platform placement preserves the previous per-write failure suppression:
+    a failed corner no longer skips the remaining eight platform blocks.
+  - Platform placement failures are now reported: `prepare_safe_spawn`
+    attempts all nine support blocks independently and returns a failed
+    result with per-block error detail when any required platform block
+    cannot be placed, so the orchestrator retry loop treats an incomplete
+    platform as a failure instead of success.
+
 - **Survival series — survival mode tuning** (slice 3 of post-survival work):
   - `ActionType.HEAL` action handler that applies `/effect give @p
     regeneration 30 2` plus golden-apple-specific bonus effects
@@ -171,6 +455,13 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
 
 ### Fixed
 
+- Fixed the chat handler's service-only construction path: a harness
+  exposing an ActionService without a world adapter or raw MCPQ client
+  previously accepted the service but resolved no world, silently disabling
+  chat-event polling, !status, and chat replies. ActionService now exposes
+  a read-only world property, and ChatCommandHandler resolves the world
+  adapter from the supplied service when the orchestrator has neither
+  _world nor _mc; the shared service remains the teleport path.
 - Survival preservation now scans curated hostile mobs plus critical threats, and auto-consume, auto-heal, and day/night awareness operate independently of the legacy reflex flags. Tick 24000 is correctly treated as daytime.
 - PR #7 (initial) had a reflex attack that fired on **any** health
   drop, including fall damage, cactus damage, and lava damage.
@@ -180,6 +471,26 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
 - `equip_best_weapon` now skips malformed inventory records instead of
   raising during weapon selection; nonzero item damage remains metadata-only
   until max-durability data is available.
+- Fixed the RFC-0001 Phase A contract schemas to reject non-JSON payload
+  values at validation time: `ActionRequestSchema.params` and
+  `Event.payload` now enforce the exact JSON domain recursively (null,
+  bool, int, finite float, str, lists, string-keyed mappings) and reject
+  tuples, non-finite floats, non-string mapping keys, and arbitrary
+  objects without coercion, so successfully constructed contracts always
+  serialize via `model_dump_json()`.
+- Hardened the same payload validation against Pydantic lax dict
+  coercion and invalid Unicode: `ActionRequestSchema.params` and
+  `Event.payload` now validate the entire input mapping before Pydantic
+  coercion, rejecting non-dict inputs (e.g. lists of pairs) and
+  non-string keys (bytes, int, bool) instead of normalizing them, and
+  every string and mapping key must encode as UTF-8, so lone surrogates
+  can no longer construct a contract that fails `model_dump_json()`.
+- Bounded JSON payload nesting in `ActionRequestSchema.params` and
+  `Event.payload` with `MAX_JSON_PAYLOAD_DEPTH` (64): every dict or
+  list counts as one level starting at the outer payload mapping itself,
+  deeper structures are rejected before model construction, and the
+  `model_dump_json()` serialization guarantee now explicitly applies
+  only to payloads within this depth.
 
 ### Removed
 
