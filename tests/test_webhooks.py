@@ -108,8 +108,26 @@ async def test_httpx_pinned_transport_uses_ip_host_and_tls_name_without_redirect
 
 
 @pytest.mark.asyncio
+async def test_default_pinned_transport_rejects_unsafe_address_before_connecting():
+    transport = webhook_runtime.HttpxPinnedTransport()
+
+    with pytest.raises(WebhookError, match="unsafe IP"):
+        await transport.send_webhook_pinned(
+            url="https://hooks.example.test/events",
+            addresses=("127.0.0.1",),
+            content=b"payload",
+            headers={},
+            timeout=1.0,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("certificate_hostname", "hostname_matches"),
+    [("hooks.example.test", True), ("wrong.example.test", False)],
+)
 async def test_httpx_pinned_transport_performs_tls_to_pinned_ip_with_original_identity(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, certificate_hostname, hostname_matches
 ):
     openssl = shutil.which("openssl")
     if openssl is None:
@@ -132,9 +150,9 @@ async def test_httpx_pinned_transport_performs_tls_to_pinned_ip_with_original_id
             "-days",
             "1",
             "-subj",
-            "/CN=hooks.example.test",
+            f"/CN={certificate_hostname}",
             "-addext",
-            "subjectAltName=DNS:hooks.example.test",
+            f"subjectAltName=DNS:{certificate_hostname}",
         ],
         check=True,
         capture_output=True,
@@ -194,19 +212,27 @@ async def test_httpx_pinned_transport_performs_tls_to_pinned_ip_with_original_id
     )
 
     try:
-        status = await transport.send_webhook_pinned(
-            url="https://hooks.example.test/events?batch=2",
-            addresses=("127.0.0.1",),
-            content=b"payload",
-            headers={"X-Test": "yes"},
-            timeout=2.0,
-        )
-        assert status == 204
+        request_args = {
+            "url": "https://hooks.example.test/events?batch=2",
+            "addresses": ("127.0.0.1",),
+            "content": b"payload",
+            "headers": {"X-Test": "yes"},
+            "timeout": 2.0,
+        }
+        if hostname_matches:
+            status = await transport.send_webhook_pinned(**request_args)
+            assert status == 204
+        else:
+            with pytest.raises(httpx.HTTPError):
+                await transport.send_webhook_pinned(**request_args)
         assert observed_sni == ["hooks.example.test"]
-        assert len(observed_requests) == 1
-        assert observed_requests[0][0] == "POST /events?batch=2 HTTP/1.1"
-        assert observed_requests[0][2] == b"payload"
-        assert observed_requests[0][1]["host"] == "hooks.example.test"
+        if hostname_matches:
+            assert len(observed_requests) == 1
+            assert observed_requests[0][0] == "POST /events?batch=2 HTTP/1.1"
+            assert observed_requests[0][2] == b"payload"
+            assert observed_requests[0][1]["host"] == "hooks.example.test"
+        else:
+            assert observed_requests == []
     finally:
         server.close()
         await server.wait_closed()
