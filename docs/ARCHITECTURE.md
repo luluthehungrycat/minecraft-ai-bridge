@@ -244,6 +244,36 @@ renewal that changes the persisted expiry clears any active session and
 advances the fencing generation, so a session bound to the previous lease
 stops validating.
 
+### Controller API (Phase B slice)
+
+`runtime.ControllerService` is the transport-independent API through which
+an external harness controls one Steve; an MCP or HTTP adapter only translates
+requests into its calls. It composes the pieces above:
+
+- `open_session` acquires the Steve's exclusive Authz controller session for
+  a `steve:control` credential; `renew_session` and `close_session` manage its
+  lease. A session ID alone is not a bearer: every call must also present the
+  token that opened it.
+- `get_capabilities` and `get_state` need `steve:observe:self` or
+  `steve:control` for that Steve; observers never get a session.
+- `submit_action` takes an `ActionRequestSchema` and returns an
+  `ActionResultSchema`. It checks the Steve, session ownership, and fencing
+  generation, then runs the action through the Steve's `ActionService` with
+  the Authz policy bound to the requesting session (a `ContextVar`), so
+  authorization, request-ID idempotency scoping, and audit match the CLI.
+  Internal-control and lifecycle actions are never exposed.
+
+Every MCPQ mutation is privileged-simulated, so it needs `admin:world`. That
+authority comes only from the operator's `world_admin_token` passed to the
+service, never from a request. With no token, ordinary keys can observe, chat,
+and wait. Authentication failures raise `PermissionError`; every other refusal
+is a `rejected` result with a `reason_code` (`STEVE_MISMATCH`,
+`SESSION_UNKNOWN`, `SESSION_NOT_OWNED`, `STALE_GENERATION`,
+`ACTION_NOT_EXPOSED`, `POLICY_REJECTED`).
+
+This slice has no transport, task service, or event API, and does not run the
+safety supervisor for externally controlled Steves.
+
 ### Durable event journal (Phase C slice)
 
 `runtime.EventJournal` persists validated Event envelopes in SQLite with WAL
