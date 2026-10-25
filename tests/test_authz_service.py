@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event
+from time import monotonic
 from unittest.mock import patch
 
 import pytest
@@ -43,6 +44,186 @@ def test_fencing_exclusive_sessions_and_action_policy(tmp_path):
     assert not auth.validate_session(session)
     next_session = auth.acquire_session(cred.token, "s1", owner_id="owner")
     assert next_session.generation > session.generation
+    auth.close()
+
+
+def test_controller_session_renewal_extends_current_session_without_refencing(tmp_path):
+    auth, cred, _ = setup_auth(tmp_path)
+    first_expiry = datetime.now(UTC) + timedelta(seconds=30)
+    session = auth.acquire_session(
+        cred.token, "s1", owner_id="owner", lease_expires_at=first_expiry
+    )
+    from minecraft_ai_bridge.runtime.action_service import ActionRequest
+
+    active_session = session
+    policy = auth.action_policy(lambda: active_session)
+    assert policy(ActionRequest(ActionType.WAIT)).allowed
+    renewed = auth.renew_session(session, lease_seconds=90)
+    active_session = renewed
+
+    assert renewed.session_id == session.session_id
+    assert renewed.generation == session.generation
+    assert renewed.expires_at is not None and renewed.expires_at > first_expiry
+    assert renewed.expires_at <= datetime.now(UTC) + timedelta(seconds=90)
+    assert not auth.validate_session(session)
+    assert auth.validate_session(renewed)
+    assert policy(ActionRequest(ActionType.WAIT)).allowed
+    auth.close()
+
+
+def test_controller_session_renewal_rejects_expired_or_revoked_authority(tmp_path):
+    auth, cred, _ = setup_auth(tmp_path)
+    expiry = datetime.now(UTC) + timedelta(seconds=30)
+    session = auth.acquire_session(cred.token, "s1", owner_id="owner", lease_expires_at=expiry)
+    auth._db.execute(
+        "UPDATE steves SET session_expires=? WHERE id='s1'",
+        ((datetime.now(UTC) - timedelta(seconds=1)).isoformat(),),
+    )
+
+    with pytest.raises(PermissionError, match="session is no longer valid"):
+        auth.renew_session(session, lease_seconds=90)
+    auth.close()
+
+    auth, cred, _ = setup_auth(tmp_path / "revoked")
+    session = auth.acquire_session(
+        cred.token,
+        "s1",
+        owner_id="owner",
+        lease_expires_at=datetime.now(UTC) + timedelta(seconds=30),
+    )
+    auth.revoke_credential(cred.token)
+    with pytest.raises(PermissionError, match="session is no longer valid"):
+        auth.renew_session(session, lease_seconds=90)
+    auth.close()
+
+
+def test_controller_session_renewal_is_capped_by_leased_ownership(tmp_path):
+    auth, _, admin = setup_auth(tmp_path)
+    ownership_expiry = datetime.now(UTC) + timedelta(seconds=45)
+    auth.register_steve(
+        "s2",
+        ownership_mode="leased",
+        owner_id="owner",
+        ownership_expires_at=ownership_expiry,
+        admin_token=admin.token,
+    )
+    leased_credential = auth.create_credential(
+        "s2", "owner", {"steve:control"}, admin_token=admin.token
+    )
+    session = auth.acquire_session(
+        leased_credential.token,
+        "s2",
+        owner_id="owner",
+        lease_expires_at=datetime.now(UTC) + timedelta(seconds=10),
+    )
+
+    renewed = auth.renew_session(session, lease_seconds=90)
+
+    assert renewed.expires_at is not None
+    assert renewed.expires_at <= ownership_expiry
+    assert auth.validate_session(renewed)
+    auth.close()
+
+
+def test_controller_session_renewal_keeps_valid_session_at_ownership_cap(tmp_path):
+    auth, _, admin = setup_auth(tmp_path)
+    ownership_expiry = datetime.now(UTC) + timedelta(seconds=45)
+    auth.register_steve(
+        "s2",
+        ownership_mode="leased",
+        owner_id="owner",
+        ownership_expires_at=ownership_expiry,
+        admin_token=admin.token,
+    )
+    credential = auth.create_credential("s2", "owner", {"steve:control"}, admin_token=admin.token)
+    session = auth.acquire_session(
+        credential.token,
+        "s2",
+        owner_id="owner",
+        lease_expires_at=ownership_expiry,
+    )
+
+    renewed = auth.renew_session(session, lease_seconds=90)
+
+    assert renewed == session
+    assert auth.validate_session(renewed)
+    auth.close()
+
+
+def test_controller_session_renewal_fails_fast_on_external_sqlite_writer(tmp_path):
+    auth, cred, _ = setup_auth(tmp_path)
+    session = auth.acquire_session(
+        cred.token,
+        "s1",
+        owner_id="owner",
+        lease_expires_at=datetime.now(UTC) + timedelta(seconds=30),
+    )
+    writer = sqlite3.connect(tmp_path / "auth.sqlite", isolation_level=None, timeout=30)
+    writer.execute("BEGIN IMMEDIATE")
+    started = monotonic()
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            auth.renew_session(session, lease_seconds=90)
+        assert monotonic() - started < 0.5
+    finally:
+        writer.execute("ROLLBACK")
+        writer.close()
+        auth.close()
+
+
+def test_controller_session_renewal_fails_fast_on_service_lock_contention(tmp_path):
+    auth, cred, _ = setup_auth(tmp_path)
+    session = auth.acquire_session(
+        cred.token,
+        "s1",
+        owner_id="owner",
+        lease_expires_at=datetime.now(UTC) + timedelta(seconds=30),
+    )
+    entered = Event()
+    release = Event()
+
+    def hold_service_lock():
+        with auth._lock:
+            entered.set()
+            release.wait(timeout=2)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        holder = pool.submit(hold_service_lock)
+        assert entered.wait(timeout=1)
+        try:
+            with pytest.raises(sqlite3.OperationalError, match="service is busy"):
+                auth.renew_session(session, lease_seconds=90)
+        finally:
+            release.set()
+            holder.result(timeout=1)
+    auth.close()
+
+
+def test_try_validate_session_returns_busy_without_waiting(tmp_path):
+    auth, cred, _ = setup_auth(tmp_path)
+    session = auth.acquire_session(
+        cred.token,
+        "s1",
+        owner_id="owner",
+        lease_expires_at=datetime.now(UTC) + timedelta(seconds=30),
+    )
+    entered = Event()
+    release = Event()
+
+    def hold_service_lock():
+        with auth._lock:
+            entered.set()
+            release.wait(timeout=2)
+
+    assert auth.try_validate_session(session) is True
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        holder = pool.submit(hold_service_lock)
+        assert entered.wait(timeout=1)
+        try:
+            assert auth.try_validate_session(session) is None
+        finally:
+            release.set()
+            holder.result(timeout=1)
     auth.close()
 
 
@@ -1208,6 +1389,86 @@ async def test_cached_action_replay_revalidates_controller_session(tmp_path, inv
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("invalidator", ["revoke", "expire", "transfer", "fence"])
+async def test_inflight_action_replay_revalidates_after_dispatch_completes(tmp_path, invalidator):
+    import asyncio
+
+    auth, credential, admin = setup_auth(tmp_path)
+    session = auth.acquire_session(credential.token, "s1", owner_id="owner")
+    world = MockMcpqClient()
+    chat_started = asyncio.Event()
+    release_chat = asyncio.Event()
+    follower_checked_initial_policy = asyncio.Event()
+    follower_rechecked_policy = asyncio.Event()
+    policy_calls = 0
+    original_post_to_chat = world.post_to_chat
+
+    async def blocked_chat(message):
+        chat_started.set()
+        await release_chat.wait()
+        await original_post_to_chat(message)
+
+    world.post_to_chat = blocked_chat
+    base_policy = auth.action_policy(session)
+
+    def policy(request):
+        nonlocal policy_calls
+        policy_calls += 1
+        decision = base_policy(request)
+        if policy_calls == 3:
+            follower_checked_initial_policy.set()
+        elif policy_calls == 4:
+            follower_rechecked_policy.set()
+        return decision
+
+    service = ActionService(world, policy=policy)
+    leader = asyncio.create_task(
+        service.execute(ActionType.CHAT, {"message": "private result"}, request_id="inflight")
+    )
+    follower = None
+    try:
+        await asyncio.wait_for(chat_started.wait(), timeout=1)
+        follower = asyncio.create_task(
+            service.execute(
+                ActionType.CHAT,
+                {"message": "private result"},
+                request_id="inflight",
+            )
+        )
+        await asyncio.wait_for(follower_checked_initial_policy.wait(), timeout=1)
+
+        if invalidator == "revoke":
+            auth.revoke_credential(credential.token)
+        elif invalidator == "expire":
+            auth._db.execute(
+                "UPDATE steves SET session_expires=? WHERE id=?",
+                ((datetime.now(UTC) - timedelta(seconds=1)).isoformat(), "s1"),
+            )
+        elif invalidator == "transfer":
+            auth.transfer_ownership(admin.token, "s1", new_owner_id="new-owner")
+        else:
+            auth.release_session(session)
+            auth.acquire_session(credential.token, "s1", owner_id="owner")
+    finally:
+        release_chat.set()
+        pending = [leader] if follower is None else [leader, follower]
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    first = leader.result()
+    assert follower is not None
+    replay = follower.result()
+
+    assert first.success
+    assert not replay.success
+    assert "private result" not in replay.message
+    assert "private result" not in repr(replay.data)
+    assert world.chat_messages_sent == ["private result"]
+    assert follower_rechecked_policy.is_set()
+    assert service.audit_records[-1].allowed is False
+    auth.close()
+
+
+@pytest.mark.asyncio
 async def test_same_request_id_is_not_replayed_to_another_controller(tmp_path):
     auth, first_credential, admin = setup_auth(tmp_path)
     auth.register_steve("s2", ownership_mode="persistent", owner_id="peer", admin_token=admin.token)
@@ -1280,6 +1541,60 @@ async def test_control_session_cannot_run_privileged_simulated_action(tmp_path, 
     assert result.success is False
     assert "admin:world" in result.message
     assert world.commands_ran == []
+    auth.close()
+
+
+@pytest.mark.parametrize(
+    ("action", "params"),
+    [
+        (ActionType.GOTO_TELEPORT, {"target": "TargetPlayer"}),
+        (ActionType.PROVISION_BOT, {"player_name": "AIBot"}),
+        (ActionType.PREPARE_SAFE_SPAWN, {}),
+    ],
+)
+@pytest.mark.asyncio
+async def test_control_session_cannot_run_internal_world_action_without_admin_world(
+    tmp_path, action, params
+):
+    auth, credential, _admin = setup_auth(tmp_path)
+    session = auth.acquire_session(credential.token, "s1", owner_id="owner")
+    world = MockMcpqClient()
+    authority = object()
+    service = ActionService(
+        world,
+        policy=auth.action_policy(session),
+        internal_authority=authority,
+    )
+
+    result = await service.execute(action, params, authority=authority)
+
+    assert not result.success
+    assert "admin:world" in result.message
+    assert world.commands_ran == []
+    auth.close()
+
+
+@pytest.mark.asyncio
+async def test_internal_world_action_runs_with_controller_and_world_admin(tmp_path):
+    auth, credential, admin = setup_auth(tmp_path)
+    session = auth.acquire_session(credential.token, "s1", owner_id="owner")
+    world_admin = auth.grant_admin_credential(admin.token, "world-operator", {"admin:world"})
+    world = MockMcpqClient()
+    authority = object()
+    service = ActionService(
+        world,
+        policy=auth.action_policy(session, admin_token=world_admin.token),
+        internal_authority=authority,
+    )
+
+    result = await service.execute(
+        ActionType.GOTO_TELEPORT,
+        {"target": "TargetPlayer"},
+        authority=authority,
+    )
+
+    assert result.success
+    world.assert_command_contains("tp AIBot TargetPlayer")
     auth.close()
 
 

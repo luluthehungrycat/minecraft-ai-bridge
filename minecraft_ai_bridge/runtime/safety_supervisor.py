@@ -17,6 +17,9 @@ logger = logging.getLogger(__name__)
 
 _SAFETY_EVENT_TYPE = "safety.intervened"
 _SAFETY_EVENT_SOURCE = "builtin_safety_supervisor"
+_SAFETY_EVENT_ACTIONS = frozenset(
+    {ActionType.ATTACK.value, ActionType.EAT.value, ActionType.HEAL.value}
+)
 
 
 class SafetySupervisor:
@@ -46,38 +49,28 @@ class SafetySupervisor:
         self._on_intervention_consumed = on_intervention_consumed
         self._event_sink = event_sink
         self._event_writes: set[asyncio.Task[None]] = set()
+        self._coalesced_event: Event | None = None
+        self._coalesced_total = 0
+        self._coalesced_outcomes: dict[str, dict[str, int]] = {}
+        self._coalesced_failed_action: str | None = None
         self._pending: ActionResult | None = None
         self._intervention_ready = asyncio.Event()
-        self._pending_consumed = asyncio.Event()
-        self._pending_consumed.set()
 
     async def run(self, stop_event: asyncio.Event) -> None:
         """Poll independently until asked to stop; isolate per-tick failures."""
 
         while not stop_event.is_set():
-            if self._pending is not None:
-                consumed_task = asyncio.create_task(self._pending_consumed.wait())
-                stopped_task = asyncio.create_task(stop_event.wait())
-                done, pending = await asyncio.wait(
-                    (consumed_task, stopped_task),
-                    timeout=self._interval,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                for task in pending:
-                    task.cancel()
-                if pending:
-                    await asyncio.gather(*pending, return_exceptions=True)
-                if stopped_task in done and stop_event.is_set():
-                    break
-                continue
             try:
                 world = await self._observe()
                 if stop_event.is_set():
                     break
                 result = await self._evaluate(world)
-                if result is not None and self._pending is None:
-                    self._pending = result
-                    self._pending_consumed.clear()
+                if result is not None:
+                    # Reflexes keep running while a result is unconsumed; the
+                    # single slot holds the newest outcome, except that a
+                    # later success never hides an unconsumed failure.
+                    if self._pending is None or self._pending.success or not result.success:
+                        self._pending = result
                     self._intervention_ready.set()
                     self._record_intervention_event(result)
             except asyncio.CancelledError:
@@ -111,9 +104,75 @@ class SafetySupervisor:
             source=_SAFETY_EVENT_SOURCE,
             payload=payload,
         )
-        write_task = asyncio.create_task(self._append_event(event))
+        if self._event_writes:
+            # Keep at most one event write in flight and one bounded summary
+            # waiting behind it if the durable sink is slow. Retain failure
+            # counts and their action even if a later intervention succeeds.
+            self._coalesced_event = event
+            action_key = (
+                str(payload["action"])
+                if str(payload["action"]) in _SAFETY_EVENT_ACTIONS
+                else "other"
+            )
+            outcome_key = "succeeded" if result.success else "failed"
+            counts = self._coalesced_outcomes.setdefault(action_key, {"failed": 0, "succeeded": 0})
+            counts[outcome_key] += 1
+            self._coalesced_total += 1
+            if not result.success:
+                self._coalesced_failed_action = str(payload["action"])
+            return
+
+        write_task = asyncio.create_task(self._write_events(event))
         self._event_writes.add(write_task)
         write_task.add_done_callback(self._event_writes.discard)
+
+    async def _write_events(self, event: Event) -> None:
+        current: Event | None = event
+        while True:
+            if current is None:
+                task = asyncio.current_task()
+                if task is not None:
+                    self._event_writes.discard(task)
+                return
+            await self._append_event(current)
+            current = self._coalesced_event
+            if current is not None:
+                current = self._summarize_coalesced_event(current)
+            self._coalesced_event = None
+
+    def _summarize_coalesced_event(self, latest: Event) -> Event:
+        """Build one bounded event that retains every coalesced outcome count."""
+
+        outcome_counts = {
+            action: dict(counts) for action, counts in sorted(self._coalesced_outcomes.items())
+        }
+        failed = sum(counts["failed"] for counts in outcome_counts.values())
+        payload = dict(latest.payload)
+        payload["coalesced_count"] = self._coalesced_total
+        payload["outcome_counts"] = outcome_counts
+        severity = latest.severity
+        if failed:
+            # Keep the latest failed action as the representative outcome so
+            # an intervening success cannot downgrade a critical incident.
+            payload["action"] = self._coalesced_failed_action or payload["action"]
+            payload["success"] = False
+            severity = EventSeverity.CRITICAL
+        event = Event(
+            event_id=latest.event_id,
+            type=latest.type,
+            severity=severity,
+            occurred_at=latest.occurred_at,
+            steve_id=latest.steve_id,
+            task_id=latest.task_id,
+            causal_action_id=latest.causal_action_id,
+            source=latest.source,
+            schema_version=latest.schema_version,
+            payload=payload,
+        )
+        self._coalesced_total = 0
+        self._coalesced_outcomes.clear()
+        self._coalesced_failed_action = None
+        return event
 
     async def _append_event(self, event: Event) -> None:
         try:
@@ -148,7 +207,6 @@ class SafetySupervisor:
         if result is not None:
             self._pending = None
             self._intervention_ready.clear()
-            self._pending_consumed.set()
             if self._on_intervention_consumed is not None:
                 self._on_intervention_consumed()
         return result

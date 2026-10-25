@@ -142,9 +142,22 @@ existing default allow policy unless the optional `authz.enabled` setting is
 true. When enabled, startup reads the controller bearer token only from
 `AUTHZ_CONTROLLER_TOKEN`, authenticates it for the configured `steve_id`, and
 acquires one controller session before startup provisioning. The configured
-`session_lease_seconds` bounds that session; it is not renewed automatically,
-so actions fail closed after it expires. The session is released on normal
-shutdown. Invalid credentials, missing `steve:control`, or an unavailable
+`session_lease_seconds` bounds each controller lease. The built-in orchestrator
+renews it periodically only while the same persisted session, credential,
+owner, and fencing generation remain valid; renewal never re-acquires or
+resurrects a session and leased Steve ownership caps the session expiry. If
+renewal is denied or cannot extend the lease, strategic work is suspended and
+the independent safety supervisor remains active until an authorized `!stop`
+or the `suspended_shutdown_seconds` grace period (default 300) ends, after
+which the bridge shuts down. Renewal runs at a third of the lease and retries
+storage errors within five seconds. Event-loop authorization checks never wait
+on a contended local Authz lock: a check that cannot complete skips the current
+strategic step and retries, and only a definitive denial or lease expiry
+suspends strategy. The session is released on normal shutdown.
+Shutdown completes renewal and safety-worker stops and Authz release/connection
+close off the event loop before propagating repeated cancellation.
+Invalid credentials, missing
+`steve:control`, or an unavailable
 session prevent startup mutations. This is local authz/session infrastructure
 only: it adds no transport, network exposure, TLS, task persistence, or
 backend-local watchdog, and does not itself fence already-dispatched backend
@@ -155,17 +168,30 @@ clear the stale session and advance its fencing generation.
 
 ActionService classifies the MCPQ backend's command-simulated movement,
 block/inventory changes, combat, eating, and healing as privileged-simulated
-actions. A normal controller session cannot invoke them; they require
-`admin:world` authorization. The built-in Authz configuration does not accept
-a world-admin token yet, so enabling it intentionally denies these actions
-until that separate administrative integration exists. Local mode without
-Authz retains the legacy behavior. The safety supervisor uses a distinct,
+actions. Internal chat teleports and startup lifecycle mutations also require
+the `admin:world` decision at ActionService; the internal caller capability
+proves origin, not world-administration authority. A normal controller
+session cannot invoke these actions alone. When Authz is enabled, configure
+the separate `AUTHZ_WORLD_ADMIN_TOKEN` from an admin credential that has
+`admin:world`; it is accepted only from the environment, and enabled Authz
+refuses to start without it. Local mode without Authz and without a custom
+policy retains the legacy behavior. A caller-supplied `action_policy` must
+return `PolicyDecision(..., allow_privileged=True)` to permit these privileged
+classes; a plain `PolicyDecision(True)` rejects them. The safety supervisor uses a distinct,
 in-process capability for only bounded mob ATTACK, inventory-backed EAT, and
 item-limited HEAL reflexes; it does not reuse strategic controller authority,
 so session expiry or revocation does not disable those reactions. The
 capability is not exposed through a transport. It does not create a backend
 watchdog or support an administrative remote freeze; process shutdown
 (including allowlisted `!stop`) stops the supervisor.
+If the strategic controller session expires or is revoked, the orchestrator
+suspends strategic work and remains in safety-only operation until an
+authorized `!stop` or the bounded `authz.suspended_shutdown_seconds` grace
+period ends; authorization denials do not trip the ordinary failure shutdown.
+Lost authority is not restored in-process, so the grace period always ends in
+shutdown (an offline-mode server has no authorized `!stop` path at all).
+While suspended, chat polling accepts only the authenticated `!stop` command;
+it ignores `!goal` and other commands that could restart strategic work.
 
 Authorization decisions are re-read from persisted state on every check.
 `steve:observe:self` and `steve:control` are Steve bound: the target must be
@@ -234,12 +260,18 @@ consumer is marked expired and polling/acknowledgment fails until
 `reset_consumer()` resumes at the oldest retained event. Reset can skip expired
 history and is an explicit recovery choice. There is no authentication/ACL
 layer, MCP endpoint, SSE delivery, or task lifecycle service. The built-in
-`SafetySupervisor` is the sole producer in this slice: it emits
-`safety.intervened` with only the action name and success flag, using HIGH for
-successful interventions and CRITICAL for failed or denied interventions.
+`SafetySupervisor` is the sole producer in this slice: each ordinary
+`safety.intervened` event contains the action name and success flag, using HIGH
+for successful interventions and CRITICAL for failed or denied interventions.
 Writes run off the event loop and are drained during orderly shutdown. Other
 RFC-0001 event producers remain unimplemented. The compact event-ID index
 grows with unique IDs even though event payload retention is bounded.
+If the journal sink is slow, the safety producer keeps one write in flight and
+coalesces pending safety-event reporting into one bounded summary. The summary
+contains counts by safety action and outcome; any coalesced failure keeps the
+summary at CRITICAL severity and is represented as a failed action, even when
+a later intervention succeeds. This bounds event backlog without erasing a
+critical failure behind a later success.
 
 ### Outbound webhook delivery (local service slice)
 
@@ -351,9 +383,10 @@ evaluates the orchestrator's existing `SelfPreservationLayer` in a task
 separate from the strategic LLM loop. If a mutating reflex arrives while the
 LLM is deciding, the orchestrator cancels and awaits that decision, then
 dispatches the reflex through the shared `ActionService`. A one-item pending
-slot bounds intervention backlog and pauses further evaluations until the
-loop consumes the pending result. Goal decomposition is covered by the
-supervisor as well. Strategic WAIT actions are interruptible and do not hold
+slot bounds unconsumed result backlog; the supervisor continues observing and
+evaluating while that result is pending, retaining only the first result for
+the strategic loop. Goal decomposition is covered by the supervisor as well.
+Strategic WAIT actions are interruptible and do not hold
 the ActionService dispatch lock; other dispatch coroutines are serialized.
 When a safety reflex starts, the shared action service invalidates strategic
 requests that have not crossed the backend dispatch boundary; it re-enables
@@ -403,9 +436,16 @@ the chat explicitly. Direct/test harness construction without an
 orchestrator-provided service uses a local ActionService bound to the
 handler's MCPQ client as the default, so there is no raw command bypass.
 Service-only construction (no adapter, no raw client) resolves the world
-from the supplied service. Chat routing and input validation do not add
-authenticated chat sender authorization; RFC-0001 chat ownership and
-authorization requirements remain open.
+from the supplied service. Protected chat commands (`!goal`, `!stop`,
+`!goto`, `!follow`, and `!come`) additionally require the MCPQ event's
+player metadata to match an explicit UUID or name allowlist. A supplied UUID
+takes precedence over the name. The current MCPQ ChatEvent exposes only the
+server-supplied player name, so name authorization is enabled only when
+`chat_control.server_online_mode` explicitly asserts that Paper uses
+`online-mode=true`; the bridge cannot verify this for separately managed
+servers. Offline-mode names, formatted chat markup, and sender strings passed
+to direct dispatch do not grant authority. `!status` and `!help` remain public
+read-only commands.
 
 ### Request idempotency
 

@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, TypeAlias
 
 if TYPE_CHECKING:
-    from ..runtime import WorldAdapter
+    from ..runtime.world_adapter import WorldAdapter as _WorldAdapter
 
-    WorldAdapterType = WorldAdapter
+    WorldAdapter: TypeAlias = _WorldAdapter
 else:
-    WorldAdapterType = object
-
-WorldAdapter = WorldAdapterType
-"""Type alias: the real Protocol under type checking, ``object`` at runtime."""
+    # The runtime import would cycle through actions -> runtime.action_service.
+    # This alias is used only in annotations; runtime dispatch accepts adapters.
+    WorldAdapter: TypeAlias = Any
+"""Type alias: the real Protocol under type checking, ``Any`` at runtime."""
 
 __all__ = ["WorldAdapter"]

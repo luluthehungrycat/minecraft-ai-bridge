@@ -34,12 +34,21 @@ bridge:
   event_journal_path: data/safety-events.sqlite3
 
 # Optional local AuthzService gate for the built-in controller. Keep the
-# bearer token in AUTHZ_CONTROLLER_TOKEN, never in this YAML file.
+# bearer tokens in environment variables, never in this YAML file.
 authz:
   enabled: false
   database_path: data/authz.sqlite3
   steve_id: ""
   session_lease_seconds: 3600
+  # Safety-only operation after losing controller authority ends after this
+  # many seconds unless an authorized in-game !stop arrives first.
+  suspended_shutdown_seconds: 300
+
+# Chat identity commands are disabled unless the server authenticates accounts.
+chat_control:
+  server_online_mode: false
+  allowed_uuids: []
+  allowed_names: []
 
 goals:
   default: "Explore the world and gather resources"

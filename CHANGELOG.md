@@ -31,31 +31,103 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
   safety-authorized HEAL action rejects. Golden carrots remain eligible for
   ordinary auto-consumption; healing now selects only supported golden apples.
 
+- Preserved failed safety interventions when a slow journal coalesces event
+  writes. The bounded summary records outcome counts by action and remains
+  CRITICAL if any coalesced intervention failed.
+
+- Combined Authz and caller-supplied action policies so a caller's explicit
+  `allow_privileged=False` restriction cannot be overridden by world-admin
+  authorization. Also restored collection of the preservation observation
+  boundary regression test.
+
 - Protected in-game chat control commands with a default-deny allowlist based
   on MCPQ event player metadata. Configure UUIDs where available, or explicit
-  authenticated player names for current MCPQ ChatEvent; `!status` and `!help`
-  remain public. An event UUID overrides name fallback. See `docs/AGENT.md`
-  for single-player setup.
+  authenticated player names for current MCPQ ChatEvent; all control commands
+  require an explicit online-mode assertion because MCPQ exposes no UUID.
+  Offline-mode names are forgeable and denied. `!status` and `!help` remain
+  public. See `docs/AGENT.md` for single-player setup.
+
+- Added `AUTHZ_WORLD_ADMIN_TOKEN` for a separately granted `admin:world`
+  credential. Authz now requires world-admin authorization for internal chat
+  teleports and startup lifecycle mutations as well as simulated gameplay;
+  the internal caller capability alone proves origin, not administrative
+  permission. Complex chat allowlist environment values are decoded as JSON
+  arrays before config validation.
+
+- When the configured controller session expires or is revoked, the
+  orchestrator now suspends strategic work and remains safety-only until an
+  explicit runtime stop. Authorization loss no longer counts toward the
+  consecutive-failure shutdown threshold. Suspended chat polling accepts only
+  authenticated `!stop`, and stop acknowledgement is time-bounded. Blocked
+  initial or chat-triggered goal decomposition is canceled when authority is
+  lost, and a reassignment is not acknowledged as successful.
+- The built-in orchestrator renews its finite controller session while its
+  persisted credential, ownership, and fencing generation remain valid.
+  Renewal cannot revive expired authority; losing the lease suspends strategic
+  work while the safety supervisor remains active. Renewal and event-loop
+  session checks fail fast under Authz/SQLite lock contention instead of
+  blocking safety polling.
+- Shutdown now completes renewal and safety-worker stops and Authz release/close
+  before propagating repeated cancellation; blocking SQLite cleanup runs off the
+  asyncio event loop.
+- Safety-only operation after losing controller authority is now bounded by
+  `authz.suspended_shutdown_seconds` (default 300). Previously the bridge
+  idled forever when no authorized `!stop` was possible, e.g. on offline-mode
+  servers. Chat poll failures while suspended are now logged.
+- A session check that cannot complete because of Authz lock or SQLite
+  contention now defers the current strategic step and retries, instead of
+  permanently suspending strategy. Only a definitive denial or lease expiry
+  suspends it.
+- Enabled Authz now requires `AUTHZ_WORLD_ADMIN_TOKEN` at startup. Without
+  it, bot provisioning and safe spawn were silently rejected and the bridge
+  started with no bot entity.
+- A safety intervention that completes in the same tick as authority loss
+  is now recorded in memory instead of being discarded.
+- The safety supervisor's single pending slot now holds the newest
+  intervention, and a later success never replaces an unconsumed failure.
+  Previously the strategic loop saw only the oldest, stale result.
+- Safety supervisor polls no longer write observations to the agent's
+  short-term memory. On a live server every 0.25s poll differed from the
+  last, so polls evicted the action history the LLM sees within seconds.
+- The `openrouter` provider now honours `llm.openrouter_base_url` instead of
+  always calling openrouter.ai, so OpenAI-compatible routers such as Requesty
+  work. Integration tests use Requesty when only `REQUESTY_API_KEY` is set.
+- Controller session renewal now runs at a third of the lease instead of
+  every five seconds, and retries storage errors within five seconds.
+
+### Changed
+
+- **Migration:** custom `action_policy` callables must now return
+  `PolicyDecision(..., allow_privileged=True)` to permit privileged-simulated,
+  internal-control, and lifecycle actions (bot provisioning, safe spawn, follow,
+  `!goto`/`!come`). A plain `PolicyDecision(True)` rejects them, and the
+  rejection message now says so. Bridges without a custom policy are unaffected.
 
 ### Added
+
+- Documented running the Paper server and building the bot plugin with
+  rootless Podman in `docs/SETUP.md`.
 
 - Separated built-in survival reflexes from strategic controller sessions with
   an in-process safety capability restricted to bounded mob attacks and
   inventory-backed eating/healing. Effects now require server-confirmed item
   consumption, item-free generic healing is denied, and combat selectors are
   bot-relative within six blocks. Authz classifies MCPQ command-simulated
-  movement and mutations as privileged, while legacy local mode remains
-  compatible; the current Authz configuration has no `admin:world` dispatch
-  token, so those simulated actions fail closed when Authz is enabled.
+  movement and mutations as privileged and requires the separate
+  `admin:world` credential when Authz is enabled, while legacy local mode
+  remains compatible.
 
 - Added an opt-in local AuthzService gate for the built-in Orchestrator.
   Set `authz.enabled`, `authz.steve_id`, and the finite
   `authz.session_lease_seconds` in configuration, and provide the scoped
   bearer token only through `AUTHZ_CONTROLLER_TOKEN`. Startup requires a valid
   `steve:control` credential and exclusive session before provisioning;
-  subsequent ActionService requests revalidate that session. Shutdown releases
-  it. The gate is disabled by default, and its session lease is not renewed
-  automatically. If a process exits uncleanly, startup reports an active
+  subsequent ActionService requests revalidate that session. Simulated and
+  internal world mutations additionally require the separate
+  `AUTHZ_WORLD_ADMIN_TOKEN`. Shutdown releases the session. The gate is
+  disabled by default. Its built-in heartbeat renews only the existing valid
+  session; it never reacquires a session after expiration or revocation. If a
+  process exits uncleanly, startup reports an active
   session; after confirming the prior process stopped, an administrator can
   deactivate and reactivate the Steve to clear stale session state. This adds
   no external transport or backend watchdog.
@@ -177,9 +249,10 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
 - Added a built-in `SafetySupervisor` that periodically evaluates the existing
   self-preservation layer independently of the strategic LLM loop. A pending
   intervention preempts and cancels an outstanding LLM decision before a stale
-  strategic action can dispatch; the supervisor pauses while its single
-  intervention slot is occupied. A strategic WAIT is interruptible and does
-  not hold the ActionService dispatch lock. Other dispatch coroutines are
+  strategic action can dispatch; its single pending result is coalesced while
+  safety observations and evaluation continue. Safety event writes are bounded
+  to one active and one latest coalesced event. A strategic WAIT is
+  interruptible and does not hold the ActionService dispatch lock. Other dispatch coroutines are
   serialized, and strategic requests queued but not yet dispatched are
   invalidated when a reflex starts. A canceled awaiter can still leave MCPQ
   thread work running.

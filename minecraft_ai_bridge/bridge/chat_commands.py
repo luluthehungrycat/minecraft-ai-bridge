@@ -17,9 +17,11 @@ Supported commands
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import re
+from collections.abc import Callable, Collection
 from typing import TYPE_CHECKING
 
 from ..minecraft.actions import ActionType
@@ -98,11 +100,16 @@ class ChatCommandHandler:
 
     # ── Polling ──────────────────────────────────────────────────────
 
-    async def poll(self) -> None:
+    async def poll(
+        self,
+        *,
+        allowed_commands: Collection[str] | Callable[[], Collection[str] | None] | None = None,
+    ) -> None:
         """Check for new chat messages and process any matching commands.
 
         Uses MCPQ's ``ChatEvent`` polling API to catch in-game chat
-        messages.  Should be called once per agent turn.
+        messages. ``allowed_commands`` can narrow dispatch for suspended
+        runtime states without changing the normal command policy.
         """
         world = self._world
         if world is None:
@@ -117,12 +124,27 @@ class ChatCommandHandler:
             return
 
         for event in events:
+            event_allowlist = allowed_commands() if callable(allowed_commands) else allowed_commands
             player = getattr(event, "player", None)
             sender_name = getattr(player, "name", "") if player else ""
             message = getattr(event, "message", "")
-            await self._process_message(message, sender_name, player)
+            await self._process_message(
+                message,
+                sender_name,
+                player,
+                allowed_commands=event_allowlist,
+            )
+            if getattr(self._orch, "_stop_requested", False):
+                break
 
-    async def _process_message(self, message: str, sender_name: str, player: object | None) -> None:
+    async def _process_message(
+        self,
+        message: str,
+        sender_name: str,
+        player: object | None,
+        *,
+        allowed_commands: Collection[str] | None = None,
+    ) -> None:
         """Process message text while deriving authority only from event metadata."""
         match = _COMMAND_RE.match(message)
         if not match:
@@ -131,13 +153,16 @@ class ChatCommandHandler:
         args = match.group(2).strip()
         if command not in COMMANDS:
             return
+        if allowed_commands is not None and command not in allowed_commands:
+            logger.info("Ignoring chat command %s in restricted runtime state", command)
+            return
         if command not in _PUBLIC_COMMANDS and not self._authorized_player(player):
             logger.warning("Denied chat control command %s from untrusted player metadata", command)
             return
         await self.handle_command(command, args, sender_name, trusted_player=player)
 
     def _authorized_player(self, player: object | None) -> bool:
-        if player is None:
+        if player is None or not getattr(self._chat_control, "server_online_mode", False):
             return False
         player_uuid = getattr(player, "uuid", None) or getattr(player, "unique_id", None)
         allowed_uuids = {
@@ -214,9 +239,15 @@ class ChatCommandHandler:
 
     async def _cmd_stop(self, args: str, sender: str) -> None:
         """Signal the agent to stop after the current turn."""
-        await self._send(f"@{sender} Shutting down by request …")
         orch = self._orch
         orch._stop_requested = True  # checked in the main loop
+        try:
+            await asyncio.wait_for(
+                self._send(f"@{sender} Shutting down by request …"),
+                timeout=1.0,
+            )
+        except TimeoutError:
+            logger.warning("Could not send chat stop acknowledgment before timeout")
 
     async def _cmd_goal(self, args: str, sender: str) -> None:
         """Re-assign the agent's goal."""
@@ -225,8 +256,17 @@ class ChatCommandHandler:
             return
         orch = self._orch
         if hasattr(orch, "_goals") and hasattr(orch, "_memory"):
+            set_goal = getattr(orch, "_set_goal_or_authority_loss", None)
+            if callable(set_goal):
+                await set_goal(args)
+            else:
+                await orch._goals.set_goal(args)
+            revalidate = getattr(orch, "_suspend_strategy_if_session_invalid", None)
+            if callable(revalidate) and revalidate():
+                return
+            if getattr(orch, "_strategic_authority_lost", False):
+                return
             orch._memory.clear_short_term()
-            await orch._goals.set_goal(args)
             await self._send(
                 f'@{sender} Goal re-assigned to: "{args}" ({orch._goals.sub_goal_count} sub-goals)'
             )

@@ -22,9 +22,10 @@ from tests.conftest import MockMcpqClient
 
 
 @pytest.mark.asyncio
-async def test_supervisor_does_not_repeat_an_unconsumed_intervention() -> None:
+async def test_supervisor_keeps_polling_with_one_coalesced_pending_intervention() -> None:
     evaluations = 0
-    intervention = ActionResult(success=True, action=ActionType.HEAL)
+    three_evaluations = asyncio.Event()
+    interventions: list[ActionResult] = []
 
     async def observe() -> WorldState:
         return WorldState()
@@ -32,17 +33,55 @@ async def test_supervisor_does_not_repeat_an_unconsumed_intervention() -> None:
     async def evaluate(_world: WorldState) -> ActionResult:
         nonlocal evaluations
         evaluations += 1
+        intervention = ActionResult(
+            success=True,
+            action=ActionType.HEAL,
+            data={"evaluation": evaluations},
+        )
+        interventions.append(intervention)
+        if evaluations >= 3:
+            three_evaluations.set()
         return intervention
 
     supervisor = SafetySupervisor(observe, evaluate, interval=0.01)
     stop_event = asyncio.Event()
     task = asyncio.create_task(supervisor.run(stop_event))
-    await asyncio.sleep(0.04)
+    await asyncio.wait_for(three_evaluations.wait(), timeout=0.5)
 
-    assert evaluations == 1
-    assert supervisor.take_nowait() is intervention
+    assert evaluations >= 3
     stop_event.set()
     await asyncio.wait_for(task, timeout=0.2)
+    # One slot, holding the newest outcome rather than the first stale one.
+    assert supervisor.take_nowait() is interventions[-1]
+    assert supervisor.take_nowait() is None
+
+
+@pytest.mark.asyncio
+async def test_supervisor_pending_slot_keeps_unconsumed_failure_over_later_success() -> None:
+    outcomes = iter([True, False, True])
+    produced: list[ActionResult] = []
+    done = asyncio.Event()
+
+    async def observe() -> WorldState:
+        return WorldState()
+
+    async def evaluate(_world: WorldState) -> ActionResult | None:
+        success = next(outcomes, None)
+        if success is None:
+            done.set()
+            return None
+        result = ActionResult(success=success, action=ActionType.ATTACK)
+        produced.append(result)
+        return result
+
+    supervisor = SafetySupervisor(observe, evaluate, interval=0.01)
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(supervisor.run(stop_event))
+    await asyncio.wait_for(done.wait(), timeout=0.5)
+    stop_event.set()
+    await asyncio.wait_for(task, timeout=0.2)
+
+    assert supervisor.take_nowait() is produced[1]
 
 
 @pytest.mark.asyncio
@@ -323,6 +362,7 @@ async def test_run_safety_reflex_preempts_a_blocked_llm_decision(
         return state
 
     monkeypatch.setattr(orch, "_observe", observe)
+    monkeypatch.setattr(orch, "_observe_for_safety", observe)
 
     run_task = asyncio.create_task(orch.run("stay alive"))
     await asyncio.wait_for(llm.started.wait(), timeout=1)
@@ -412,6 +452,7 @@ async def test_reflex_invalidates_llm_mutation_queued_behind_heal(
         return critical_state
 
     monkeypatch.setattr(orch, "_observe", observe)
+    monkeypatch.setattr(orch, "_observe_for_safety", observe)
     run_task = asyncio.create_task(orch.run("stay alive"))
     await asyncio.wait_for(heal_started.wait(), timeout=0.5)
     await asyncio.wait_for(llm.decision_returned.wait(), timeout=0.5)
@@ -476,6 +517,7 @@ async def test_safety_supervisor_runs_while_goal_decomposition_is_blocked(
         return critical_state
 
     monkeypatch.setattr(orch, "_observe", observe)
+    monkeypatch.setattr(orch, "_observe_for_safety", observe)
 
     run_task = asyncio.create_task(orch.run("stay alive"))
     await asyncio.wait_for(llm.decomposition_started.wait(), timeout=0.5)
@@ -486,3 +528,88 @@ async def test_safety_supervisor_runs_while_goal_decomposition_is_blocked(
     assert any(record.action is ActionType.HEAL for record in service.audit_records)
     llm.release_decomposition.set()
     await asyncio.wait_for(run_task, timeout=1)
+
+
+class _NeverDecidingLLM(BlockingLLM):
+    async def decide(self, system_prompt, messages, tool_choice="auto") -> LLMResponse:
+        del system_prompt, messages, tool_choice
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
+class _ReadySupervisor:
+    def __init__(self, result: ActionResult) -> None:
+        self._result = result
+
+    def take_nowait(self) -> ActionResult | None:
+        return None
+
+    async def wait_for_intervention(self) -> ActionResult:
+        return self._result
+
+
+@pytest.mark.asyncio
+async def test_intervention_wins_over_simultaneous_authority_loss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    config = AppConfig()
+    config.authz.enabled = True
+    orch = Orchestrator(config)
+    orch._llm = _NeverDecidingLLM()
+    intervention = ActionResult(success=False, action=ActionType.ATTACK)
+    orch._safety_supervisor = _ReadySupervisor(intervention)  # type: ignore[assignment]
+    orch._strategic_authority_lost = True
+    orch._strategic_authority_lost_event.set()
+
+    response, decided = await asyncio.wait_for(orch._decide_with_safety([]), timeout=1)
+    assert response.action == "wait"
+    assert decided is intervention
+
+    completed, waited = await asyncio.wait_for(
+        orch._wait_or_safety(LLMResponse(action="wait", action_params={"seconds": 60})),
+        timeout=1,
+    )
+    assert completed is None
+    assert waited is intervention
+
+
+@pytest.mark.asyncio
+async def test_deferred_strategy_records_consumed_reflex(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    orch = Orchestrator(AppConfig())
+    orch._strategic_authority_lost = True
+    reflex = ActionResult(success=False, action=ActionType.EAT, message="no food")
+
+    await orch._defer_strategy(reflex)
+
+    assert orch._last_result is reflex
+    assert any("eat" in message.content for message in orch._memory.recent_messages())
+
+
+@pytest.mark.asyncio
+async def test_safety_polling_does_not_write_observations_to_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    orch = Orchestrator(AppConfig())
+    ticks = 0
+
+    class ChangingObserver:
+        async def observe(self) -> WorldState:
+            nonlocal ticks
+            ticks += 1
+            # A live server's state changes between polls, defeating dedup.
+            return WorldState(health=20.0 - ticks % 5)
+
+    orch._observer = ChangingObserver()  # type: ignore[assignment]
+    orch._memory.record_action("scan", {"success": True, "message": "", "data": {}})
+
+    for _ in range(30):
+        await orch._observe_for_safety()
+
+    assert ticks == 30
+    assert [entry.raw for entry in orch._memory._short_term][-1].startswith("Action: scan")
+    assert len(orch._memory._short_term) == 1

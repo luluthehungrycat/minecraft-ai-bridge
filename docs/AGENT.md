@@ -200,18 +200,25 @@ Control commands (`!goal`, `!stop`, `!goto`, `!follow`, `!come`) are denied
 unless the MCPQ chat event's player metadata matches `chat_control.allowed_uuids`
 or `chat_control.allowed_names`. A supplied UUID is authoritative: if it is
 not allowlisted, a matching name cannot override it. The current MCPQ
-ChatEvent exposes an authenticated player name but no UUID. For a single-player
-server using that API, configure the exact
-server-authenticated online-mode account name:
+ChatEvent exposes a player name but no UUID. Protected commands are denied
+unless `chat_control.server_online_mode` is explicitly true, because the
+bridge cannot verify Paper's authentication mode through MCPQ. For a
+single-player server, set Paper `online-mode=true` and configure the exact
+authenticated account name:
 
 ```yaml
 chat_control:
+  server_online_mode: true
   allowed_names:
-    - YourMinecraftAccount
+    - YourAccount
 ```
 
-Names are an explicit fallback and are only trustworthy when the server
-authenticates online-mode identities. The allowlist defaults empty. `!status`
+Names are an explicit fallback and are trustworthy only when the server
+authenticates online-mode identities. The mode assertion and both allowlists
+default to deny; the bridge does not independently verify a remote server's
+`online-mode` setting. Docker Compose derives `CHAT_CONTROL_SERVER_ONLINE_MODE`
+and Paper's `ONLINE_MODE` from the same `ONLINE_MODE` variable (default
+`false`), so offline-mode deployment rejects all protected commands. `!status`
 and `!help` are public read-only commands. Formatted chat markup and sender
 strings supplied to direct dispatch never grant authority.
 
@@ -246,8 +253,10 @@ a local ActionService bound to its MCPQ client, so the mutation still
 crosses the policy/audit gate; there is no raw command bypass. A harness
 exposing only an ActionService (with no adapter and no raw client)
 resolves the world from that service, so polling, status, and chat replies
-still work. This routing and validation do not add authenticated chat sender
-authorization; RFC-0001 chat ownership and authorization remain open.
+still work. Protected commands are separately authorized against the MCPQ
+event's player metadata using the explicit chat-control allowlist and online-
+mode requirement described above; this gate is independent of the
+orchestrator's controller session and the ActionService policy.
 
 The self-preservation layer (see below) routes its mutating reflexes —
 reflex ATTACK, auto EAT, and auto HEAL — through the same shared

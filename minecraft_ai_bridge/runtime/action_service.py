@@ -107,6 +107,13 @@ _INTERNAL_CONTROL_ACTIONS = frozenset(
     }
 )
 _LIFECYCLE_INTERNAL_ACTIONS = frozenset({ActionType.PROVISION_BOT, ActionType.PREPARE_SAFE_SPAWN})
+_PRIVILEGED_AUTHORIZATION_CLASSES = frozenset(
+    {
+        ActionClass.PRIVILEGED_SIMULATED,
+        ActionClass.INTERNAL_CONTROL,
+        ActionClass.LIFECYCLE_INTERNAL,
+    }
+)
 _SAFETY_ACTIONS = frozenset({ActionType.ATTACK, ActionType.EAT, ActionType.HEAL})
 
 
@@ -863,11 +870,12 @@ class ActionService:
                 decision.reason or "Action rejected by policy",
                 status="rejected",
             )
-        if action_class is ActionClass.PRIVILEGED_SIMULATED and not decision.allow_privileged:
+        if action_class in _PRIVILEGED_AUTHORIZATION_CLASSES and not decision.allow_privileged:
             return None, self._rejection_outcome(
                 request,
                 request_id,
-                f"{request.action.value} requires privileged backend authorization",
+                f"{request.action.value} requires privileged backend authorization "
+                "(the action policy must return allow_privileged=True)",
                 status="rejected",
             )
         return decision, None

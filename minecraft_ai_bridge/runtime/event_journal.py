@@ -85,6 +85,14 @@ def _positive_int(value: int, *, name: str, maximum: int | None = None) -> int:
     return value
 
 
+def _inserted_row_id(cursor: sqlite3.Cursor) -> int:
+    """Return SQLite's inserted row ID, rejecting an unexpected missing value."""
+    row_id = cursor.lastrowid
+    if row_id is None:
+        raise EventJournalError("SQLite did not return an inserted row ID")
+    return row_id
+
+
 def _event_json(event: Event) -> tuple[Event, str, str]:
     """Return a validated snapshot, fixed-size fingerprint and canonical JSON."""
     if not isinstance(event, Event):
@@ -225,7 +233,7 @@ class EventJournal:
                 "INSERT INTO events(event_id, fingerprint, payload) VALUES (?, ?, ?)",
                 (snapshot.event_id, fingerprint, payload),
             )
-            cursor = int(result.lastrowid)
+            cursor = _inserted_row_id(result)
             self._conn.execute(
                 "INSERT INTO event_ids(event_id, fingerprint, cursor) VALUES (?, ?, ?)",
                 (snapshot.event_id, fingerprint, cursor),
@@ -257,7 +265,7 @@ class EventJournal:
                     "INSERT INTO events(event_id, fingerprint, payload) VALUES (?, ?, ?)",
                     (snapshot.event_id, fingerprint, payload),
                 )
-                cursor = int(result.lastrowid)
+                cursor = _inserted_row_id(result)
                 self._conn.execute(
                     "INSERT INTO event_ids(event_id, fingerprint, cursor) VALUES (?, ?, ?)",
                     (snapshot.event_id, fingerprint, cursor),

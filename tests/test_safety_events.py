@@ -266,6 +266,101 @@ async def test_close_joins_outstanding_event_writes(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_slow_event_sink_coalesces_to_one_bounded_pending_write() -> None:
+    write_started = asyncio.Event()
+    release_write = asyncio.Event()
+    five_evaluations = asyncio.Event()
+    events: list[Event] = []
+    evaluations = 0
+
+    async def observe() -> WorldState:
+        return WorldState()
+
+    async def evaluate(_world: WorldState) -> ActionResult:
+        nonlocal evaluations
+        evaluations += 1
+        if evaluations >= 5:
+            five_evaluations.set()
+        action = ActionType.HEAL if evaluations % 2 else ActionType.EAT
+        return ActionResult(success=True, action=action)
+
+    async def slow_sink(event: Event) -> None:
+        events.append(event)
+        if len(events) == 1:
+            write_started.set()
+            await release_write.wait()
+
+    supervisor = SafetySupervisor(observe, evaluate, interval=0.01, event_sink=slow_sink)
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(supervisor.run(stop_event))
+    await asyncio.wait_for(write_started.wait(), timeout=1)
+    await asyncio.wait_for(five_evaluations.wait(), timeout=1)
+
+    assert len(supervisor._event_writes) == 1
+    assert supervisor._coalesced_event is not None
+    stop_event.set()
+    await asyncio.wait_for(task, timeout=1)
+    release_write.set()
+    await supervisor.close()
+
+    assert len(events) == 2
+    assert events[-1].payload["action"] == ("heal" if evaluations % 2 else "eat")
+
+
+@pytest.mark.asyncio
+async def test_coalescing_preserves_failed_safety_interventions() -> None:
+    write_started = asyncio.Event()
+    release_write = asyncio.Event()
+    three_evaluations = asyncio.Event()
+    events: list[Event] = []
+    evaluations = 0
+
+    async def observe() -> WorldState:
+        return WorldState()
+
+    async def evaluate(_world: WorldState) -> ActionResult:
+        nonlocal evaluations
+        evaluations += 1
+        if evaluations == 1:
+            result = ActionResult(success=True, action=ActionType.HEAL)
+        elif evaluations == 2:
+            result = ActionResult(success=False, action=ActionType.ATTACK)
+        else:
+            result = ActionResult(success=True, action=ActionType.EAT)
+            three_evaluations.set()
+        return result
+
+    async def slow_sink(event: Event) -> None:
+        events.append(event)
+        if len(events) == 1:
+            write_started.set()
+            await release_write.wait()
+
+    supervisor = SafetySupervisor(observe, evaluate, interval=0.01, event_sink=slow_sink)
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(supervisor.run(stop_event))
+    await asyncio.wait_for(write_started.wait(), timeout=1)
+    await asyncio.wait_for(three_evaluations.wait(), timeout=1)
+
+    stop_event.set()
+    await asyncio.wait_for(task, timeout=1)
+    release_write.set()
+    await supervisor.close()
+
+    assert len(events) == 2
+    assert events[1].severity is EventSeverity.CRITICAL
+    assert events[1].payload == {
+        "action": "attack",
+        "success": False,
+        "coalesced_count": 2,
+        "outcome_counts": {
+            "attack": {"failed": 1, "succeeded": 0},
+            "eat": {"failed": 0, "succeeded": 1},
+        },
+    }
+
+
+@pytest.mark.asyncio
 async def test_sync_sink_runs_off_loop_and_each_intervention_has_unique_id() -> None:
     events: list[Event] = []
     sink_thread_ids: list[int] = []
@@ -357,6 +452,7 @@ async def test_orchestrator_uses_configured_journal_path_and_closes_it(
         return state
 
     monkeypatch.setattr(orch, "_observe", observe)
+    monkeypatch.setattr(orch, "_observe_for_safety", observe)
 
     run_task = asyncio.create_task(orch.run("stay alive"))
     await asyncio.wait_for(llm.started.wait(), timeout=1)

@@ -212,6 +212,38 @@ class TestInternalActionProtection:
         assert policy_log.actions == []
         assert _seen_actions(service) == []
 
+    async def test_caller_policy_can_restrict_authz_privileged_allow(
+        self, mock_mc: MockMcpqClient
+    ) -> None:
+        authority = object()
+
+        def authz_policy(_request: Any) -> PolicyDecision:
+            return PolicyDecision(
+                allowed=True,
+                allow_privileged=True,
+                identity_scope=("controller", "test-controller"),
+            )
+
+        def caller_policy(_request: Any) -> PolicyDecision:
+            return PolicyDecision(allowed=True, allow_privileged=False)
+
+        service = ActionService(
+            mock_mc,
+            policy=Orchestrator._combine_action_policies(authz_policy, caller_policy),
+            internal_authority=authority,
+        )
+
+        result = await service.execute(
+            ActionType.PROVISION_BOT,
+            {"player_name": "AIBot"},
+            authority=authority,
+        )
+
+        assert not result.success
+        assert "privileged backend authorization" in result.message
+        assert mock_mc.commands_ran == []
+        _assert_rejected(service, ActionType.PROVISION_BOT, "privileged backend authorization")
+
 
 async def _fake_pos_response(command: str) -> str:
     del command
@@ -352,6 +384,7 @@ class TestChatCommandGate:
     ) -> None:
         orch, service, policy_log = gate_env
         orch._config.chat_control.allowed_names = ["SomePlayer"]
+        orch._config.chat_control.server_online_mode = True
         handler = ChatCommandHandler(orch)
 
         await handler.handle_command(
@@ -371,6 +404,7 @@ class TestChatCommandGate:
     ) -> None:
         orch, service, policy_log = gate_env
         orch._config.chat_control.allowed_names = ["SomePlayer"]
+        orch._config.chat_control.server_online_mode = True
         handler = ChatCommandHandler(orch)
 
         await handler.handle_command(
@@ -389,6 +423,7 @@ class TestChatCommandGate:
         harness = _BareHarness(mock_mc)
         harness._config = AppConfig()
         harness._config.chat_control.allowed_names = ["SomePlayer"]
+        harness._config.chat_control.server_online_mode = True
         harness._action_policy = lambda request: deny_all(PolicyDeny(request.action))
         handler = ChatCommandHandler(harness)
 
@@ -529,6 +564,24 @@ class TestSelfPreservationGate:
         _assert_succeeded(service, ActionType.ATTACK)
         assert any("damage" in cmd for cmd in mock_mc.commands_ran)
 
+    async def test_observations_stay_outside_policy_and_audit(
+        self, gate_env: tuple[Orchestrator, ActionService, PolicyLog]
+    ) -> None:
+        orch, service, policy_log = gate_env
+        mock_mc = orch._mc
+        mock_mc.set_hostile_mobs(["zombie"])
+        layer = _make_layer(orch, service)
+
+        await layer.evaluate(WorldState(health=20.0, hunger=20))
+        result = await layer.evaluate(WorldState(health=15.0, hunger=20))
+
+        # The reflex receives dedicated safety authorization and an audit
+        # record; the hurt-source probe and entity scan stay read-only.
+        assert result is not None
+        assert result.action is ActionType.ATTACK
+        assert policy_log.actions == []
+        assert [r.action for r in service.audit_records] == [ActionType.ATTACK]
+
 
 @pytest.mark.asyncio
 async def test_safety_authority_requires_a_consumed_item_before_healing_or_eating(
@@ -566,24 +619,6 @@ async def test_safety_authority_requires_a_consumed_item_before_healing_or_eatin
         "clear @p minecraft:bread 1",
     ]
     assert not any(command.startswith("effect give") for command in commands)
-
-    async def test_observations_stay_outside_policy_and_audit(
-        self, gate_env: tuple[Orchestrator, ActionService, PolicyLog]
-    ) -> None:
-        orch, service, policy_log = gate_env
-        mock_mc = orch._mc
-        mock_mc.set_hostile_mobs(["zombie"])
-        layer = _make_layer(orch, service)
-
-        await layer.evaluate(WorldState(health=20.0, hunger=20))
-        result = await layer.evaluate(WorldState(health=15.0, hunger=20))
-
-        # The reflex receives dedicated safety authorization and an audit
-        # record; the hurt-source probe and entity scan stay read-only.
-        assert result is not None
-        assert result.action is ActionType.ATTACK
-        assert policy_log.actions == []
-        assert [r.action for r in service.audit_records] == [ActionType.ATTACK]
 
 
 @pytest.mark.asyncio

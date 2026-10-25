@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from pathlib import Path
-from typing import Literal
+from typing import Literal, get_origin
 from uuid import UUID
 
 import yaml
@@ -106,7 +107,11 @@ class AuthzConfig(BaseSettings):
     database_path: str = "data/authz.sqlite3"
     steve_id: str = ""
     controller_token: SecretStr = SecretStr("")
+    world_admin_token: SecretStr = SecretStr("")
     session_lease_seconds: float = 3600
+    # Safety-only operation after losing controller authority ends after
+    # this many seconds unless an authorized in-game !stop arrives first.
+    suspended_shutdown_seconds: float = 300
 
     model_config = SettingsConfigDict(env_prefix="authz_")
 
@@ -117,18 +122,33 @@ class AuthzConfig(BaseSettings):
             raise ValueError("authz session lease must be a finite positive number")
         return value
 
+    @field_validator("suspended_shutdown_seconds")
+    @classmethod
+    def validate_suspended_shutdown(cls, value: float) -> float:
+        if not math.isfinite(value) or value < 0:
+            raise ValueError("authz suspended shutdown must be a finite non-negative number")
+        return value
+
     def validate_controller_credentials(self) -> None:
-        if self.enabled and (
-            not self.steve_id.strip() or not self.controller_token.get_secret_value()
-        ):
+        if not self.enabled:
+            return
+        if not self.steve_id.strip() or not self.controller_token.get_secret_value():
             raise ValueError("enabled authz requires steve_id and AUTHZ_CONTROLLER_TOKEN")
+        # Startup provisioning, safe spawn, follow, and !goto/!come are
+        # privileged internal actions that Authz gates on admin:world.
+        if not self.world_admin_token.get_secret_value().strip():
+            raise ValueError(
+                "enabled authz requires AUTHZ_WORLD_ADMIN_TOKEN for bot provisioning "
+                "and internal control actions"
+            )
 
 
 class ChatControlConfig(BaseSettings):
-    """Explicit allowlist for state-changing commands received in chat."""
+    """Allowlist and server identity mode for state-changing chat commands."""
 
     allowed_uuids: list[str] = Field(default_factory=list)
     allowed_names: list[str] = Field(default_factory=list)
+    server_online_mode: bool = False
 
     model_config = SettingsConfigDict(env_prefix="chat_control_")
 
@@ -201,10 +221,12 @@ class AppConfig(BaseSettings):
             "goals",
         ):
             yaml_data = raw.get(section_name, {})
-            if section_name == "authz" and "controller_token" in yaml_data:
-                raise ValueError(
-                    "authz.controller_token must be supplied by an environment variable"
-                )
+            if section_name == "authz":
+                for secret_field in ("controller_token", "world_admin_token"):
+                    if secret_field in yaml_data:
+                        raise ValueError(
+                            f"authz.{secret_field} must be supplied by an environment variable"
+                        )
 
             # Gather env-var overrides for this section
             section_model_cls = type(getattr(cfg, section_name))
@@ -213,6 +235,14 @@ class AppConfig(BaseSettings):
             for field_name in section_model_cls.model_fields:
                 env_val = env_lookup.get((prefix + field_name).casefold())
                 if env_val is not None:
+                    field = section_model_cls.model_fields[field_name]
+                    if get_origin(field.annotation) is list:
+                        try:
+                            env_val = json.loads(env_val)
+                        except json.JSONDecodeError as exc:
+                            raise ValueError(f"{prefix}{field_name} must be a JSON array") from exc
+                        if not isinstance(env_val, list):
+                            raise ValueError(f"{prefix}{field_name} must be a JSON array")
                     env_data[field_name] = env_val
 
             # Merge: env > yaml > defaults

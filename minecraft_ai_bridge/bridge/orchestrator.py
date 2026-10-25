@@ -9,8 +9,10 @@ import contextlib
 import inspect
 import json
 import logging
+import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from ..config import AppConfig
 from ..llm.client import LLMClient, OpenCodeServerClient, create_llm_client
@@ -34,6 +36,8 @@ from .memory import AgentMemory
 from .self_preservation import PreservationConfig, SelfPreservationLayer
 
 logger = logging.getLogger(__name__)
+
+_AUTH_LOST_CHAT_COMMANDS = frozenset({"!stop"})
 
 _INTERNAL_ACTION_TYPES = frozenset(
     {
@@ -88,6 +92,10 @@ class Orchestrator:
         self._safety_action_authority = object()
         self._authz_service: AuthzService | None = None
         self._authz_session: AuthzControllerSession | None = None
+        self._strategic_authority_lost = False
+        self._strategic_authority_lost_event = asyncio.Event()
+        self._session_renewal_stop_event: asyncio.Event | None = None
+        self._session_renewal_task: asyncio.Task[None] | None = None
         self._observer: Observer | None = None
         self._memory = AgentMemory(window=config.bridge.memory_window)
         self._goals = GoalManager(
@@ -142,16 +150,23 @@ class Orchestrator:
         try:
             await self._connect()
             logger.info("MCPQ connected — controlling player: %s", api_cfg.player_name)
+            self._start_session_renewal()
             self._start_safety_supervisor()
+            # Let the independent task begin polling before goal setup can
+            # block on LLM inference.
+            await asyncio.sleep(0)
 
             # 2. Set up goal hierarchy
             logger.info("Decomposing goal into sub-tasks via LLM ...")
-            await self._goals.set_goal(goal_text)
+            await self._set_goal_or_authority_loss(goal_text)
             logger.info("Goal decomposition complete — %d sub-goals", self._goals.sub_goal_count)
 
             # 3. Main loop
             done = False
             while not done and self._turn < self._max_iterations:
+                if self._strategic_authority_lost:
+                    await self._wait_for_authorized_stop()
+                    break
                 self._turn += 1
                 try:
                     done = await self._step()
@@ -169,6 +184,14 @@ class Orchestrator:
 
                     # Backoff sleep after unexpected crashes
                     await asyncio.sleep(min(5 * self._consecutive_failures, 30))
+
+                self._suspend_strategy_if_session_invalid()
+                if self._strategic_authority_lost:
+                    # Losing controller authority pauses strategy; it is not
+                    # a reason to shut down the independent safety task.
+                    self._consecutive_failures = 0
+                    await self._wait_for_authorized_stop()
+                    break
 
                 if self._stop_requested or self._consecutive_failures >= self._max_failures:
                     if self._stop_requested:
@@ -190,8 +213,35 @@ class Orchestrator:
                 self._goals.is_complete,
             )
         finally:
-            await self._stop_safety_supervisor()
-            await self._disconnect()
+            await self._finish_shutdown()
+
+    async def _finish_shutdown(self) -> None:
+        """Complete every shutdown phase before propagating caller cancellation."""
+        shutdown_task = asyncio.create_task(self._shutdown_components())
+        await self._await_cleanup_task(shutdown_task)
+
+    @staticmethod
+    async def _await_cleanup_task(task: asyncio.Task[None]) -> None:
+        """Wait for cleanup despite repeated cancellation, then re-raise it."""
+        cancelled = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+        task.result()
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _shutdown_components(self) -> None:
+        """Stop background workers and always proceed to resource cleanup."""
+        try:
+            await self._stop_session_renewal()
+        finally:
+            try:
+                await self._stop_safety_supervisor()
+            finally:
+                await self._disconnect()
 
     # ── Core step ────────────────────────────────────────────────────
 
@@ -205,12 +255,19 @@ class Orchestrator:
         if world_adapter is None:
             raise RuntimeError("Orchestrator must connect before starting a step")
 
+        if self._suspend_strategy_if_session_invalid():
+            await self._defer_strategy()
+            return False
+
         # ── Check for in-game commands (N4) ──────────────────────
         if self._cmd_handler:
             with contextlib.suppress(Exception):
-                await self._cmd_handler.poll()
+                await self._cmd_handler.poll(allowed_commands=self._chat_command_allowlist)
         if self._stop_requested:
             return True
+        if self._suspend_strategy_if_session_invalid():
+            await self._defer_strategy()
+            return False
 
         # ── Follow-mode support (N4) ─────────────────────────────
         if self._follow_target:
@@ -315,6 +372,9 @@ class Orchestrator:
             response, safety_result = await self._decide_with_safety(messages)
             if safety_result is not None:
                 reflex_result = safety_result
+        if self._suspend_strategy_if_session_invalid():
+            await self._defer_strategy(reflex_result)
+            return False
 
         if self._verbose:
             logger.info(
@@ -328,6 +388,9 @@ class Orchestrator:
             and response.action == ActionType.WAIT.value
         ):
             completed_result, reflex_result = await self._wait_or_safety(response)
+            if self._suspend_strategy_if_session_invalid():
+                await self._defer_strategy(reflex_result)
+                return False
 
         # ── Act ───────────────────────────────────────────────────
         # A retry is evaluated on the following turn, but this block
@@ -371,8 +434,13 @@ class Orchestrator:
                     result.message,
                 )
 
-        # Track consecutive failures — count both action failures and exceptions
-        if result.success:
+        # Authorization loss pauses strategy instead of counting toward the
+        # fatal action-failure threshold. The safety supervisor stays active.
+        self._suspend_strategy_if_session_invalid()
+        if self._strategic_authority_lost:
+            self._clear_retry()
+            self._consecutive_failures = 0
+        elif result.success:
             self._consecutive_failures = 0
         else:
             self._consecutive_failures += 1
@@ -402,6 +470,239 @@ class Orchestrator:
 
         return self._turn >= self._max_iterations
 
+    def _authz_enabled(self) -> bool:
+        """Return whether Authz is enabled, including in lightweight test harnesses."""
+        config = getattr(self, "_config", None)
+        authz = getattr(config, "authz", None)
+        return bool(getattr(authz, "enabled", False))
+
+    def _suspend_strategy_if_session_invalid(self) -> bool:
+        """Fail closed into safety-only operation when Authz loses its session.
+
+        Returns True whenever strategy must not proceed right now. A definitive
+        invalid session latches ``_strategic_authority_lost``; a check that
+        could not complete without blocking (lock or SQLite busy) only skips
+        the current strategic work until the lease itself expires.
+        """
+        if self._strategic_authority_lost:
+            return True
+        if not self._config.authz.enabled:
+            return False
+
+        service = self._authz_service
+        session = self._authz_session
+        valid: bool | None
+        if service is None or session is None:
+            valid = False
+        else:
+            try:
+                valid = service.try_validate_session(session)
+            except sqlite3.Error:
+                logger.exception("Could not verify controller session; deferring strategy")
+                valid = None
+        if valid is True:
+            return False
+
+        if (
+            valid is None
+            and session is not None
+            and session.expires_at is not None
+            and datetime.now(UTC) < session.expires_at
+        ):
+            logger.warning(
+                "Controller authorization could not be verified without blocking; "
+                "deferring strategic work and retrying"
+            )
+            return True
+
+        self._strategic_authority_lost = True
+        self._strategic_authority_lost_event.set()
+        self._clear_retry()
+        if valid is None:
+            logger.error(
+                "Controller authorization could not be verified before the lease expired; "
+                "strategic actions are suspended while safety supervision remains active"
+            )
+        else:
+            logger.error(
+                "Controller authorization is no longer valid; strategic actions are suspended "
+                "while safety supervision remains active"
+            )
+        return True
+
+    async def _defer_strategy(self, reflex_result: ActionResult | None = None) -> None:
+        """Skip strategic work, keeping any consumed safety result in memory.
+
+        A reflex result has already been consumed from the supervisor, so it
+        is recorded here rather than dropped. If the session check merely
+        could not complete, back off before the next attempt.
+        """
+        if reflex_result is not None:
+            self._last_result = reflex_result
+            self._memory.record_action(
+                reflex_result.action.value,
+                {
+                    "success": reflex_result.success,
+                    "message": reflex_result.message,
+                    "data": reflex_result.data,
+                },
+            )
+        if not self._strategic_authority_lost:
+            await asyncio.sleep(max(self._config.bridge.cycle_delay, 0.05))
+
+    async def _set_goal_or_authority_loss(self, goal: str) -> None:
+        """Cancel strategic goal inference promptly if session authority is lost."""
+        if not self._config.authz.enabled:
+            await self._goals.set_goal(goal)
+            return
+        goal_task = asyncio.create_task(self._goals.set_goal(goal))
+        lost_task = asyncio.create_task(self._strategic_authority_lost_event.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {goal_task, lost_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if lost_task in done and self._strategic_authority_lost:
+                goal_task.cancel()
+                await asyncio.gather(goal_task, return_exceptions=True)
+                return
+            await goal_task
+        finally:
+            if not goal_task.done():
+                goal_task.cancel()
+            lost_task.cancel()
+            await asyncio.gather(goal_task, lost_task, return_exceptions=True)
+
+    def _start_session_renewal(self) -> None:
+        """Renew the built-in controller lease while its persisted authority is valid."""
+        if (
+            not self._config.authz.enabled
+            or self._authz_service is None
+            or self._authz_session is None
+            or self._session_renewal_task is not None
+        ):
+            return
+        self._session_renewal_stop_event = asyncio.Event()
+        self._session_renewal_task = asyncio.create_task(
+            self._session_renewal_loop(), name="minecraft-ai-bridge-session-renewal"
+        )
+
+    async def _session_renewal_loop(self) -> None:
+        service = self._authz_service
+        stop_event = self._session_renewal_stop_event
+        if service is None or stop_event is None:
+            return
+        lease_seconds = self._config.authz.session_lease_seconds
+        # Renew at a third of the lease so two further attempts fit before
+        # expiry; retry storage errors sooner than a full interval.
+        renew_interval = lease_seconds / 3
+        retry_interval = min(renew_interval, 5.0)
+        interval = renew_interval
+        while not stop_event.is_set() and not self._strategic_authority_lost:
+            session = self._authz_session
+            if session is None or session.expires_at is None:
+                self._mark_strategic_authority_lost(
+                    "controller session is unavailable or unbounded"
+                )
+                return
+            remaining = (session.expires_at - datetime.now(UTC)).total_seconds()
+            if remaining <= 0:
+                self._mark_strategic_authority_lost(
+                    "controller session expired before it could be renewed"
+                )
+                return
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=min(interval, remaining))
+                return
+            except TimeoutError:
+                pass
+
+            if datetime.now(UTC) >= session.expires_at:
+                self._mark_strategic_authority_lost(
+                    "controller session expired before it could be renewed"
+                )
+                return
+            try:
+                self._authz_session = service.renew_session(session, lease_seconds=lease_seconds)
+                interval = renew_interval
+            except PermissionError as exc:
+                self._mark_strategic_authority_lost(
+                    f"controller session could not be renewed: {exc}"
+                )
+                return
+            except ValueError as exc:
+                self._mark_strategic_authority_lost(str(exc))
+                return
+            except sqlite3.Error:
+                logger.exception("Controller session renewal failed; will retry before expiry")
+                interval = retry_interval
+
+    def _mark_strategic_authority_lost(self, reason: str) -> None:
+        self._strategic_authority_lost = True
+        self._strategic_authority_lost_event.set()
+        self._clear_retry()
+        logger.error("Controller session renewal stopped: %s; strategy suspended", reason)
+
+    async def _stop_session_renewal(self) -> None:
+        if self._session_renewal_stop_event is not None:
+            self._session_renewal_stop_event.set()
+        if self._session_renewal_task is not None:
+            await asyncio.gather(self._session_renewal_task, return_exceptions=True)
+        self._session_renewal_task = None
+        self._session_renewal_stop_event = None
+
+    def _chat_command_allowlist(self) -> frozenset[str] | None:
+        """Recheck authority before dispatching each event in a chat poll."""
+        if self._suspend_strategy_if_session_invalid():
+            return _AUTH_LOST_CHAT_COMMANDS
+        return None
+
+    def _chat_stop_available(self) -> bool:
+        """Return whether an in-game ``!stop`` could ever be authorized."""
+        chat_control = self._config.chat_control
+        return (
+            self._cmd_handler is not None
+            and chat_control.server_online_mode
+            and bool(chat_control.allowed_uuids or chat_control.allowed_names)
+        )
+
+    async def _wait_for_authorized_stop(self) -> None:
+        """Keep safety supervision alive after auth loss for a bounded grace period.
+
+        An authorized ``!stop`` ends the wait early. Lost authority is never
+        restored in-process, so the wait always ends at the grace deadline and
+        the caller shuts down instead of idling indefinitely.
+        """
+        pause = max(self._config.bridge.cycle_delay, 0.05)
+        grace = self._config.authz.suspended_shutdown_seconds
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + grace
+        if not self._chat_stop_available():
+            logger.warning(
+                "No authorized in-game !stop is possible; safety supervision continues for "
+                "%.0fs before shutdown",
+                grace,
+            )
+        poll_failing = False
+        while not self._stop_requested:
+            if self._cmd_handler is not None:
+                try:
+                    await self._cmd_handler.poll(allowed_commands=_AUTH_LOST_CHAT_COMMANDS)
+                    poll_failing = False
+                except Exception:
+                    # Log once per failure streak; this loop polls every cycle.
+                    if not poll_failing:
+                        logger.exception("Chat command poll failed while strategy is suspended")
+                    poll_failing = True
+            if self._stop_requested:
+                return
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                logger.error(
+                    "Controller authority was not restored within %.0fs; shutting down", grace
+                )
+                return
+            await asyncio.sleep(min(pause, remaining))
+
     # ── Sub-routines ────────────────────────────────────────────────
 
     async def _observe(self) -> WorldState:
@@ -410,6 +711,15 @@ class Orchestrator:
         state = await self._observer.observe()
         self._memory.record_observation(state)
         return state
+
+    async def _observe_for_safety(self) -> WorldState:
+        """Gather world state for safety polling without writing to memory.
+
+        The supervisor polls every 0.25s; recording each changing observation
+        would evict the action history the LLM sees from short-term memory.
+        """
+        assert self._observer is not None
+        return await self._observer.observe()
 
     async def _decide_with_safety(
         self, messages: list[Message]
@@ -425,17 +735,32 @@ class Orchestrator:
             self._llm.decide(system_prompt=SYSTEM_PROMPT, messages=messages)
         )
         intervention_task = asyncio.create_task(supervisor.wait_for_intervention())
+        authority_task = (
+            asyncio.create_task(self._strategic_authority_lost_event.wait())
+            if self._authz_enabled()
+            else None
+        )
         try:
+            waiters: set[asyncio.Task[Any]] = {decision_task, intervention_task}
+            if authority_task is not None:
+                waiters.add(authority_task)
             done, _ = await asyncio.wait(
-                {decision_task, intervention_task},
+                waiters,
                 return_when=asyncio.FIRST_COMPLETED,
             )
+            # A finished intervention has already been consumed from the
+            # supervisor, so it wins over a simultaneous authority loss.
             if intervention_task in done:
                 intervention = intervention_task.result()
                 decision_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await decision_task
                 return LLMResponse(action="wait"), intervention
+            if authority_task is not None and authority_task in done:
+                decision_task.cancel()
+                intervention_task.cancel()
+                await asyncio.gather(decision_task, intervention_task, return_exceptions=True)
+                return LLMResponse(action="wait"), self._completed_intervention(intervention_task)
 
             response = decision_task.result()
             intervention_task.cancel()
@@ -449,8 +774,23 @@ class Orchestrator:
         except BaseException:
             decision_task.cancel()
             intervention_task.cancel()
-            await asyncio.gather(decision_task, intervention_task, return_exceptions=True)
+            tasks: list[asyncio.Task[Any]] = [decision_task, intervention_task]
+            if authority_task is not None:
+                authority_task.cancel()
+                tasks.append(authority_task)
+            await asyncio.gather(*tasks, return_exceptions=True)
             raise
+        finally:
+            if authority_task is not None:
+                authority_task.cancel()
+                await asyncio.gather(authority_task, return_exceptions=True)
+
+    @staticmethod
+    def _completed_intervention(task: asyncio.Task[ActionResult]) -> ActionResult | None:
+        """Return an intervention consumed while its waiter was being cancelled."""
+        if task.done() and not task.cancelled() and task.exception() is None:
+            return task.result()
+        return None
 
     async def _wait_or_safety(
         self, response: LLMResponse
@@ -464,9 +804,17 @@ class Orchestrator:
 
         wait_task = asyncio.create_task(self._act(response))
         intervention_task = asyncio.create_task(supervisor.wait_for_intervention())
+        authority_task = (
+            asyncio.create_task(self._strategic_authority_lost_event.wait())
+            if self._authz_enabled()
+            else None
+        )
         try:
+            waiters: set[asyncio.Task[Any]] = {wait_task, intervention_task}
+            if authority_task is not None:
+                waiters.add(authority_task)
             done, _ = await asyncio.wait(
-                {wait_task, intervention_task},
+                waiters,
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if intervention_task in done:
@@ -474,6 +822,11 @@ class Orchestrator:
                 wait_task.cancel()
                 await asyncio.gather(wait_task, return_exceptions=True)
                 return None, intervention
+            if authority_task is not None and authority_task in done:
+                wait_task.cancel()
+                intervention_task.cancel()
+                await asyncio.gather(wait_task, intervention_task, return_exceptions=True)
+                return None, self._completed_intervention(intervention_task)
 
             result = wait_task.result()
             intervention_task.cancel()
@@ -485,8 +838,16 @@ class Orchestrator:
         except BaseException:
             wait_task.cancel()
             intervention_task.cancel()
-            await asyncio.gather(wait_task, intervention_task, return_exceptions=True)
+            tasks: list[asyncio.Task[Any]] = [wait_task, intervention_task]
+            if authority_task is not None:
+                authority_task.cancel()
+                tasks.append(authority_task)
+            await asyncio.gather(*tasks, return_exceptions=True)
             raise
+        finally:
+            if authority_task is not None:
+                authority_task.cancel()
+                await asyncio.gather(authority_task, return_exceptions=True)
 
     def _start_safety_supervisor(self) -> None:
         """Start periodic preservation checks after runtime wiring is ready."""
@@ -495,7 +856,7 @@ class Orchestrator:
         if self._action_service is not None:
             self._action_service.enable_safety_preemption()
         self._safety_supervisor = SafetySupervisor(
-            self._observe,
+            self._observe_for_safety,
             self._preservation.evaluate,
             on_intervention_consumed=(
                 self._action_service.acknowledge_safety_intervention
@@ -670,7 +1031,14 @@ class Orchestrator:
                 lease_expires_at=datetime.now(UTC)
                 + timedelta(seconds=authz_config.session_lease_seconds),
             )
-            authz_policy = self._authz_service.action_policy(self._authz_session)
+            # Startup provisioning can span multiple retries. Keep the finite
+            # controller lease alive from the moment it is acquired.
+            self._start_session_renewal()
+            world_admin_token = authz_config.world_admin_token.get_secret_value().strip() or None
+            authz_policy = self._authz_service.action_policy(
+                lambda: self._authz_session,
+                admin_token=world_admin_token,
+            )
             policy = self._combine_action_policies(authz_policy, self._action_policy)
         self._runtime_action_policy = policy
         self._action_service = ActionService(
@@ -768,16 +1136,32 @@ class Orchestrator:
 
     async def _disconnect(self) -> None:
         """Clean up the MCPQ connection, memory database, and other resources."""
+        cleanup_task = asyncio.create_task(self._disconnect_impl())
+        await self._await_cleanup_task(cleanup_task)
+
+    async def _disconnect_impl(self) -> None:
+        """Perform shutdown work; _disconnect owns cancellation shielding."""
+        await self._stop_session_renewal()
         try:
             if self._authz_service is not None:
-                try:
-                    if self._authz_session is not None:
-                        with contextlib.suppress(PermissionError):
-                            self._authz_service.release_session(self._authz_session)
-                finally:
+                service = self._authz_service
+                session = self._authz_session
+
+                def release_and_close_authz() -> None:
                     try:
-                        self._authz_service.close()
+                        if session is not None:
+                            with contextlib.suppress(PermissionError):
+                                service.release_session(session)
                     finally:
+                        service.close()
+
+                cleanup_task = asyncio.create_task(asyncio.to_thread(release_and_close_authz))
+                try:
+                    await self._await_cleanup_task(cleanup_task)
+                finally:
+                    # References are cleared only after the worker has stopped,
+                    # so cancellation cannot orphan a live SQLite cleanup thread.
+                    if cleanup_task.done():
                         self._authz_service = None
                         self._authz_session = None
         finally:
@@ -813,6 +1197,7 @@ class Orchestrator:
 
         async def combined(request):
             authorization_decision = None
+            caller_decision = None
             for index, policy in enumerate((authz_policy, additional_policy)):
                 if policy is None:
                     continue
@@ -824,6 +1209,7 @@ class Orchestrator:
                 if index == 0:
                     authorization_decision = decision
                 if index == 1:
+                    caller_decision = decision
                     # A caller policy may await while the session is revoked,
                     # expires, or is fenced by ownership transfer. Revalidate
                     # at the dispatch boundary after that await completes.
@@ -836,7 +1222,9 @@ class Orchestrator:
             return PolicyDecision(
                 allowed=True,
                 allow_privileged=bool(
-                    authorization_decision and authorization_decision.allow_privileged
+                    authorization_decision
+                    and authorization_decision.allow_privileged
+                    and (caller_decision is None or caller_decision.allow_privileged)
                 ),
                 identity_scope=(
                     authorization_decision.identity_scope if authorization_decision else None

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -63,6 +64,7 @@ class TestCommandParsing:
         )
         assert configured.allowed_uuids == ["00000000-0000-0000-0000-000000000001"]
         assert configured.allowed_names == ["Authorized_1"]
+        assert configured.server_online_mode is False
         with pytest.raises(ValueError, match="valid UUIDs"):
             ChatControlConfig(allowed_uuids=["not-a-uuid"])
         with pytest.raises(ValueError, match="Minecraft usernames"):
@@ -83,7 +85,11 @@ class TestHarness:
         self._turn = 0
         self._internal_action_authority = object()
         self._config = SimpleNamespace(
-            chat_control=SimpleNamespace(allowed_uuids=[], allowed_names=["Player"])
+            chat_control=SimpleNamespace(
+                allowed_uuids=[],
+                allowed_names=["Player"],
+                server_online_mode=True,
+            )
         )
 
 
@@ -111,9 +117,109 @@ class TestCommandDispatch:
         await handler.poll()
         assert not harness._stop_requested
 
+    async def test_restricted_poll_ignores_goal_and_still_processes_stop(self, harness):
+        goal_started = False
+
+        async def set_goal(_goal):
+            nonlocal goal_started
+            goal_started = True
+            await asyncio.Future()
+
+        harness._goals = SimpleNamespace(set_goal=set_goal, current_goal="goal")
+        handler = ChatCommandHandler(harness)
+        trusted_player = SimpleNamespace(name="Player")
+        harness._mc.set_chat_events(
+            [
+                SimpleNamespace(player=trusted_player, message="!goal replace goal"),
+                SimpleNamespace(player=trusted_player, message="!stop"),
+            ]
+        )
+
+        await handler.poll(allowed_commands={"!stop"})
+
+        assert harness._stop_requested
+        assert not goal_started
+
+    async def test_goal_command_revalidates_authority_after_decomposition(self, harness):
+        revalidated = False
+        memory_cleared = False
+
+        async def completed_goal(_goal):
+            return None
+
+        def lose_authority():
+            nonlocal revalidated
+            revalidated = True
+            harness._strategic_authority_lost = True
+            return True
+
+        def clear_memory():
+            nonlocal memory_cleared
+            memory_cleared = True
+
+        harness._goals = SimpleNamespace(
+            set_goal=completed_goal, current_goal="old", sub_goal_count=1
+        )
+        harness._strategic_authority_lost = False
+        harness._set_goal_or_authority_loss = completed_goal
+        harness._suspend_strategy_if_session_invalid = lose_authority
+        harness._memory.clear_short_term = clear_memory
+        handler = ChatCommandHandler(harness)
+
+        await handler.handle_command(
+            "!goal",
+            "new goal",
+            "Player",
+            trusted_player=SimpleNamespace(name="Player"),
+        )
+
+        assert revalidated
+        assert not memory_cleared
+        assert not any("Goal re-assigned" in message for message in harness._mc.chat_messages_sent)
+
+    async def test_poll_rechecks_dynamic_allowlist_after_chat_retrieval(self, harness):
+        authority_valid = True
+        goal_started = False
+
+        async def set_goal(_goal):
+            nonlocal goal_started
+            goal_started = True
+
+        async def retrieve_then_expire():
+            nonlocal authority_valid
+            authority_valid = False
+            trusted_player = SimpleNamespace(name="Player")
+            return [
+                SimpleNamespace(player=trusted_player, message="!goal replace goal"),
+                SimpleNamespace(player=trusted_player, message="!stop"),
+            ]
+
+        harness._goals = SimpleNamespace(set_goal=set_goal, current_goal="goal")
+        harness._mc.get_chat_events = retrieve_then_expire
+        handler = ChatCommandHandler(harness)
+
+        await handler.poll(
+            allowed_commands=lambda: {"!goal", "!stop"} if authority_valid else {"!stop"}
+        )
+
+        assert not goal_started
+        assert harness._stop_requested
+
+    async def test_offline_mode_denies_allowlisted_name(self, harness):
+        harness._config.chat_control.server_online_mode = False
+        handler = ChatCommandHandler(harness)
+        harness._mc.set_chat_events(
+            [SimpleNamespace(player=SimpleNamespace(name="Player"), message="!stop")]
+        )
+
+        await handler.poll()
+
+        assert not harness._stop_requested
+
     async def test_unlisted_uuid_cannot_fall_back_to_an_allowlisted_name(self, harness):
         harness._config.chat_control.allowed_uuids = ["trusted-uuid"]
         harness._config.chat_control.allowed_names = ["Player"]
+        harness._config.chat_control.server_online_mode = True
         handler = ChatCommandHandler(harness)
         harness._mc.set_chat_events(
             [

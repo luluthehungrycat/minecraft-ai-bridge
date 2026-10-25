@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import secrets
 import sqlite3
 import threading
-from contextlib import suppress
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import uuid4
@@ -272,6 +274,30 @@ class AuthzService:
                     self.outer._lock.release()
 
         return Transaction(self)
+
+    @contextmanager
+    def _try_tx(self) -> Iterator[sqlite3.Connection]:
+        """Begin a write transaction without waiting on local or SQLite locks."""
+        if not self._lock.acquire(blocking=False):
+            raise sqlite3.OperationalError("authorization service is busy")
+        previous_timeout: int | None = None
+        try:
+            previous_timeout = int(self._db.execute("PRAGMA busy_timeout").fetchone()[0])
+            self._db.execute("PRAGMA busy_timeout=0")
+            self._begin_write()
+            try:
+                yield self._db
+                self._commit()
+            except BaseException:
+                if self._db.in_transaction:
+                    with suppress(sqlite3.Error):
+                        self._db.execute("ROLLBACK")
+                raise
+        finally:
+            if previous_timeout is not None:
+                with suppress(sqlite3.Error):
+                    self._db.execute(f"PRAGMA busy_timeout={previous_timeout}")
+            self._lock.release()
 
     def _begin_write(self) -> None:
         """Start a serialized immediate write transaction on the connection."""
@@ -1050,6 +1076,110 @@ class AuthzService:
                 if owns_transaction and self._db.in_transaction:
                     self._db.execute("ROLLBACK")
 
+    def try_validate_session(
+        self,
+        session: ControllerSession,
+        *,
+        required_admin_scope: str | None = None,
+        admin_token: str | None = None,
+    ) -> bool | None:
+        """Validate without waiting for another local Authz operation.
+
+        ``None`` means the service lock is busy. Callers on an asyncio event
+        loop can treat that as an authorization failure instead of blocking
+        unrelated safety and shutdown tasks.
+        """
+        if not self._lock.acquire(blocking=False):
+            return None
+        previous_timeout: int | None = None
+        try:
+            previous_timeout = int(self._db.execute("PRAGMA busy_timeout").fetchone()[0])
+            self._db.execute("PRAGMA busy_timeout=0")
+            try:
+                return self.validate_session(
+                    session,
+                    required_admin_scope=required_admin_scope,
+                    admin_token=admin_token,
+                )
+            except sqlite3.Error:
+                return None
+        finally:
+            if previous_timeout is not None:
+                with suppress(sqlite3.Error):
+                    self._db.execute(f"PRAGMA busy_timeout={previous_timeout}")
+            self._lock.release()
+
+    def renew_session(
+        self,
+        session: ControllerSession,
+        *,
+        lease_seconds: float,
+    ) -> ControllerSession:
+        """Extend a still-valid finite session without changing its fencing ID.
+
+        Renewal is serialized with revocation and ownership changes. Expired,
+        revoked, transferred, or otherwise stale sessions cannot be revived.
+        Leased Steve ownership caps the renewed session expiry.
+        """
+        if (
+            isinstance(lease_seconds, bool)
+            or not isinstance(lease_seconds, (int, float))
+            or not math.isfinite(lease_seconds)
+            or lease_seconds <= 0
+        ):
+            raise ValueError("controller session renewal lease must be finite and positive")
+
+        with self._try_tx() as db:
+            if not self.validate_session(session):
+                raise PermissionError("controller session is no longer valid")
+            if session.expires_at is None:
+                raise ValueError("only finite controller sessions can be renewed")
+            now = datetime.now(UTC)
+            if session.expires_at <= now:
+                raise PermissionError("controller session expired before renewal")
+
+            row = db.execute(
+                "SELECT mode,expires,session_expires FROM steves WHERE id=?",
+                (session.steve_id,),
+            ).fetchone()
+            if row is None:
+                raise PermissionError("controller Steve is unavailable")
+
+            renewed_expiry = now + timedelta(seconds=lease_seconds)
+            if row["mode"] == "leased" and row["expires"] is not None:
+                ownership_expiry = datetime.fromisoformat(row["expires"])
+                renewed_expiry = min(renewed_expiry, ownership_expiry)
+            if renewed_expiry <= session.expires_at:
+                # The current lease may already reach the ownership deadline.
+                # Preserve it as a valid no-op; the heartbeat will continue
+                # checking until its actual expiry instead of suspending early.
+                return session
+
+            stored_expiry = _dt(renewed_expiry)
+            updated = db.execute(
+                "UPDATE steves SET session_expires=? WHERE id=? AND session=? "
+                "AND session_credential=? AND generation=? AND session_expires=?",
+                (
+                    stored_expiry,
+                    session.steve_id,
+                    session.session_id,
+                    session.credential_id,
+                    session.generation,
+                    row["session_expires"],
+                ),
+            )
+            if updated.rowcount != 1:
+                raise PermissionError("controller session changed during renewal")
+
+            return ControllerSession(
+                session.session_id,
+                session.steve_id,
+                session.credential_id,
+                session.owner_id,
+                session.generation,
+                renewed_expiry,
+            )
+
     def release_session(self, session: ControllerSession) -> None:
         with self._tx() as db:
             if not self.validate_session(session):
@@ -1094,31 +1224,49 @@ class AuthzService:
                 (new_owner_id, ownership_mode, expiry, steve_id),
             )
 
-    def action_policy(self, session: ControllerSession, *, admin_token: str | None = None):
-        from .action_service import ActionClass, PolicyDecision, classify_action
+    def action_policy(
+        self,
+        session: ControllerSession | Callable[[], ControllerSession | None],
+        *,
+        admin_token: str | None = None,
+    ):
+        from .action_service import (
+            _PRIVILEGED_AUTHORIZATION_CLASSES,
+            PolicyDecision,
+            classify_action,
+        )
 
         def policy(request: ActionRequest) -> PolicyDecision:
-            privileged = classify_action(request.action) is ActionClass.PRIVILEGED_SIMULATED
-            authorized = self.validate_session(
-                session,
-                required_admin_scope="admin:world" if privileged else None,
-                admin_token=admin_token,
+            active_session = session() if callable(session) else session
+            privileged = classify_action(request.action) in _PRIVILEGED_AUTHORIZATION_CLASSES
+            authorized = bool(
+                active_session
+                and self.try_validate_session(
+                    active_session,
+                    required_admin_scope="admin:world" if privileged else None,
+                    admin_token=admin_token,
+                )
+                is True
             )
             return PolicyDecision(
                 authorized,
                 (
-                    "admin:world required for privileged simulated backend action"
+                    "admin:world required for privileged backend action"
                     if privileged and not authorized
                     else "controller session invalid or fenced"
                 ),
                 allow_privileged=authorized if privileged else False,
                 identity_scope=(
-                    "controller",
-                    session.steve_id,
-                    session.owner_id,
-                    session.credential_id,
-                    session.session_id,
-                    str(session.generation),
+                    (
+                        "controller",
+                        active_session.steve_id,
+                        active_session.owner_id,
+                        active_session.credential_id,
+                        active_session.session_id,
+                        str(active_session.generation),
+                    )
+                    if active_session is not None
+                    else ("controller", "invalid")
                 ),
             )
 

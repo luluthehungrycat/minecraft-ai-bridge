@@ -202,14 +202,16 @@ async def test_httpx_pinned_transport_performs_tls_to_pinned_ip_with_original_id
             )
             return await super().handle_async_request(local_request)
 
-    transport = webhook_runtime.HttpxPinnedTransport(
-        transport_factory=lambda: LocalPortTransport(
-            verify=client_context,
-            trust_env=False,
-            http2=False,
-            retries=0,
-        )
-    )
+    default_transport_options = []
+
+    def build_test_transport(**options):
+        default_transport_options.append(options)
+        return LocalPortTransport(verify=client_context, **options)
+
+    # Exercise HttpxPinnedTransport's production default-factory branch while
+    # substituting only the local test CA and test-server port mapping.
+    monkeypatch.setattr(httpx, "AsyncHTTPTransport", build_test_transport)
+    transport = webhook_runtime.HttpxPinnedTransport()
 
     try:
         request_args = {
@@ -225,6 +227,13 @@ async def test_httpx_pinned_transport_performs_tls_to_pinned_ip_with_original_id
         else:
             with pytest.raises(httpx.HTTPError):
                 await transport.send_webhook_pinned(**request_args)
+        assert len(default_transport_options) == 1
+        options = default_transport_options[0]
+        assert options["trust_env"] is False
+        assert options["http2"] is False
+        assert options["retries"] == 0
+        assert options["limits"].max_connections == 1
+        assert options["limits"].max_keepalive_connections == 0
         assert observed_sni == ["hooks.example.test"]
         if hostname_matches:
             assert len(observed_requests) == 1

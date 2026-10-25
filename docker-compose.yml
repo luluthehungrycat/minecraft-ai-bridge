@@ -17,7 +17,7 @@ services:
       RCON_PASSWORD: "changeme"
       RCON_PORT: 25575
       # Server properties
-      ONLINE_MODE: "false"
+      ONLINE_MODE: "${ONLINE_MODE:-false}"
       DIFFICULTY: "easy"
       MOTD: "Minecraft AI Bridge — MCPQ"
       MAX_PLAYERS: 10
@@ -68,6 +68,8 @@ services:
       AGENT_MEMORY_DB: /app/data/agent_memory.db
       # Durable safety intervention event journal
       BRIDGE_EVENT_JOURNAL_PATH: /app/data/safety-events.sqlite3
+      # Must match the Paper ONLINE_MODE setting; offline-mode names are forgeable.
+      CHAT_CONTROL_SERVER_ONLINE_MODE: "${ONLINE_MODE:-false}"
     # Array form keeps the goal as a single argument (no shell splitting)
     command: ["--verbose", "${GOAL:-Explore the area and report what you see}"]
     # The bridge has built-in retry logic (20 attempts with backoff),
