@@ -6,6 +6,7 @@ think-act-observe loop without needing a real Minecraft server.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 
@@ -14,6 +15,35 @@ import pytest
 from minecraft_ai_bridge.bridge.orchestrator import Orchestrator
 from minecraft_ai_bridge.config import AppConfig
 from minecraft_ai_bridge.llm.models import Role
+
+
+def _llm_api_errors(records: list[logging.LogRecord]) -> list[str]:
+    """Return LLM transport/API failures that the clients turned into WAITs."""
+    import openai
+
+    return [
+        record.getMessage()
+        for record in records
+        if record.name == "minecraft_ai_bridge.llm.client"
+        and any(isinstance(arg, openai.APIError) for arg in (record.args or ()))
+    ]
+
+
+@pytest.fixture(autouse=True)
+def fail_on_llm_api_errors(caplog: pytest.LogCaptureFixture):
+    """Fail instead of passing on fallback WAITs when the provider rejects calls.
+
+    The LLM clients log API errors and return a WAIT so the agent keeps
+    running. That is right in production but lets a dead key or exhausted
+    budget pass these tests. Malformed model output is not treated as an
+    error here; fallback decomposition covers it.
+    """
+    caplog.set_level(logging.WARNING, logger="minecraft_ai_bridge.llm.client")
+    yield
+    # caplog.records only holds the current (teardown) phase at this point.
+    errors = _llm_api_errors(caplog.get_records("setup") + caplog.get_records("call"))
+    if errors:
+        pytest.fail(f"LLM API call failed {len(errors)} time(s); first: {errors[0]}")
 
 
 async def _no_sleep(x: float) -> None:
