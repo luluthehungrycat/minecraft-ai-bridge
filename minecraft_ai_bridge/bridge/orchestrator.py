@@ -131,6 +131,11 @@ class Orchestrator:
 
     # ── Public API ───────────────────────────────────────────────────
 
+    @property
+    def strategic_authority_lost(self) -> bool:
+        """Whether strategy was suspended because controller authority was lost."""
+        return self._strategic_authority_lost
+
     async def run(self, goal: str | None = None) -> None:
         """Run the full agent loop until the goal is complete or
         ``max_iterations`` is reached."""

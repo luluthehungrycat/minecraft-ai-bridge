@@ -120,6 +120,8 @@ All configuration is driven by environment variables. The full list:
 |------|---------|
 | `0` | Goal completed successfully |
 | `1` | Fatal error during execution |
+| `2` | Invalid command-line arguments |
+| `3` | Shut down after losing controller authority (Authz session expired, revoked, or fenced), after an authorized `!stop` or the `authz.suspended_shutdown_seconds` grace period |
 | `130` | Interrupted by user (Ctrl+C) |
 
 ## Docker CLI

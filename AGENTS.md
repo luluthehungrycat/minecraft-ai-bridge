@@ -110,7 +110,7 @@ examples and the conventions block at the top.
 - **config.yaml volume mount**: Mounted read-only at `/app/config.yaml`. Changes require `docker compose restart bridge`.
 
 ### Code Quality
-- **Tests**: 573 tests collected in total — 561 deterministic unit tests plus 12 integration tests. Unit tests use `MockMcpqClient` for deterministic MCPQ simulation. Integration tests use a real MCPQ server + real LLM (OpenRouter `openai/gpt-oss-20b`, or Requesty `runware/gpt-oss-120b` when only `REQUESTY_API_KEY` is set; override with `INTEGRATION_LLM_MODEL`) for end-to-end validation. The stack uses pinned Paper 26.2 build 123. Run with `pytest tests/`.
+- **Tests**: 575 tests collected in total — 563 deterministic unit tests plus 12 integration tests. Unit tests use `MockMcpqClient` for deterministic MCPQ simulation. Integration tests use a real MCPQ server + real LLM (OpenRouter `openai/gpt-oss-20b`, or Requesty `runware/gpt-oss-120b` when only `REQUESTY_API_KEY` is set; override with `INTEGRATION_LLM_MODEL`) for end-to-end validation. The stack uses pinned Paper 26.2 build 123. Run with `pytest tests/`.
 - **Mypy**: The CI job is wired but skipped by default; enable it with the `MYPY_ENABLED` repository variable after SDK typing issues are resolved.
 - **gRPC stubs are synchronous**: MCPQ generated stubs block; dispatched via `asyncio.to_thread`. Not ideal but works.
 - **RCON client is unmaintained**: Since the MCPQ migration, `rcon.py` isn't tested. Consider removing or marking deprecated.
@@ -136,7 +136,7 @@ Some LLMs (especially smaller/local ones) can't reliably output structured JSON 
 
 ### P0: None (Testing Complete)
 The 0.5.0 release completed the testing milestone:
-- **Unit tests** (561): MockMcpqClient covers all 36 actions, observer parsing, memory, goal fallback plans, config, inventory manager, chat commands, pathfinding, the runtime action gate, the safety supervisor, the event journal, webhook delivery, and the local authorization service
+- **Unit tests** (563): MockMcpqClient covers all 36 actions, observer parsing, memory, goal fallback plans, config, inventory manager, chat commands, pathfinding, the runtime action gate, the safety supervisor, the event journal, webhook delivery, and the local authorization service
 - **Integration tests** (12): Full think-act-observe loop with real MCPQ server + real LLM inference (OpenRouter `openai/gpt-oss-20b`). Covers teleport, exploration, disconnect handling, fallback decomposition, failure counting, memory recording, chat command stop, and inventory creation.
 - **Goal-verification assertions**: Integration tests verify agent behavior via:
   - `action_taken(orch, *names) → bool` — checks if the agent performed a specific action (parses `MemoryEntry.raw`)
@@ -206,7 +206,7 @@ The 0.5.0 release completed the testing milestone:
 | `docker-compose.yml` | Paper server + bridge services |
 | `docs/*.md` | Full documentation set |
 | `tests/conftest.py` | MockMcpqClient, MockLLMClient, test fixtures |
-| `tests/test_*.py` | Unit + integration tests (573 total: 561 unit + 12 integration) |
+| `tests/test_*.py` | Unit + integration tests (575 total: 563 unit + 12 integration) |
 | `AGENTS.md` | This file |
 
 ## Environment Info
@@ -253,6 +253,7 @@ Helpers in `tests/test_integration.py`:
 | `tests/test_pathfinding.py` | 10 | A* pathfinding |
 | `tests/test_orchestrator.py` | 6 | Orchestrator loop and wiring |
 | `tests/test_llm_client.py` | 2 | LLM provider factory wiring |
+| `tests/test_main.py` | 2 | CLI exit codes |
 | `tests/test_authz_orchestrator.py` | 27 | Optional built-in Orchestrator Authz configuration, session gating, revocation, and cleanup |
 | `tests/test_authz_service.py` | 93 | Local credentials, scopes, ownership, sessions, fencing, peer-grant audit migration |
 | `tests/test_event_journal.py` | 8 | Durable event journal |

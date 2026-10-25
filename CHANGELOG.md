@@ -70,6 +70,9 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
 - Shutdown now completes renewal and safety-worker stops and Authz release/close
   before propagating repeated cancellation; blocking SQLite cleanup runs off the
   asyncio event loop.
+- The CLI exits with code 3 when it shut down after losing controller
+  authority, instead of 0, so supervisors and scripts can tell it apart
+  from a normal finish.
 - Safety-only operation after losing controller authority is now bounded by
   `authz.suspended_shutdown_seconds` (default 300). Previously the bridge
   idled forever when no authorized `!stop` was possible, e.g. on offline-mode
