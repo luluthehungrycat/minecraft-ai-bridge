@@ -105,8 +105,11 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
 
 ### Added
 
-- Documented running the Paper server and building the bot plugin with
-  rootless Podman in `docs/SETUP.md`.
+- Added `compose.podman.yml`, a rootless Podman override for the Paper
+  server, and documented building the bot plugin in a Java 25 container in
+  `docs/SETUP.md`.
+- Added `MC_BIND_ADDRESS` to `docker-compose.yml` to choose the host address
+  for published ports (default `0.0.0.0`, unchanged).
 
 - Separated built-in survival reflexes from strategic controller sessions with
   an in-process safety capability restricted to bounded mob attacks and

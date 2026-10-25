@@ -1,0 +1,24 @@
+# Rootless Podman override for docker-compose.yml.
+#
+#   MC_BIND_ADDRESS=127.0.0.1 \
+#     podman-compose -f docker-compose.yml -f compose.podman.yml up -d minecraft
+#
+# - Runs the server as container root. The image otherwise drops to UID 1000,
+#   which cannot write the /data/plugins directory created by the MCPQ config
+#   bind mount. Under rootless Podman, container root is your own host user.
+# - Relabels bind mounts for SELinux hosts (:Z).
+#
+# Port bindings cannot be replaced from an override (podman-compose appends
+# list entries), so set MC_BIND_ADDRESS instead, e.g. in .env.
+services:
+  minecraft:
+    environment:
+      UID: "0"
+      GID: "0"
+    volumes:
+      - ./mcpq-plugins:/plugins:Z
+      - ./mcpq-config/config.yml:/data/plugins/mcpq/config.yml:Z
+
+  bridge:
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro,Z

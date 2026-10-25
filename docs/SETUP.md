@@ -107,13 +107,23 @@ from Docker:
   cp bot-plugin/build/libs/mc-bot-plugin-1.0.0.jar mcpq-plugins/
   ```
 
-- Set `UID=0` and `GID=0` on the server container. The image otherwise drops
-  to UID 1000, which cannot write the `/data/plugins` directory created by
-  the MCPQ config bind mount. Under rootless Podman, container root maps to
-  your own host user. Add `:Z` to bind mounts on SELinux hosts.
+- Start the server with the `compose.podman.yml` override:
 
-The compose file publishes ports on all interfaces, including RCON with the
-example password; bind them to `127.0.0.1` for local testing.
+  ```bash
+  MC_BIND_ADDRESS=127.0.0.1 \
+    podman-compose -f docker-compose.yml -f compose.podman.yml up -d minecraft
+  ```
+
+  The override runs the server as container root (`UID=0`/`GID=0`); the image
+  otherwise drops to UID 1000, which cannot write the `/data/plugins`
+  directory created by the MCPQ config bind mount. Under rootless Podman,
+  container root maps to your own host user. It also adds `:Z` to bind
+  mounts for SELinux hosts.
+
+`MC_BIND_ADDRESS` (default `0.0.0.0`) sets the host address for all
+published ports, with Docker or Podman. Set it to `127.0.0.1` for local
+testing: RCON uses the example password. Overrides cannot replace port
+bindings, so it is a variable rather than part of `compose.podman.yml`.
 
 ## Method 2: Local Installation
 
