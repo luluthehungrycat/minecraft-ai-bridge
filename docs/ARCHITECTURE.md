@@ -265,6 +265,17 @@ requests into its calls. It composes the pieces above:
   unreachable until added; internal-control and lifecycle actions never are.
   Request-ID replay protection is process-local and bounded, like the
   ActionService it uses: a retry after a bridge restart can repeat a mutation.
+- The service re-validates every `ActionRequestSchema` it receives, because
+  Pydantic skips validation in `model_construct()` and
+  `model_copy(update=...)`; malformed requests raise `ValueError` before
+  dispatch. Transport adapters should still build requests with
+  `model_validate`.
+- Authorization is evaluated after the request acquires the Steve's dispatch
+  lock, immediately before the backend call, so revocation or fencing that
+  happens while a request is queued is enforced. The policy waits for the
+  local Authz lock rather than treating contention as an invalid session. A
+  revocation that lands after that check, or while MCPQ work is already
+  running, cannot stop it.
 
 Every MCPQ mutation is privileged-simulated, so it needs `admin:world`. That
 authority comes only from the operator's `world_admin_token` passed to the

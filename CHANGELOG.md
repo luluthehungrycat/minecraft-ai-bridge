@@ -124,7 +124,9 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
   `ActionRequestSchema` requests through the same action gate as the CLI.
   Privileged MCPQ actions need an operator-supplied world-admin token, which
   then applies to every controller session on that service. Only explicitly
-  allowlisted actions are exposed. No MCP transport yet.
+  allowlisted actions are exposed. Requests are re-validated at the service
+  boundary, and authorization is checked at dispatch time without treating
+  Authz lock contention as an invalid session. No MCP transport yet.
 
 - Added `compose.podman.yml`, a rootless Podman override for the Paper
   server, and documented building the bot plugin in a Java 25 container in

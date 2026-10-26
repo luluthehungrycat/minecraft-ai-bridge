@@ -277,3 +277,187 @@ async def test_world_admin_does_not_bypass_parameter_validation(setup):
     )
     assert result.status is ActionStatus.FAILED
     assert setup.world.commands_ran == []
+
+
+@pytest.mark.parametrize(
+    "update",
+    [
+        {"action": "set_time"},
+        {"params": [("message", "hi")]},
+        {"params": {"message": object()}},
+        {"controller_session_id": ["not", "hashable"]},
+        {"request_id": None},
+        {"request_id": 5},
+        {"steve_id": ""},
+    ],
+)
+async def test_unvalidated_request_instances_are_revalidated(setup, update):
+    """model_construct/model_copy skip validation; the service must not trust them."""
+    service = setup.service()
+    session = await service.open_session(setup.controller)
+    fields = {**dict(_request(session, ActionType.CHAT, {"message": "hi"})), **update}
+
+    with pytest.raises(ValueError, match="invalid action request"):
+        await service.submit_action(setup.controller, ActionRequestSchema.model_construct(**fields))
+    assert setup.world.chat_messages_sent == []
+    assert setup.world.commands_ran == []
+
+
+async def test_revalidation_still_refuses_internal_actions(setup):
+    service = setup.service(world_admin=True)
+    session = await service.open_session(setup.controller)
+    request = _request(session, ActionType.WAIT).model_copy(update={"action": "goto_teleport"})
+
+    result = await service.submit_action(setup.controller, request)
+    assert result.reason_code == "ACTION_NOT_EXPOSED"
+    assert setup.world.commands_ran == []
+
+
+async def test_unauthenticated_malformed_request_is_an_authentication_error(setup):
+    service = setup.service()
+    with pytest.raises(PermissionError):
+        await service.submit_action(
+            "mab-not-a-token", ActionRequestSchema.model_construct(action="set_time")
+        )
+
+
+async def test_revocation_while_queued_is_enforced_at_dispatch(setup, monkeypatch):
+    """Policy runs after the dispatch lock, so a queued request sees revocation."""
+    import asyncio
+
+    from minecraft_ai_bridge.runtime import action_service
+
+    service = setup.service()
+    session = await service.open_session(setup.controller)
+    first_running = asyncio.Event()
+    release_first = asyncio.Event()
+    original = action_service.execute_action
+
+    async def slow_first(world, action, params):
+        if not first_running.is_set():
+            first_running.set()
+            await release_first.wait()
+        return await original(world, action, params)
+
+    monkeypatch.setattr(action_service, "execute_action", slow_first)
+    first = asyncio.create_task(
+        service.submit_action(
+            setup.controller, _request(session, ActionType.CHAT, {"message": "a"}, "req-a")
+        )
+    )
+    await first_running.wait()
+    second = asyncio.create_task(
+        service.submit_action(
+            setup.controller, _request(session, ActionType.CHAT, {"message": "b"}, "req-b")
+        )
+    )
+    await asyncio.sleep(0.05)  # second is now waiting for the dispatch lock
+    setup.auth.revoke_credential(setup.controller)
+    release_first.set()
+
+    assert (await first).status is ActionStatus.SUCCEEDED
+    queued = await second
+    assert queued.status is ActionStatus.REJECTED
+    assert queued.reason_code == "POLICY_REJECTED"
+    assert setup.world.chat_messages_sent == ["a"]
+
+
+async def test_concurrent_sessions_do_not_share_authority(setup):
+    """The ContextVar binding is per request even when requests interleave."""
+    import asyncio
+
+    service = setup.service()
+    stale = await service.open_session(setup.controller)
+    setup.auth.deactivate_steve(setup.admin, "AIBot")
+    setup.auth.reactivate_steve(setup.admin, "AIBot")
+    live = await service.open_session(setup.second_controller)
+
+    requests = []
+    for i in range(10):
+        requests.append(
+            service.submit_action(
+                setup.controller,
+                _request(stale, ActionType.CHAT, {"message": f"stale-{i}"}, f"s-{i}"),
+            )
+        )
+        requests.append(
+            service.submit_action(
+                setup.second_controller,
+                _request(live, ActionType.CHAT, {"message": f"live-{i}"}, f"l-{i}"),
+            )
+        )
+    results = await asyncio.gather(*requests)
+
+    assert [r.status for r in results[0::2]] == [ActionStatus.REJECTED] * 10
+    assert [r.status for r in results[1::2]] == [ActionStatus.SUCCEEDED] * 10
+    assert sorted(setup.world.chat_messages_sent) == sorted(f"live-{i}" for i in range(10))
+
+
+async def test_unverifiable_session_fails_closed(setup, monkeypatch):
+    """A busy Authz lock (try_validate_session -> None) rejects, never allows."""
+    service = setup.service()
+    session = await service.open_session(setup.controller)
+    monkeypatch.setattr(setup.auth, "try_validate_session", lambda *_a, **_k: None)
+
+    result = await service.submit_action(
+        setup.controller, _request(session, ActionType.CHAT, {"message": "x"})
+    )
+    assert result.reason_code == "POLICY_REJECTED"
+    assert setup.world.chat_messages_sent == []
+
+
+async def test_request_id_cannot_replay_across_sessions(setup):
+    service = setup.service()
+    first = await service.open_session(setup.controller)
+    done = await service.submit_action(
+        setup.controller, _request(first, ActionType.CHAT, {"message": "once"})
+    )
+    await service.close_session(setup.controller, first.session_id)
+    second = await service.open_session(setup.second_controller)
+
+    replay = await service.submit_action(
+        setup.second_controller, _request(second, ActionType.CHAT, {"message": "once"})
+    )
+    assert done.status is ActionStatus.SUCCEEDED
+    assert replay.status is ActionStatus.REJECTED
+    assert setup.world.chat_messages_sent == ["once"]
+
+
+async def test_concurrent_requests_from_one_valid_session_all_run(setup):
+    """Authz lock contention between requests must not read as an invalid session."""
+    import asyncio
+
+    service = setup.service()
+    session = await service.open_session(setup.controller)
+    results = await asyncio.gather(
+        *(
+            service.submit_action(
+                setup.controller,
+                _request(session, ActionType.CHAT, {"message": str(i)}, f"req-{i}"),
+            )
+            for i in range(20)
+        )
+    )
+
+    assert [r.status for r in results] == [ActionStatus.SUCCEEDED] * 20
+    assert len(setup.world.chat_messages_sent) == 20
+
+
+async def test_request_fields_cannot_supply_world_admin_authority(setup):
+    service = setup.service()  # no operator delegation
+    session = await service.open_session(setup.controller)
+    params = {
+        "x": 5,
+        "y": 64,
+        "z": 5,
+        "admin_token": setup.world_admin,
+        "world_admin_token": setup.world_admin,
+        "allow_privileged": True,
+    }
+
+    result = await service.submit_action(
+        setup.controller, _request(session, ActionType.TELEPORT, params)
+    )
+    assert result.status is ActionStatus.REJECTED
+    assert result.reason_code == "POLICY_REJECTED"
+    assert setup.world.commands_ran == []

@@ -31,10 +31,18 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
+from pydantic import ValidationError
+
 from ..minecraft.actions import ActionType
 from ..minecraft.observer import Observer
 from ..minecraft.world_types import WorldAdapter
-from .action_service import ActionClass, ActionService, classify_action
+from .action_service import (
+    ActionClass,
+    ActionRequest,
+    ActionService,
+    PolicyDecision,
+    classify_action,
+)
 from .authz import AuthzService
 from .authz import ControllerSession as AuthzControllerSession
 from .contracts import (
@@ -121,11 +129,12 @@ class ControllerService:
         self._current: ContextVar[AuthzControllerSession | None] = ContextVar(
             f"controller_session_{steve_id}", default=None
         )
+        self._authz_policy = authz.action_policy(
+            self._current.get, admin_token=(world_admin_token or "").strip() or None
+        )
         self._action_service = ActionService(
             world,
-            policy=authz.action_policy(
-                self._current.get, admin_token=(world_admin_token or "").strip() or None
-            ),
+            policy=self._policy,
             safety_authority=safety_authority,
         )
         self._observer = Observer(world)
@@ -195,10 +204,13 @@ class ControllerService:
     async def submit_action(self, token: str, request: ActionRequestSchema) -> ActionResultSchema:
         """Run one action through the Steve's gate under the caller's session.
 
-        Authentication failures raise ``PermissionError``. Every other refusal
-        is returned as a ``rejected`` result with a ``reason_code``.
+        Authentication failures raise ``PermissionError``. A request that does
+        not satisfy ``ActionRequestSchema`` raises ``ValueError`` before any
+        dispatch. Every other refusal is returned as a ``rejected`` result with
+        a ``reason_code``.
         """
         credential = await asyncio.to_thread(self._authz.authenticate, token)
+        request = self._revalidate(request)
         session = self._sessions.get(request.controller_session_id)
         rejection = self._envelope_rejection(credential.credential_id, request, session)
         if rejection is not None:
@@ -225,6 +237,37 @@ class ControllerService:
         return self._result(request, status, reason_code, result.message)
 
     # ── Helpers ──────────────────────────────────────────────────────
+
+    async def _policy(self, request: ActionRequest) -> PolicyDecision:
+        """Evaluate the Authz policy without spurious contention denials.
+
+        The Authz policy validates with a non-blocking lock attempt and denies
+        when another request's authentication holds the lock, which would
+        reject concurrent requests from a valid session. Here the worker
+        thread first waits for that re-entrant lock, so the policy's own
+        attempt succeeds. ``asyncio.to_thread`` copies the context, so the
+        requesting session is still the one bound in ``_current``. A busy
+        database in another process still fails closed.
+        """
+
+        def evaluate() -> PolicyDecision:
+            with self._authz._lock:
+                return self._authz_policy(request)
+
+        return await asyncio.to_thread(evaluate)
+
+    @staticmethod
+    def _revalidate(request: ActionRequestSchema) -> ActionRequestSchema:
+        """Validate the request's field values again at the trust boundary.
+
+        Pydantic does not validate ``model_construct()`` or
+        ``model_copy(update=...)``, so an instance's type alone does not prove
+        its fields are valid.
+        """
+        try:
+            return ActionRequestSchema.model_validate(dict(request))
+        except (ValidationError, TypeError) as exc:
+            raise ValueError(f"invalid action request: {exc}") from None
 
     def _envelope_rejection(
         self,
