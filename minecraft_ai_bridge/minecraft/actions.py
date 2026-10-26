@@ -694,6 +694,23 @@ def _sanitize_resource_id(value: object, label: str) -> str:
     return value.removeprefix("minecraft:")
 
 
+def _finite_coordinate(value: object, label: str) -> float:
+    """Return a finite coordinate, or raise `ValueError`.
+
+    Accepts numbers and numeric strings. Anything else, including booleans,
+    NaN, and infinity, is rejected so it cannot alter a `tp` command.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"{label} must be a number")
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        raise ValueError(f"{label} {value!r} must be a number") from None
+    if not math.isfinite(number):
+        raise ValueError(f"{label} must be finite")
+    return number
+
+
 def _sanitize_amount(value: object) -> int:
     """Return an item count from 1 to 64, or raise `ValueError`."""
     if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 64:
@@ -705,9 +722,10 @@ def _sanitize_amount(value: object) -> int:
 
 
 async def _move_to(mc: WorldAdapter, params: dict) -> ActionResult:
-    x = params.get("x", 0)
-    y = params.get("y", 0)
-    z = params.get("z", 0)
+    try:
+        x, y, z = (_finite_coordinate(params.get(axis, 0), axis) for axis in ("x", "y", "z"))
+    except ValueError as exc:
+        return ActionResult(success=False, action=ActionType.MOVE_TO, message=str(exc))
     await mc.teleport_player(x, y, z)
     return ActionResult(
         success=True,

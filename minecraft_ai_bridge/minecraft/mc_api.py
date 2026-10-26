@@ -212,7 +212,8 @@ class McpqClient:
         call silently fails on Paper 26.x (reports success but doesn't
         actually move the player).
         """
-        await self.run_as_player(f"tp @p {x} {y} {z}")
+        # float() keeps a non-numeric value from changing the command.
+        await self.run_as_player(f"tp @p {float(x)} {float(y)} {float(z)}")
 
     # ── World methods ─────────────────────────────────────────────────
 
