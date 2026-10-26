@@ -2,9 +2,9 @@
 
 Contracts defines the RFC-0001 Phase A Pydantic schemas. This package also
 provides the action gate, local SQLite authorization and controller fencing,
-durable event journal, and local webhook sender. The authorization service
-does not provide transport/MCP wiring, task persistence, or backend watchdog
-safety; those capabilities remain outside this slice.
+durable event journal, local webhook sender, and a transport-independent
+controller API. There is no transport/MCP wiring, task persistence, or
+backend watchdog safety yet.
 """
 
 from .action_service import (
@@ -44,6 +44,7 @@ from .contracts import (
     Task,
     TaskStatus,
 )
+from .controller_service import ControllerService
 from .event_journal import EventCursorExpiredError, EventIdConflictError, EventJournal, EventRecord
 from .safety_supervisor import SafetySupervisor
 from .webhooks import (
@@ -58,6 +59,7 @@ from .world_adapter import McpqWorldAdapter, WorldAdapter
 
 __all__ = [
     "ActionAuditRecord",
+    "ControllerService",
     "ActionClass",
     "ActionOutcome",
     "ActionPolicy",

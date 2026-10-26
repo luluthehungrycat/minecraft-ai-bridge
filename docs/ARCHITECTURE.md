@@ -244,6 +244,53 @@ renewal that changes the persisted expiry clears any active session and
 advances the fencing generation, so a session bound to the previous lease
 stops validating.
 
+### Controller API (Phase B slice)
+
+`runtime.ControllerService` is the transport-independent API through which
+an external harness controls one Steve; an MCP or HTTP adapter only translates
+requests into its calls. It composes the pieces above:
+
+- `open_session` acquires the Steve's exclusive Authz controller session for
+  a `steve:control` credential; `renew_session` and `close_session` manage its
+  lease. A session ID alone is not a bearer: every call must also present the
+  token that opened it.
+- `get_capabilities` and `get_state` need `steve:observe:self` or
+  `steve:control` for that Steve; observers never get a session.
+- `submit_action` takes an `ActionRequestSchema` and returns an
+  `ActionResultSchema`. It checks the Steve, session ownership, and fencing
+  generation, then runs the action through the Steve's `ActionService` with
+  the Authz policy bound to the requesting session (a `ContextVar`), so
+  authorization, request-ID idempotency scoping, and audit match the CLI.
+  Only actions on an explicit allowlist are exposed, so a new ActionType is
+  unreachable until added; internal-control and lifecycle actions never are.
+  Request-ID replay protection is process-local and bounded, like the
+  ActionService it uses: a retry after a bridge restart can repeat a mutation.
+- The service re-validates every `ActionRequestSchema` it receives, because
+  Pydantic skips validation in `model_construct()` and
+  `model_copy(update=...)`; malformed requests raise `ValueError` before
+  dispatch. Transport adapters should still build requests with
+  `model_validate`.
+- Authorization is evaluated after the request acquires the Steve's dispatch
+  lock, immediately before the backend call, so revocation or fencing that
+  happens while a request is queued is enforced. The policy waits for the
+  local Authz lock rather than treating contention as an invalid session. A
+  revocation that lands after that check, or while MCPQ work is already
+  running, cannot stop it.
+
+Every MCPQ mutation is privileged-simulated, so it needs `admin:world`. That
+authority comes only from the operator's `world_admin_token` passed to the
+service, never from a request. With no token, ordinary keys can observe, chat,
+and wait. With a token, every controller session on the service gets all
+privileged-simulated actions, including teleporting and editing blocks at any
+coordinates, so configure it only when every controller credential for that
+Steve is trusted at world-admin level. Parameter validation still applies. Authentication failures raise `PermissionError`; every other refusal
+is a `rejected` result with a `reason_code` (`STEVE_MISMATCH`,
+`SESSION_UNKNOWN`, `SESSION_NOT_OWNED`, `STALE_GENERATION`,
+`ACTION_NOT_EXPOSED`, `POLICY_REJECTED`).
+
+This slice has no transport, task service, or event API, and does not run the
+safety supervisor for externally controlled Steves.
+
 ### Durable event journal (Phase C slice)
 
 `runtime.EventJournal` persists validated Event envelopes in SQLite with WAL
