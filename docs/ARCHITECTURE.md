@@ -261,12 +261,18 @@ requests into its calls. It composes the pieces above:
   generation, then runs the action through the Steve's `ActionService` with
   the Authz policy bound to the requesting session (a `ContextVar`), so
   authorization, request-ID idempotency scoping, and audit match the CLI.
-  Internal-control and lifecycle actions are never exposed.
+  Only actions on an explicit allowlist are exposed, so a new ActionType is
+  unreachable until added; internal-control and lifecycle actions never are.
+  Request-ID replay protection is process-local and bounded, like the
+  ActionService it uses: a retry after a bridge restart can repeat a mutation.
 
 Every MCPQ mutation is privileged-simulated, so it needs `admin:world`. That
 authority comes only from the operator's `world_admin_token` passed to the
 service, never from a request. With no token, ordinary keys can observe, chat,
-and wait. Authentication failures raise `PermissionError`; every other refusal
+and wait. With a token, every controller session on the service gets all
+privileged-simulated actions, including teleporting and editing blocks at any
+coordinates, so configure it only when every controller credential for that
+Steve is trusted at world-admin level. Parameter validation still applies. Authentication failures raise `PermissionError`; every other refusal
 is a `rejected` result with a `reason_code` (`STEVE_MISMATCH`,
 `SESSION_UNKNOWN`, `SESSION_NOT_OWNED`, `STALE_GENERATION`,
 `ACTION_NOT_EXPOSED`, `POLICY_REJECTED`).

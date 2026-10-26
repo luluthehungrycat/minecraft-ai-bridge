@@ -10,9 +10,12 @@ same gate as the built-in CLI.
 
 Privileged-simulated MCPQ actions (movement, block and inventory edits,
 combat) need ``admin:world``. That authority comes only from the operator's
-``world_admin_token`` given to this service, never from a client request, so
-ordinary controller keys can observe, chat, and wait but cannot escalate.
-Internal and lifecycle actions are never exposed.
+``world_admin_token`` given to this service, never from a client request.
+Without it, ordinary controller keys can observe, chat, and wait. With it,
+*every* controller session on this service gets those privileged actions,
+including teleporting and editing blocks at any coordinates; configure it only
+when all controller credentials for this Steve are trusted at that level.
+Only allowlisted actions are exposed; internal and lifecycle actions never are.
 
 This is not a transport, task service, or event API, and it does not run the
 safety supervisor; those are separate slices.
@@ -28,6 +31,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
+from ..minecraft.actions import ActionType
 from ..minecraft.observer import Observer
 from ..minecraft.world_types import WorldAdapter
 from .action_service import ActionClass, ActionService, classify_action
@@ -44,9 +48,48 @@ from .contracts import (
 
 logger = logging.getLogger(__name__)
 
-# Action classes a controller may request. Internal-control and lifecycle
-# actions belong to trusted in-process callers only.
-_EXPOSED_CLASSES = frozenset(
+# Explicit allowlist of actions a controller may request. A new ActionType is
+# not exposed until it is added here; internal-control, lifecycle, and
+# unclassified actions must never be.
+_EXPOSED_ACTIONS = frozenset(
+    {
+        # Observation
+        ActionType.CHECK_INVENTORY,
+        ActionType.SCAN_ENTITIES,
+        ActionType.SCAN,
+        ActionType.CHECK_TIME,
+        ActionType.CHECK_WEATHER,
+        ActionType.CHECK_HEALTH,
+        ActionType.CHECK_HUNGER,
+        ActionType.CHECK_POSITION,
+        ActionType.LIST_PLAYERS,
+        # Survival
+        ActionType.CHAT,
+        ActionType.WAIT,
+        ActionType.DONE,
+        # Privileged-simulated on MCPQ; still require admin:world from policy
+        ActionType.MOVE_TO,
+        ActionType.MOVE_FORWARD,
+        ActionType.MOVE_BACK,
+        ActionType.WALK_TO,
+        ActionType.TURN_LEFT,
+        ActionType.TURN_RIGHT,
+        ActionType.JUMP,
+        ActionType.SPRINT,
+        ActionType.TELEPORT,
+        ActionType.BREAK_BLOCK,
+        ActionType.PLACE_BLOCK,
+        ActionType.INTERACT,
+        ActionType.EQUIP_ITEM,
+        ActionType.EQUIP_BEST_WEAPON,
+        ActionType.CRAFT_ITEM,
+        ActionType.DROP_ITEM,
+        ActionType.EAT,
+        ActionType.HEAL,
+        ActionType.ATTACK,
+    }
+)
+_EXPOSABLE_CLASSES = frozenset(
     {ActionClass.OBSERVATION, ActionClass.SURVIVAL, ActionClass.PRIVILEGED_SIMULATED}
 )
 _OBSERVE_SCOPES = ("steve:observe:self", "steve:control")
@@ -197,7 +240,10 @@ class ControllerService:
             return "SESSION_NOT_OWNED", "controller session belongs to another credential"
         if request.generation != session.generation:
             return "STALE_GENERATION", "request generation does not match the session"
-        if classify_action(request.action) not in _EXPOSED_CLASSES:
+        if (
+            request.action not in _EXPOSED_ACTIONS
+            or classify_action(request.action) not in _EXPOSABLE_CLASSES
+        ):
             return "ACTION_NOT_EXPOSED", f"{request.action.value} is not a controller action"
         return None
 

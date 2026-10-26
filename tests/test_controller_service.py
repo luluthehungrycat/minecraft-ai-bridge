@@ -211,3 +211,69 @@ async def test_closed_session_is_unusable(setup):
     assert result.reason_code == "SESSION_UNKNOWN"
     with pytest.raises(PermissionError):
         await service.renew_session(setup.controller, session.session_id)
+
+
+def test_exposed_actions_are_an_explicit_safe_allowlist():
+    from minecraft_ai_bridge.runtime.action_service import ActionClass, classify_action
+    from minecraft_ai_bridge.runtime.controller_service import _EXPOSED_ACTIONS
+
+    exposable = {ActionClass.OBSERVATION, ActionClass.SURVIVAL, ActionClass.PRIVILEGED_SIMULATED}
+    assert {classify_action(a) for a in _EXPOSED_ACTIONS} <= exposable
+    assert ActionType.GOTO_TELEPORT not in _EXPOSED_ACTIONS
+
+
+async def test_action_outside_allowlist_is_not_exposed(setup, monkeypatch):
+    from minecraft_ai_bridge.runtime import controller_service
+
+    monkeypatch.setattr(
+        controller_service,
+        "_EXPOSED_ACTIONS",
+        controller_service._EXPOSED_ACTIONS - {ActionType.CHAT},
+    )
+    service = setup.service()
+    session = await service.open_session(setup.controller)
+
+    result = await service.submit_action(
+        setup.controller, _request(session, ActionType.CHAT, {"message": "hi"})
+    )
+    assert result.reason_code == "ACTION_NOT_EXPOSED"
+    assert setup.world.chat_messages_sent == []
+
+
+async def test_revoked_credential_loses_access_immediately(setup):
+    service = setup.service()
+    session = await service.open_session(setup.controller)
+    setup.auth.revoke_credential(setup.controller)
+
+    with pytest.raises(PermissionError):
+        await service.submit_action(setup.controller, _request(session, ActionType.WAIT))
+    with pytest.raises(PermissionError):
+        await service.get_state(setup.controller)
+
+
+async def test_expired_lease_is_rejected(setup):
+    import asyncio
+
+    service = ControllerService(
+        McpqWorldAdapter(setup.world), setup.auth, "AIBot", session_lease_seconds=0.05
+    )
+    session = await service.open_session(setup.controller)
+    await asyncio.sleep(0.1)
+
+    result = await service.submit_action(
+        setup.controller, _request(session, ActionType.CHAT, {"message": "late"})
+    )
+    assert result.status is ActionStatus.REJECTED
+    assert result.reason_code == "POLICY_REJECTED"
+    assert setup.world.chat_messages_sent == []
+
+
+async def test_world_admin_does_not_bypass_parameter_validation(setup):
+    service = setup.service(world_admin=True)
+    session = await service.open_session(setup.controller)
+
+    result = await service.submit_action(
+        setup.controller, _request(session, ActionType.PLACE_BLOCK, {"block_type": "stone{}"})
+    )
+    assert result.status is ActionStatus.FAILED
+    assert setup.world.commands_ran == []
