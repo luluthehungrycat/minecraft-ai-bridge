@@ -394,14 +394,21 @@ async def test_concurrent_sessions_do_not_share_authority(setup):
 
 
 async def test_unverifiable_session_fails_closed(setup, monkeypatch):
-    """A busy Authz lock (try_validate_session -> None) rejects, never allows."""
+    """A storage error while validating the session rejects, never allows."""
+    import sqlite3
+
     service = setup.service()
     session = await service.open_session(setup.controller)
-    monkeypatch.setattr(setup.auth, "try_validate_session", lambda *_a, **_k: None)
+
+    def locked(*_args, **_kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(setup.auth, "validate_session", locked)
 
     result = await service.submit_action(
         setup.controller, _request(session, ActionType.CHAT, {"message": "x"})
     )
+    assert result.status is ActionStatus.REJECTED
     assert result.reason_code == "POLICY_REJECTED"
     assert setup.world.chat_messages_sent == []
 

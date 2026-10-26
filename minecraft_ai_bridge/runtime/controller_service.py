@@ -130,7 +130,9 @@ class ControllerService:
             f"controller_session_{steve_id}", default=None
         )
         self._authz_policy = authz.action_policy(
-            self._current.get, admin_token=(world_admin_token or "").strip() or None
+            self._current.get,
+            admin_token=(world_admin_token or "").strip() or None,
+            blocking=True,
         )
         self._action_service = ActionService(
             world,
@@ -239,22 +241,16 @@ class ControllerService:
     # ── Helpers ──────────────────────────────────────────────────────
 
     async def _policy(self, request: ActionRequest) -> PolicyDecision:
-        """Evaluate the Authz policy without spurious contention denials.
+        """Evaluate the blocking Authz policy in a worker thread.
 
-        The Authz policy validates with a non-blocking lock attempt and denies
-        when another request's authentication holds the lock, which would
-        reject concurrent requests from a valid session. Here the worker
-        thread first waits for that re-entrant lock, so the policy's own
-        attempt succeeds. ``asyncio.to_thread`` copies the context, so the
-        requesting session is still the one bound in ``_current``. A busy
-        database in another process still fails closed.
+        The default Authz policy denies when its lock is busy, which would
+        reject concurrent requests from a valid session because each request
+        authenticates under that lock. The blocking variant waits instead, so
+        it runs off the event loop. ``asyncio.to_thread`` copies the context,
+        so the requesting session is still the one bound in ``_current``. A
+        storage error still fails closed through ActionService.
         """
-
-        def evaluate() -> PolicyDecision:
-            with self._authz._lock:
-                return self._authz_policy(request)
-
-        return await asyncio.to_thread(evaluate)
+        return await asyncio.to_thread(self._authz_policy, request)
 
     @staticmethod
     def _revalidate(request: ActionRequestSchema) -> ActionRequestSchema:
