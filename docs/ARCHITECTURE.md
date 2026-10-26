@@ -378,7 +378,8 @@ allowlist: `chat`, `wait`, and `done` are the only survival actions, and an
 ActionType missing from every class is rejected before policy evaluation
 instead of defaulting to survival. Handlers that build server commands from
 request strings validate them first: player targets as plain usernames, and
-block and item names as plain IDs without block states or NBT data. Local
+block and item names as plain IDs without block states or NBT data, amounts
+as integers from 1 to 64, and teleport coordinates as finite numbers. Local
 mode preserves existing CLI behavior. Safety reflexes use a distinct bounded capability described above.
 
 ### Independently scheduled preservation (safety prerequisite slice)

@@ -1082,3 +1082,82 @@ async def test_namespaced_ids_are_accepted(mock_mc):
     assert result.success
     mock_mc.assert_command_contains("give")
     assert "oak_planks 4" in mock_mc.last_command()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", [ActionType.MOVE_TO, ActionType.TELEPORT])
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"x": "1 2", "y": 64, "z": 0},
+        {"x": True, "y": 64, "z": 0},
+        {"x": float("nan"), "y": 64, "z": 0},
+        {"x": 0, "y": float("inf"), "z": 0},
+        {"x": 0, "y": 64, "z": [1]},
+        {"x": 0, "y": 64, "z": "~"},
+    ],
+)
+async def test_teleport_coordinates_must_be_finite_numbers(mock_mc, action, params):
+    mock_mc.set_position(0, 64, 0)
+    result = await execute_action(mock_mc, action, params)
+
+    assert not result.success
+    assert mock_mc.commands_ran == []
+    assert await mock_mc.get_player_pos() == (0, 64, 0)
+
+
+@pytest.mark.asyncio
+async def test_teleport_accepts_numeric_strings(mock_mc):
+    result = await execute_action(mock_mc, ActionType.TELEPORT, {"x": "5", "y": 64.5, "z": -3})
+
+    assert result.success
+    assert result.data == {"x": 5.0, "y": 64.5, "z": -3.0}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "block_type",
+    [
+        "other:stone",
+        "minecraft:stone/slab",
+        "minecraft:minecraft:stone",
+        "STONE",
+        "stone\t",
+        "a" * 65,
+        "",
+        None,
+        7,
+        ["stone"],
+    ],
+)
+async def test_place_block_rejects_non_plain_ids(mock_mc, block_type):
+    result = await execute_action(mock_mc, ActionType.PLACE_BLOCK, {"block_type": block_type})
+
+    assert not result.success
+    assert mock_mc.commands_ran == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("amount", [True, 1.5, "1", -1, None])
+async def test_item_amounts_must_be_bounded_integers(mock_mc, amount):
+    mock_mc.set_position(0, 64, 0)
+    for action in (ActionType.CRAFT_ITEM, ActionType.DROP_ITEM):
+        result = await execute_action(mock_mc, action, {"item_type": "stone", "amount": amount})
+        assert not result.success
+    assert mock_mc.commands_ran == []
+
+
+@pytest.mark.asyncio
+async def test_valid_block_and_item_operations_still_run(mock_mc):
+    mock_mc.set_position(0, 64, 0)
+
+    params = {"block_type": "minecraft:oak_log", "x": 1, "y": 64, "z": 1}
+    placed = await execute_action(mock_mc, ActionType.PLACE_BLOCK, params)
+    dropped = await execute_action(
+        mock_mc, ActionType.DROP_ITEM, {"item_type": "cobblestone", "amount": 64}
+    )
+
+    assert placed.success
+    assert await mock_mc.get_block(1, 64, 1) == "oak_log"
+    assert dropped.success
+    assert any("summon item" in command for command in mock_mc.commands_ran)

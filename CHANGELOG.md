@@ -70,6 +70,8 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
 - Shutdown now completes renewal and safety-worker stops and Authz release/close
   before propagating repeated cancellation; blocking SQLite cleanup runs off the
   asyncio event loop.
+- `move_to` and `teleport` now require finite numeric coordinates. They were
+  interpolated unvalidated into a console `tp` command.
 - `place_block`, `craft_item`, and `drop_item` now accept only plain block
   and item IDs (optional `minecraft:` namespace) and amounts from 1 to 64.
   These values were interpolated unvalidated into server commands, so block
