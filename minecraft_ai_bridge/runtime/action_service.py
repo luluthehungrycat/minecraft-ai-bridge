@@ -22,6 +22,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from inspect import isawaitable
 from math import isfinite
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -126,6 +127,45 @@ _PRIVILEGED_AUTHORIZATION_CLASSES = frozenset(
     }
 )
 _SAFETY_ACTIONS = frozenset({ActionType.ATTACK, ActionType.EAT, ActionType.HEAL})
+
+# Credential scope that delegates each privileged-simulated action to an
+# external controller (AuthzService.action_policy(require_delegation=True)).
+# Every privileged-simulated action must appear here; a test enforces it.
+WORLD_DELEGATION_SCOPES: Mapping[ActionType, str] = MappingProxyType(
+    {
+        **dict.fromkeys(
+            (
+                ActionType.MOVE_TO,
+                ActionType.MOVE_FORWARD,
+                ActionType.MOVE_BACK,
+                ActionType.WALK_TO,
+                ActionType.TURN_LEFT,
+                ActionType.TURN_RIGHT,
+                ActionType.JUMP,
+                ActionType.SPRINT,
+                ActionType.TELEPORT,
+            ),
+            "steve:world:move",
+        ),
+        **dict.fromkeys(
+            (ActionType.BREAK_BLOCK, ActionType.PLACE_BLOCK, ActionType.INTERACT),
+            "steve:world:edit",
+        ),
+        **dict.fromkeys(
+            (
+                ActionType.EQUIP_ITEM,
+                ActionType.EQUIP_BEST_WEAPON,
+                ActionType.CRAFT_ITEM,
+                ActionType.DROP_ITEM,
+            ),
+            "steve:world:items",
+        ),
+        **dict.fromkeys(
+            (ActionType.ATTACK, ActionType.EAT, ActionType.HEAL),
+            "steve:world:combat",
+        ),
+    }
+)
 
 
 def classify_action(action: ActionType) -> ActionClass:

@@ -283,11 +283,26 @@ requests into its calls. It composes the pieces above:
 
 Every MCPQ mutation is privileged-simulated, so it needs `admin:world`. That
 authority comes only from the operator's `world_admin_token` passed to the
-service, never from a request. With no token, ordinary keys can observe, chat,
-and wait. With a token, every controller session on the service gets all
-privileged-simulated actions, including teleporting and editing blocks at any
-coordinates, so configure it only when every controller credential for that
-Steve is trusted at world-admin level. Parameter validation still applies. Authentication failures raise `PermissionError`; every other refusal
+service, never from a request. A controller credential additionally needs the
+delegation scope for the action's group, held on the session's own
+credential and re-read on every request:
+
+| Scope | Actions |
+|-------|---------|
+| `steve:world:move` | move_to, move_forward, move_back, walk_to, turn_left, turn_right, jump, sprint, teleport |
+| `steve:world:edit` | break_block, place_block, interact |
+| `steve:world:items` | equip_item, equip_best_weapon, craft_item, drop_item |
+| `steve:world:combat` | attack, eat, heal |
+
+Both keys are required: the token says the service may simulate privileged
+actions at all, and the scope says this credential may request that group.
+Without either, ordinary keys can observe, chat, and wait. An `admin:steves`
+administrator grants scopes when creating the credential; changing them means
+issuing a new credential. Privileged actions with no delegation scope
+(internal and lifecycle actions) are always denied on this path. The
+built-in CLI agent is trusted in-process and does not use delegation scopes.
+Delegated actions still have no reach limit (#25), and parameter validation
+still applies. Authentication failures raise `PermissionError`; every other refusal
 is a `rejected` result with a `reason_code` (`STEVE_MISMATCH`,
 `SESSION_UNKNOWN`, `SESSION_NOT_OWNED`, `STALE_GENERATION`,
 `ACTION_NOT_EXPOSED`, `POLICY_REJECTED`).

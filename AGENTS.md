@@ -43,11 +43,11 @@
 - `from_yaml()` class method merges YAML + env vars with type coercion
 
 ### Runtime (`minecraft_ai_bridge/runtime/`)
-- `authz.py` — local SQLite credentials/scopes, global admin identities, Steve ownership/first-claim, exclusive controller sessions and fencing; trusted local bootstrap recovers only when no valid `admin:steves` credential remains, and `steve:observe:shared` requires explicit per-peer admin grants while `events:read` is service level. No transport or external endpoint.
+- `authz.py` — local SQLite credentials/scopes, global admin identities, Steve ownership/first-claim, exclusive controller sessions and fencing; trusted local bootstrap recovers only when no valid `admin:steves` credential remains, and `steve:observe:shared` requires explicit per-peer admin grants while `events:read` is service level. `steve:world:*` scopes delegate privileged-simulated action groups to controller credentials (`action_policy(require_delegation=True)`). No transport or external endpoint.
 - `world_adapter.py` — transport-independent `WorldAdapter` Protocol plus `McpqWorldAdapter` composition wrapper around a connected `McpqClient`; its read-only `capabilities` property advertises a conservative MCPQ profile (teleport-simulated movement, privileged-simulated crafting, world edit; no live version/dimension or hazard-sensor claims). The orchestrator creates exactly one adapter and passes it to ActionService, Observer, InventoryManager, ChatCommandHandler, and SelfPreservationLayer; the raw client is kept only for connection lifecycle. Phase A slice — capability reporting is not authorization or independent safety, and this is not yet a full backend contract; external MCP access out of scope.
 - `action_service.py` — policy hook, bounded audit trace, and process-local request-ID idempotency for strategic actions, trusted startup provisioning, follow-mode teleport, chat-command teleports, and self-preservation mutating reflexes.
 - `safety_supervisor.py` — independently scheduled preservation polling from goal decomposition onward with a single pending-intervention slot; the orchestrator cancels stale LLM decisions and strategic WAITs, and ActionService invalidates queued strategic actions when a reflex starts. It emits durable `safety.intervened` events; when a slow journal forces coalescing, one bounded summary retains per-action success/failure counts and preserves CRITICAL severity if any intervention failed. All other RFC-0001 event producers remain open. This is a built-in runtime prerequisite slice, not backend watchdog safety or Phase C completion.
-- `controller_service.py` — transport-independent controller API for one Steve (RFC-0001 Phase B slice): exclusive Authz sessions bound to the presenting token, observer-scoped capabilities/state, and `ActionRequestSchema` → `ActionResultSchema` through the Steve's ActionService with the Authz policy bound per request via a ContextVar. Exposed actions are an explicit allowlist. Privileged MCPQ actions need the operator's world-admin token, which then applies to every controller session on the service; internal/lifecycle actions are never exposed. Request-ID idempotency is durable with an `outcome_store`, process-local without one. No MCP transport, task, or event API yet.
+- `controller_service.py` — transport-independent controller API for one Steve (RFC-0001 Phase B slice): exclusive Authz sessions bound to the presenting token, observer-scoped capabilities/state, and `ActionRequestSchema` → `ActionResultSchema` through the Steve's ActionService with the Authz policy bound per request via a ContextVar. Exposed actions are an explicit allowlist. Privileged MCPQ actions need both the operator's world-admin token and a per-credential delegation scope (`steve:world:move`/`edit`/`items`/`combat`, mapped in `WORLD_DELEGATION_SCOPES`); internal/lifecycle actions are never exposed. Request-ID idempotency is durable with an `outcome_store`, process-local without one. No MCP transport, task, or event API yet.
 - `action_outcomes.py` — `SqliteActionOutcomeStore`: durable request-ID outcomes for ActionService. Per-request `reserved` → `dispatching` → terminal state machine with owner compare-and-set, so instances sharing a database dispatch a request ID at most once; writes run off the event loop in tracked tasks (`ActionService.flush()`); a row left `dispatching` reads as `unknown` and never re-dispatches. Full outcomes kept 7 days / 10,000 records, then tombstones until 365 days (the idempotency window). At-most-once dispatch, not exactly-once execution.
 - `event_journal.py` — SQLite append-only Event persistence with monotonic cursors, event-ID idempotency, per-consumer at-least-once polling/acknowledgment, and bounded payload retention.
 - `webhooks.py` — administrator-configured local webhook delivery over EventJournal, with isolated per-subscription consumers, strict journal-head ordering, ack-cursor reconciliation, durable retries/dead letters, HMAC signatures, bounded size/rate/retries, and HTTPS exact-host allowlisting. The default HTTPX pinned transport connects directly to checked public IPs while preserving TLS SNI and HTTP Host, with environment proxies and redirects disabled; callers may inject a compatible transport. No subscription-management endpoint or external controller authorization/admin config integration. This is not full Phase C.
@@ -112,7 +112,7 @@ examples and the conventions block at the top.
 - **config.yaml volume mount**: Mounted read-only at `/app/config.yaml`. Changes require `docker compose restart bridge`.
 
 ### Code Quality
-- **Tests**: 682 tests collected in total — 670 deterministic unit tests plus 12 integration tests. Unit tests use `MockMcpqClient` for deterministic MCPQ simulation. Integration tests use a real MCPQ server + real LLM (OpenRouter `openai/gpt-oss-20b`, or Requesty `runware/gpt-oss-120b` when only `REQUESTY_API_KEY` is set; override with `INTEGRATION_LLM_MODEL`) for end-to-end validation. The stack uses pinned Paper 26.2 build 123. Run with `pytest tests/`.
+- **Tests**: 701 tests collected in total — 689 deterministic unit tests plus 12 integration tests. Unit tests use `MockMcpqClient` for deterministic MCPQ simulation. Integration tests use a real MCPQ server + real LLM (OpenRouter `openai/gpt-oss-20b`, or Requesty `runware/gpt-oss-120b` when only `REQUESTY_API_KEY` is set; override with `INTEGRATION_LLM_MODEL`) for end-to-end validation. The stack uses pinned Paper 26.2 build 123. Run with `pytest tests/`.
 - **Mypy**: runs in CI on every push and PR (`mypy minecraft_ai_bridge/ --ignore-missing-imports`) and must pass.
 - **gRPC stubs are synchronous**: MCPQ generated stubs block; dispatched via `asyncio.to_thread`. Not ideal but works.
 - **RCON client is unmaintained**: Since the MCPQ migration, `rcon.py` isn't tested. Consider removing or marking deprecated.
@@ -138,7 +138,7 @@ Some LLMs (especially smaller/local ones) can't reliably output structured JSON 
 
 ### P0: None (Testing Complete)
 The 0.5.0 release completed the testing milestone:
-- **Unit tests** (670): MockMcpqClient covers all 36 actions, observer parsing, memory, goal fallback plans, config, inventory manager, chat commands, pathfinding, the runtime action gate, the safety supervisor, the event journal, webhook delivery, and the local authorization service
+- **Unit tests** (689): MockMcpqClient covers all 36 actions, observer parsing, memory, goal fallback plans, config, inventory manager, chat commands, pathfinding, the runtime action gate, the safety supervisor, the event journal, webhook delivery, and the local authorization service
 - **Integration tests** (12): Full think-act-observe loop with real MCPQ server + real LLM inference (OpenRouter `openai/gpt-oss-20b`). Covers teleport, exploration, disconnect handling, fallback decomposition, failure counting, memory recording, chat command stop, and inventory creation.
 - **Goal-verification assertions**: Integration tests verify agent behavior via:
   - `action_taken(orch, *names) → bool` — checks if the agent performed a specific action (parses `MemoryEntry.raw`)
@@ -210,7 +210,7 @@ The 0.5.0 release completed the testing milestone:
 | `docker-compose.yml` | Paper server + bridge services |
 | `docs/*.md` | Full documentation set |
 | `tests/conftest.py` | MockMcpqClient, MockLLMClient, test fixtures |
-| `tests/test_*.py` | Unit + integration tests (682 total: 670 unit + 12 integration) |
+| `tests/test_*.py` | Unit + integration tests (701 total: 689 unit + 12 integration) |
 | `AGENTS.md` | This file |
 
 ## Environment Info
@@ -261,6 +261,7 @@ Helpers in `tests/test_integration.py`:
 | `tests/test_main.py` | 2 | CLI exit codes |
 | `tests/test_authz_orchestrator.py` | 27 | Optional built-in Orchestrator Authz configuration, session gating, revocation, and cleanup |
 | `tests/test_controller_service.py` | 33 | Phase B controller API gate: exclusive sessions, observers, privileged and internal actions |
+| `tests/test_world_delegation.py` | 19 | Per-credential world delegation scopes for ControllerService |
 | `tests/test_authz_service.py` | 93 | Local credentials, scopes, ownership, sessions, fencing, peer-grant audit migration |
 | `tests/test_event_journal.py` | 8 | Durable event journal |
 | `tests/test_action_outcomes.py` | 25 | Durable request-ID outcomes: restarts, retention, cross-instance claims, async persistence, corrupt records |
