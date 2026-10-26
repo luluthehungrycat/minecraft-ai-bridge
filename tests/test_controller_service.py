@@ -468,3 +468,20 @@ async def test_request_fields_cannot_supply_world_admin_authority(setup):
     assert result.status is ActionStatus.REJECTED
     assert result.reason_code == "POLICY_REJECTED"
     assert setup.world.commands_ran == []
+
+
+async def test_action_id_names_the_logical_action_across_replays(setup):
+    """RFC-0001: action IDs are durable, so a replay keeps the original ID."""
+    service = setup.service()
+    session = await service.open_session(setup.controller)
+    request = _request(session, ActionType.CHAT, {"message": "hi"})
+
+    first = await service.submit_action(setup.controller, request)
+    replay = await service.submit_action(setup.controller, request)
+    other = await service.submit_action(
+        setup.controller, _request(session, ActionType.CHAT, {"message": "hi"}, "req-2")
+    )
+
+    assert first.action_id == replay.action_id
+    assert other.action_id != first.action_id
+    assert len(setup.world.chat_messages_sent) == 1 + 1

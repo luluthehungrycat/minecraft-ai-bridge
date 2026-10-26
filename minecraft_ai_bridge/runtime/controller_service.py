@@ -29,7 +29,7 @@ import logging
 from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4, uuid5
 
 from pydantic import ValidationError
 
@@ -144,6 +144,10 @@ class ControllerService:
         )
         self._observer = Observer(world)
 
+    async def aclose(self) -> None:
+        """Wait for pending durable outcome writes; call before shutdown."""
+        await self._action_service.flush()
+
     @property
     def action_service(self) -> ActionService:
         """The Steve's action gate, for sharing with an in-process safety layer."""
@@ -219,7 +223,9 @@ class ControllerService:
         session = self._sessions.get(request.controller_session_id)
         rejection = self._envelope_rejection(credential.credential_id, request, session)
         if rejection is not None:
-            return self._result(request, ActionStatus.REJECTED, *rejection)
+            return self._result(
+                credential.credential_id, request, ActionStatus.REJECTED, *rejection
+            )
         assert session is not None
 
         correlation_id = str(uuid4())
@@ -239,7 +245,7 @@ class ControllerService:
             ActionStatus.REJECTED: "POLICY_REJECTED",
             ActionStatus.FAILED: "ACTION_FAILED",
         }.get(status)
-        return self._result(request, status, reason_code, result.message)
+        return self._result(credential.credential_id, request, status, reason_code, result.message)
 
     # ── Helpers ──────────────────────────────────────────────────────
 
@@ -325,13 +331,14 @@ class ControllerService:
 
     def _result(
         self,
+        credential_id: str,
         request: ActionRequestSchema,
         status: ActionStatus,
         reason_code: str | None,
         message: str,
     ) -> ActionResultSchema:
         return ActionResultSchema(
-            action_id=f"act-{uuid4()}",
+            action_id=_action_id(request.steve_id, credential_id, request.request_id),
             steve_id=request.steve_id,
             request_id=request.request_id,
             status=status,
@@ -352,5 +359,19 @@ class ControllerService:
             status=SessionStatus.ACTIVE,
         )
 
+
+def _action_id(steve_id: str, credential_id: str, request_id: str) -> str:
+    """Return the stable ID of the logical action a request ID names.
+
+    RFC-0001 treats action IDs as durable across reconnects, so replays and
+    retries of one request ID from one credential share an ID, including
+    after a restart. It is derived rather than stored, so it needs no
+    persistence.
+    """
+    name = "\x00".join((steve_id, credential_id, request_id))
+    return f"act-{uuid5(_ACTION_ID_NAMESPACE, name)}"
+
+
+_ACTION_ID_NAMESPACE = UUID("6f0d3c1e-6a0b-5c5e-9a8e-4a1d5f2b7c90")
 
 __all__ = ["ControllerService"]
