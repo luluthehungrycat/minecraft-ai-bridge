@@ -70,6 +70,10 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
 - Shutdown now completes renewal and safety-worker stops and Authz release/close
   before propagating repeated cancellation; blocking SQLite cleanup runs off the
   asyncio event loop.
+- Action security classification now fails closed. Only `chat`, `wait`,
+  and `done` are survival actions; an ActionType missing from every class is
+  rejected before policy instead of defaulting to survival, which an
+  ordinary controller session could use without `admin:world`.
 - The CLI exits with code 3 when it shut down after losing controller
   authority, instead of 0, so supervisors and scripts can tell it apart
   from a normal finish.

@@ -403,7 +403,10 @@ covered.
 At this boundary, backend command-simulated movement, world/inventory edits,
 combat, and simulated consumption/healing are classified as privileged and
 require `admin:world` under Authz; ordinary controller sessions cannot reach
-them by selecting a different ActionType. Local mode preserves existing CLI
+them by selecting a different ActionType. Classification is an explicit
+allowlist: `chat`, `wait`, and `done` are the only survival actions, and an
+ActionType missing from every class is rejected before policy evaluation
+instead of defaulting to survival. Local mode preserves existing CLI
 behavior. Safety reflexes use a distinct bounded capability described above.
 
 ### Independently scheduled preservation (safety prerequisite slice)
@@ -414,10 +417,13 @@ separate from the strategic LLM loop. If a mutating reflex arrives while the
 LLM is deciding, the orchestrator cancels and awaits that decision, then
 dispatches the reflex through the shared `ActionService`. A one-item pending
 slot bounds unconsumed result backlog; the supervisor continues observing and
-evaluating while that result is pending, retaining only the first result for
-the strategic loop. Goal decomposition is covered by the supervisor as well.
+evaluating while that result is pending. The slot holds the newest result,
+except that a later success never replaces an unconsumed failure. Goal
+decomposition is covered by the supervisor as well.
 Strategic WAIT actions are interruptible and do not hold
 the ActionService dispatch lock; other dispatch coroutines are serialized.
+A reflex therefore waits for any strategic action already dispatched to the
+backend to finish: a long `walk_to` delays reflex dispatch by its duration.
 When a safety reflex starts, the shared action service invalidates strategic
 requests that have not crossed the backend dispatch boundary; it re-enables
 them after the intervention is consumed. Cancellation can release that lock
