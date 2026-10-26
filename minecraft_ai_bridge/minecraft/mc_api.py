@@ -78,7 +78,7 @@ class McpqClient:
                 return
             except Exception as exc:
                 last_exc = exc
-                self._mc = None
+                await self._discard_client()
                 if attempt < retries:
                     wait = min(delay * (1.5 ** (attempt - 1)), 30.0)
                     logger.warning(
@@ -105,16 +105,21 @@ class McpqClient:
         that cleanup then deadlocks waiting on gRPC's own lock. Cleaning up
         here, in a worker thread, keeps it deterministic and off the loop.
         """
+        if await self._discard_client():
+            logger.info("Disconnected from MCPQ plugin")
+
+    async def _discard_client(self) -> bool:
+        """Clean up and forget the current mcpq client; False if there was none."""
         mc, self._mc = self._mc, None
         if mc is None:
-            return
+            return False
         try:
             # mcpq exposes no public close(); _cleanup is idempotent, so the
             # later __del__ call is a no-op.
             await asyncio.to_thread(mc._cleanup)
         except Exception:
-            logger.exception("MCPQ cleanup failed during disconnect")
-        logger.info("Disconnected from MCPQ plugin")
+            logger.exception("MCPQ cleanup failed")
+        return True
 
     # ── Thread-pool helper ────────────────────────────────────────────
 

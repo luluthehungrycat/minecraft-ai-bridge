@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import threading
 
+import pytest
+
 from minecraft_ai_bridge.minecraft.mc_api import McpqClient
 
 
@@ -39,4 +41,32 @@ async def test_disconnect_survives_cleanup_failure():
 
     await client.disconnect()
 
+    assert client._mc is None
+
+
+async def test_failed_connect_attempts_clean_up_their_client(monkeypatch):
+    from minecraft_ai_bridge.minecraft import mc_api
+
+    created: list[_FakeMinecraft] = []
+
+    class Unverifiable(_FakeMinecraft):
+        def __init__(self, **_kwargs) -> None:
+            super().__init__()
+            created.append(self)
+
+        def getMinecraftVersion(self) -> str:  # noqa: N802 - mirrors the mcpq API
+            raise RuntimeError("plugin not ready")
+
+    async def no_wait(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(mc_api, "Minecraft", Unverifiable)
+    monkeypatch.setattr(mc_api.asyncio, "sleep", no_wait)
+    client = McpqClient(host="localhost", port=1789, player_name="AIBot")
+
+    with pytest.raises(ConnectionError):
+        await client.connect(retries=3)
+
+    assert len(created) == 3
+    assert [fake.cleanups for fake in created] == [1, 1, 1]
     assert client._mc is None
