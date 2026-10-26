@@ -127,6 +127,12 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
 
 ### Added
 
+- Added `runtime.SqliteActionOutcomeStore` for durable request-ID
+  idempotency. Pass it to `ActionService` or `ControllerService` as
+  `outcome_store=`; a retry after a bridge restart replays the stored outcome,
+  and a dispatch interrupted by a crash is reported as unknown instead of
+  running again (#23).
+
 - Added `runtime.ControllerService`, a transport-independent controller API
   for one Steve (RFC-0001 Phase B slice). It opens exclusive Authz controller
   sessions, serves capabilities and state to observers, and runs

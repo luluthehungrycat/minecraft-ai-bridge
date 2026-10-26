@@ -14,6 +14,7 @@ import copy
 import hashlib
 import json
 import logging
+import sqlite3
 from collections import OrderedDict, deque
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
@@ -21,7 +22,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from inspect import isawaitable
 from math import isfinite
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from ..minecraft.actions import (
@@ -34,6 +35,9 @@ from ..minecraft.actions import (
     safety_interrupt_scope,
 )
 from ..minecraft.world_types import WorldAdapter
+
+if TYPE_CHECKING:
+    from .action_outcomes import SqliteActionOutcomeStore
 
 logger = logging.getLogger(__name__)
 
@@ -322,8 +326,12 @@ class ActionService:
         max_terminal_records: int = 1024,
         internal_authority: object | None = None,
         safety_authority: object | None = None,
+        outcome_store: SqliteActionOutcomeStore | None = None,
     ) -> None:
         self._world = world
+        # Optional durable request-ID outcomes; without it idempotency is
+        # process-local and bounded by max_terminal_records.
+        self._outcome_store = outcome_store
         self._policy = policy or _allow_all
         self._default_identity_scope = ("service", str(uuid4()))
         self._internal_authority = (
@@ -434,6 +442,25 @@ class ActionService:
         assert decision is not None
         identity_scope = decision.identity_scope or self._default_identity_scope
 
+        if (
+            self._outcome_store is not None
+            and request_id not in self._inflight
+            and request_id not in self._terminal
+        ):
+            # Hydrate the in-memory cache from durable storage; the checks
+            # below then replay, refuse, or conflict exactly as in memory.
+            stored = await asyncio.to_thread(self._outcome_store.load, request_id)
+            if (
+                stored is not None
+                and request_id not in self._inflight
+                and request_id not in self._terminal
+            ):
+                self._terminal[request_id] = _TerminalEntry(
+                    fingerprint=stored.fingerprint,
+                    identity_scope=stored.identity_scope,
+                    outcome=stored.outcome,
+                )
+
         entry = self._inflight.get(request_id)
         if entry is not None:
             if entry.identity_scope != identity_scope:
@@ -456,6 +483,30 @@ class ActionService:
             identity_scope=identity_scope,
             future=future,
         )
+
+        if self._outcome_store is not None:
+            try:
+                await asyncio.to_thread(
+                    self._outcome_store.claim, request_id, action, fingerprint, identity_scope
+                )
+            except sqlite3.Error:
+                logger.exception("Could not persist request_id %s; not dispatching", request_id)
+                refused = ActionOutcome(
+                    result=ActionResult(
+                        success=False,
+                        action=action,
+                        message="Request could not be recorded durably; not dispatched.",
+                        data={"correlation_id": request.correlation_id},
+                    ),
+                    status="failed",
+                    allowed=False,
+                )
+                # Not persisted, so a retry may dispatch; drop the claim
+                # rather than caching a failure for this request_id.
+                self._inflight.pop(request_id, None)
+                if not future.done():
+                    future.set_result(refused)
+                return refused.result
 
         try:
             if action is ActionType.WAIT:
@@ -733,6 +784,13 @@ class ActionService:
         )
         if not entry.future.done():
             entry.future.set_result(stored)
+        if self._outcome_store is not None:
+            try:
+                self._outcome_store.complete(request_id, stored)
+            except sqlite3.Error:
+                # The dispatching marker stays, so a retry after restart sees
+                # an unknown outcome rather than re-dispatching.
+                logger.exception("Could not persist outcome for request_id %s", request_id)
         self._store_terminal(
             request_id,
             entry.fingerprint,

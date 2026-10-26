@@ -263,8 +263,9 @@ requests into its calls. It composes the pieces above:
   authorization, request-ID idempotency scoping, and audit match the CLI.
   Only actions on an explicit allowlist are exposed, so a new ActionType is
   unreachable until added; internal-control and lifecycle actions never are.
-  Request-ID replay protection is process-local and bounded, like the
-  ActionService it uses: a retry after a bridge restart can repeat a mutation.
+  Request-ID replay protection survives restarts when the service is given a
+  `SqliteActionOutcomeStore` (`outcome_store=`); without one it is
+  process-local, and a retry after a bridge restart can repeat a mutation.
 - The service re-validates every `ActionRequestSchema` it receives, because
   Pydantic skips validation in `model_construct()` and
   `model_copy(update=...)`; malformed requests raise `ValueError` before
@@ -510,7 +511,14 @@ read-only commands.
 `ActionService.execute` accepts an optional `request_id`. Calls that omit it
 behave exactly as before. With an explicit `request_id` the service keeps a
 process-local, bounded terminal registry (plus separate in-flight entries,
-which are never evicted):
+which are never evicted). An optional `SqliteActionOutcomeStore` makes it
+durable: the request is marked `dispatching` before it can reach the backend
+and completed afterwards. After a restart a stored outcome replays, and a
+marker left by a crash loads as `unknown`, so the request ID never dispatches
+again. Records keep their identity scope, so a retry from a new controller
+session is refused rather than replayed. If the marker cannot be written the
+request is refused without dispatching. Retention is bounded by record count
+and age (defaults 10,000 and 7 days).
 
 - An identical action+params payload replays the stored terminal result
   instead of dispatching again. Replayed results are copies flagged with

@@ -36,6 +36,7 @@ from pydantic import ValidationError
 from ..minecraft.actions import ActionType
 from ..minecraft.observer import Observer
 from ..minecraft.world_types import WorldAdapter
+from .action_outcomes import SqliteActionOutcomeStore
 from .action_service import (
     ActionClass,
     ActionRequest,
@@ -115,6 +116,7 @@ class ControllerService:
         world_admin_token: str | None = None,
         session_lease_seconds: float = 300,
         safety_authority: object | None = None,
+        outcome_store: SqliteActionOutcomeStore | None = None,
     ) -> None:
         if session_lease_seconds <= 0:
             raise ValueError("controller session lease must be positive")
@@ -138,6 +140,7 @@ class ControllerService:
             world,
             policy=self._policy,
             safety_authority=safety_authority,
+            outcome_store=outcome_store,
         )
         self._observer = Observer(world)
 

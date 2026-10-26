@@ -7,6 +7,7 @@ controller API. There is no transport/MCP wiring, task persistence, or
 backend watchdog safety yet.
 """
 
+from .action_outcomes import SqliteActionOutcomeStore, StoredActionOutcome
 from .action_service import (
     ActionAuditRecord,
     ActionClass,
@@ -59,6 +60,8 @@ from .world_adapter import McpqWorldAdapter, WorldAdapter
 
 __all__ = [
     "ActionAuditRecord",
+    "SqliteActionOutcomeStore",
+    "StoredActionOutcome",
     "ControllerService",
     "ActionClass",
     "ActionOutcome",
