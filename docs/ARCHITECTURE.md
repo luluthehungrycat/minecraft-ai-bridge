@@ -527,7 +527,10 @@ terminal:
   it is persisted before any backend call can start. A reservation whose
   owner crashed while waiting for the lock can be taken over after
   `reservation_timeout_seconds` (default 300); the old owner's
-  compare-and-set then fails and it does not dispatch.
+  compare-and-set then fails and it does not dispatch, and it can no longer
+  record an outcome for the row. Takeover and `begin_dispatch` are each
+  atomic in SQLite, so when they race exactly one owner reaches
+  `dispatching`. A `dispatching` row is never taken over.
 - `complete` records the terminal outcome off the event loop in a tracked
   task. The caller's result is returned only after the write; cancellation
   does not abandon it, and `ActionService.flush()` /

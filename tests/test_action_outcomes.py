@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from minecraft_ai_bridge.minecraft.actions import ActionType
+from minecraft_ai_bridge.minecraft.actions import ActionResult, ActionType
 from minecraft_ai_bridge.runtime import (
     ActionRequestSchema,
     ActionService,
@@ -457,3 +457,93 @@ async def test_controller_retry_after_restart_never_repeats_a_mutation(tmp_path,
     assert retry.status.value == "rejected"
     assert retry.action_id == first.action_id
     assert world.chat_messages_sent == ["once"]
+
+
+# ── Reservation takeover vs. a delayed original owner ────────────────
+
+
+def test_delayed_owner_cannot_dispatch_or_complete_after_takeover(path):
+    clock = Clock()
+    a = SqliteActionOutcomeStore(path, reservation_timeout_seconds=300, clock=clock)
+    b = SqliteActionOutcomeStore(path, reservation_timeout_seconds=300, clock=clock)
+    first = a.claim("r1", ActionType.CHAT, _fp("x"), SCOPE)
+
+    clock.advance(seconds=301)  # A is stalled past the reservation timeout
+    second = b.claim("r1", ActionType.CHAT, _fp("x"), SCOPE)
+
+    assert first.owner and second.owner and first.owner != second.owner
+    assert not a.begin_dispatch("r1", first.owner)  # A wakes up: fenced
+    assert b.begin_dispatch("r1", second.owner)
+    stale = ActionOutcome(
+        result=ActionResult(success=True, action=ActionType.CHAT), status="succeeded", allowed=True
+    )
+    assert not a.complete("r1", first.owner, stale)  # cannot overwrite B's row
+    # A dispatching row is never taken over, however old it gets.
+    clock.advance(days=30)
+    late = a.claim("r1", ActionType.CHAT, _fp("x"), SCOPE)
+    assert late.owner is None
+    a.close()
+    b.close()
+
+
+async def test_owner_stalled_behind_its_dispatch_lock_aborts_after_takeover(path, world):
+    clock = Clock()
+    a_store = SqliteActionOutcomeStore(path, reservation_timeout_seconds=300, clock=clock)
+    b_store = SqliteActionOutcomeStore(path, reservation_timeout_seconds=300, clock=clock)
+    a = _service(world, a_store)
+    b = _service(world, b_store)
+
+    # Hold A's dispatch lock so A's request reserves, then waits.
+    await a._dispatch_lock.acquire()
+    stalled = asyncio.create_task(_chat(a, "x"))
+    while a_store.load("r1") is None and "r1" not in a._durable_owners:
+        await asyncio.sleep(0)
+
+    clock.advance(seconds=301)
+    taken = await _chat(b, "x")  # B takes the stale reservation over
+    a._dispatch_lock.release()
+    aborted = await stalled
+    a_store.close()
+    b_store.close()
+
+    assert taken.success
+    assert not aborted.success and "reservation was lost" in aborted.message
+    assert world.chat_messages_sent == ["x"]
+
+
+def _race_takeover(
+    a: SqliteActionOutcomeStore, b: SqliteActionOutcomeStore, request_id: str, owner: str
+) -> dict[str, bool]:
+    """Run A's begin_dispatch and B's takeover at the same moment."""
+    barrier = threading.Barrier(2)
+    outcome: dict[str, bool] = {}
+
+    def original_owner() -> None:
+        barrier.wait()
+        outcome["a"] = a.begin_dispatch(request_id, owner)
+
+    def takeover() -> None:
+        barrier.wait()
+        taken = b.claim(request_id, ActionType.CHAT, _fp("x"), SCOPE)
+        outcome["b"] = taken.owner is not None and b.begin_dispatch(request_id, taken.owner)
+
+    threads = [threading.Thread(target=original_owner), threading.Thread(target=takeover)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    return outcome
+
+
+def test_begin_dispatch_and_takeover_race_has_exactly_one_winner(path):
+    clock = Clock()
+    a = SqliteActionOutcomeStore(path, reservation_timeout_seconds=300, clock=clock)
+    b = SqliteActionOutcomeStore(path, reservation_timeout_seconds=300, clock=clock)
+    for i in range(300):
+        claim = a.claim(f"r{i}", ActionType.CHAT, _fp("x"), SCOPE)
+        assert claim.owner is not None
+        clock.advance(seconds=301)  # the reservation is now stale
+        outcome = _race_takeover(a, b, f"r{i}", claim.owner)
+        assert outcome["a"] != outcome["b"], (i, outcome)  # exactly one dispatches
+    a.close()
+    b.close()
