@@ -37,7 +37,7 @@ from ..minecraft.actions import (
 from ..minecraft.world_types import WorldAdapter
 
 if TYPE_CHECKING:
-    from .action_outcomes import SqliteActionOutcomeStore
+    from .action_outcomes import SqliteActionOutcomeStore, StoredActionOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -332,6 +332,8 @@ class ActionService:
         # Optional durable request-ID outcomes; without it idempotency is
         # process-local and bounded by max_terminal_records.
         self._outcome_store = outcome_store
+        self._durable_owners: dict[str, str] = {}
+        self._persistence: dict[str, asyncio.Task[None]] = {}
         self._policy = policy or _allow_all
         self._default_identity_scope = ("service", str(uuid4()))
         self._internal_authority = (
@@ -442,25 +444,6 @@ class ActionService:
         assert decision is not None
         identity_scope = decision.identity_scope or self._default_identity_scope
 
-        if (
-            self._outcome_store is not None
-            and request_id not in self._inflight
-            and request_id not in self._terminal
-        ):
-            # Hydrate the in-memory cache from durable storage; the checks
-            # below then replay, refuse, or conflict exactly as in memory.
-            stored = await asyncio.to_thread(self._outcome_store.load, request_id)
-            if (
-                stored is not None
-                and request_id not in self._inflight
-                and request_id not in self._terminal
-            ):
-                self._terminal[request_id] = _TerminalEntry(
-                    fingerprint=stored.fingerprint,
-                    identity_scope=stored.identity_scope,
-                    outcome=stored.outcome,
-                )
-
         entry = self._inflight.get(request_id)
         if entry is not None:
             if entry.identity_scope != identity_scope:
@@ -484,29 +467,47 @@ class ActionService:
             future=future,
         )
 
+        durable_owner: str | None = None
         if self._outcome_store is not None:
+            refusal: str | None = None
             try:
-                await asyncio.to_thread(
+                claim = await asyncio.to_thread(
                     self._outcome_store.claim, request_id, action, fingerprint, identity_scope
                 )
             except sqlite3.Error:
                 logger.exception("Could not persist request_id %s; not dispatching", request_id)
+                refusal = "Request could not be recorded durably; not dispatched."
+            else:
+                if claim.in_progress:
+                    refusal = (
+                        "This request_id is reserved or dispatching elsewhere; not "
+                        "dispatched. Retry later to read its outcome."
+                    )
+                elif claim.existing is not None:
+                    return self._replay_durable(
+                        claim.existing, request, fingerprint, request_id, identity_scope, future
+                    )
+                else:
+                    durable_owner = claim.owner
+            if refusal is not None:
                 refused = ActionOutcome(
                     result=ActionResult(
                         success=False,
                         action=action,
-                        message="Request could not be recorded durably; not dispatched.",
+                        message=refusal,
                         data={"correlation_id": request.correlation_id},
                     ),
                     status="failed",
                     allowed=False,
                 )
-                # Not persisted, so a retry may dispatch; drop the claim
-                # rather than caching a failure for this request_id.
+                # Nothing was dispatched and the outcome may still change, so
+                # drop the in-memory claim instead of caching this refusal.
                 self._inflight.pop(request_id, None)
                 if not future.done():
                     future.set_result(refused)
                 return refused.result
+            assert durable_owner is not None
+            self._durable_owners[request_id] = durable_owner
 
         try:
             if action is ActionType.WAIT:
@@ -515,6 +516,7 @@ class ActionService:
                     request_id=request_id,
                     preemptible=preemptible,
                     expected_identity_scope=identity_scope,
+                    durable_owner=durable_owner,
                 )
             else:
                 async with self._dispatch_lock:
@@ -523,6 +525,7 @@ class ActionService:
                         request_id=request_id,
                         preemptible=preemptible,
                         expected_identity_scope=identity_scope,
+                        durable_owner=durable_owner,
                     )
         except asyncio.CancelledError:
             if request_id not in self._dispatch_started:
@@ -616,6 +619,7 @@ class ActionService:
             raise
         outcome.result.data["request_id"] = request_id
         self._finish_inflight(request_id, outcome)
+        await self._await_persistence(request_id)
         return outcome.result
 
     @property
@@ -763,6 +767,75 @@ class ActionService:
             data=copy.deepcopy(result.data),
         )
 
+    def _replay_durable(
+        self,
+        stored: StoredActionOutcome,
+        request: ActionRequest,
+        fingerprint: str,
+        request_id: str,
+        identity_scope: tuple[str, ...],
+        future: asyncio.Future[ActionOutcome],
+    ) -> ActionResult:
+        """Replay or refuse against a durable record found while claiming."""
+        self._inflight.pop(request_id, None)
+        terminal = _TerminalEntry(
+            fingerprint=stored.fingerprint,
+            identity_scope=stored.identity_scope,
+            outcome=stored.outcome,
+        )
+        self._terminal[request_id] = terminal
+        if stored.identity_scope != identity_scope:
+            result = self._identity_conflict_result(request, request_id, in_flight=False)
+            shared = ActionOutcome(self._snapshot_result(result), "rejected", allowed=False)
+        elif stored.fingerprint != fingerprint:
+            result = self._conflict_result(request, request_id, in_flight=False)
+            shared = ActionOutcome(self._snapshot_result(result), "rejected", allowed=False)
+        else:
+            result = self._replay_terminal(terminal, request, fingerprint, request_id)
+            shared = stored.outcome
+        # Coalesced waiters share this request's identity and fingerprint.
+        if not future.done():
+            future.set_result(shared)
+        return result
+
+    def _schedule_persistence(self, request_id: str, owner: str, outcome: ActionOutcome) -> None:
+        """Persist a terminal outcome off the event loop in a tracked task.
+
+        Terminal paths include cancellation handlers that cannot await, so the
+        write runs in a task kept in ``_persistence`` until done. The leader
+        awaits it before returning; ``flush()`` awaits any that remain. If the
+        write fails, the row stays ``dispatching`` and later reads report an
+        unknown outcome, so a failure never permits a re-dispatch.
+        """
+        store = self._outcome_store
+        assert store is not None
+
+        async def persist() -> None:
+            try:
+                if not await asyncio.to_thread(store.complete, request_id, owner, outcome):
+                    logger.warning("Outcome for request_id %s no longer owned", request_id)
+            except sqlite3.Error:
+                logger.exception("Could not persist outcome for request_id %s", request_id)
+
+        task = asyncio.get_running_loop().create_task(persist())
+        self._persistence[request_id] = task
+        task.add_done_callback(lambda done: self._forget_persistence(request_id, done))
+
+    def _forget_persistence(self, request_id: str, task: asyncio.Task[None]) -> None:
+        if self._persistence.get(request_id) is task:
+            del self._persistence[request_id]
+
+    async def _await_persistence(self, request_id: str) -> None:
+        task = self._persistence.get(request_id)
+        if task is not None:
+            # Shield: cancelling the caller must not abandon the write.
+            await asyncio.shield(task)
+
+    async def flush(self) -> None:
+        """Wait for every pending durable outcome write, e.g. at shutdown."""
+        while self._persistence:
+            await asyncio.gather(*list(self._persistence.values()), return_exceptions=True)
+
     def _finish_inflight(self, request_id: str, outcome: ActionOutcome) -> None:
         """Resolve the in-flight entry and move its outcome to the terminal store."""
 
@@ -784,13 +857,9 @@ class ActionService:
         )
         if not entry.future.done():
             entry.future.set_result(stored)
-        if self._outcome_store is not None:
-            try:
-                self._outcome_store.complete(request_id, stored)
-            except sqlite3.Error:
-                # The dispatching marker stays, so a retry after restart sees
-                # an unknown outcome rather than re-dispatching.
-                logger.exception("Could not persist outcome for request_id %s", request_id)
+        owner = self._durable_owners.pop(request_id, None)
+        if owner is not None:
+            self._schedule_persistence(request_id, owner, stored)
         self._store_terminal(
             request_id,
             entry.fingerprint,
@@ -832,8 +901,30 @@ class ActionService:
         request_id: str | None,
         preemptible: bool,
         expected_identity_scope: tuple[str, ...] | None = None,
+        durable_owner: str | None = None,
     ) -> ActionOutcome:
         """Run policy evaluation, dispatch an allowed action, and audit it."""
+
+        if durable_owner is not None and request_id is not None:
+            # Persist reserved -> dispatching before anything else can lead to
+            # a backend call. It runs here, under the dispatch lock and before
+            # policy, so the policy check stays adjacent to the dispatch. A
+            # crash after this point reads as an unknown outcome.
+            assert self._outcome_store is not None
+            try:
+                started = await asyncio.to_thread(
+                    self._outcome_store.begin_dispatch, request_id, durable_owner
+                )
+            except sqlite3.Error:
+                logger.exception("Could not record dispatch start for %s", request_id)
+                started = False
+            if not started:
+                return self._rejection_outcome(
+                    request,
+                    request_id,
+                    "The request_id reservation was lost or could not be recorded; not dispatched.",
+                    status="failed",
+                )
 
         decision, denied = await self._evaluate_policy(request, request_id=request_id)
         if denied is not None:
