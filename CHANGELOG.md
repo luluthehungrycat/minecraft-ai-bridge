@@ -27,6 +27,10 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
 
 ### Fixed
 
+- `McpqClient.disconnect` now shuts down the MCPQ client explicitly. It
+  previously only dropped the reference, leaving cleanup to garbage
+  collection, which could run inside another thread's gRPC call and deadlock
+  the bridge (reproduced as a hang in the integration suite).
 - Safety reflexes no longer wait for a long strategic movement to finish.
   `walk_to`, `move_forward`, `move_back`, and `sprint` stop between steps once
   a reflex is waiting and report `interrupted` (#22).
