@@ -31,6 +31,7 @@ from ..minecraft.actions import (
     _is_food,
     _should_attack,
     execute_action,
+    safety_interrupt_scope,
 )
 from ..minecraft.world_types import WorldAdapter
 
@@ -578,6 +579,9 @@ class ActionService:
 
         return self._world
 
+    def _safety_intervention_pending(self) -> bool:
+        return self._preemption_generation != self._acknowledged_preemption_generation
+
     def acknowledge_safety_intervention(self) -> None:
         """Allow new strategic actions after the pending reflex is consumed."""
         self._acknowledged_preemption_generation = self._preemption_generation
@@ -812,7 +816,13 @@ class ActionService:
             # after it is treated as an interrupted dispatch with unknown
             # outcome.
             self._dispatch_started.add(request_id)
-        result = await execute_action(self._world, request.action, dict(request.params))
+        if preemptible and self._safety_preemption_enabled:
+            # Multi-step handlers stop between steps once a reflex is waiting
+            # for the dispatch lock, so a long walk cannot delay it.
+            with safety_interrupt_scope(self._safety_intervention_pending):
+                result = await execute_action(self._world, request.action, dict(request.params))
+        else:
+            result = await execute_action(self._world, request.action, dict(request.params))
         self._record(
             request,
             allowed=True,

@@ -27,6 +27,9 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
 
 ### Fixed
 
+- Safety reflexes no longer wait for a long strategic movement to finish.
+  `walk_to`, `move_forward`, `move_back`, and `sprint` stop between steps once
+  a reflex is waiting and report `interrupted` (#22).
 - Fixed the 12 mypy errors in `llm/client.py`, `rcon.py`, and
   `goal_manager.py`, and made mypy a required CI step (#2). Goal
   decomposition now returns an empty list when a provider's JSON holds a

@@ -442,8 +442,10 @@ except that a later success never replaces an unconsumed failure. Goal
 decomposition is covered by the supervisor as well.
 Strategic WAIT actions are interruptible and do not hold
 the ActionService dispatch lock; other dispatch coroutines are serialized.
-A reflex therefore waits for any strategic action already dispatched to the
-backend to finish: a long `walk_to` delays reflex dispatch by its duration.
+Multi-step strategic actions (`walk_to`, `move_forward`, `move_back`,
+`sprint`) check between steps whether a reflex is waiting for that lock and
+stop with an `interrupted` result, so a reflex waits at most one step plus any
+MCPQ call already in flight. Single-step actions still run to completion.
 When a safety reflex starts, the shared action service invalidates strategic
 requests that have not crossed the backend dispatch boundary; it re-enables
 them after the intervention is consumed. Cancellation can release that lock

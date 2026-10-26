@@ -10,7 +10,8 @@ import contextlib
 import logging
 import math
 import re
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Iterator
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
@@ -500,6 +501,9 @@ async def _walk_toward(
         for wx, wz in waypoints:
             if steps_taken >= max_steps:
                 break
+            if _safety_interrupted():
+                failed_at = _INTERRUPTED_MESSAGE
+                break
             # Face the waypoint
             await mc.run_as_player(f"execute as @p at @s facing {wx} {py} {wz} run tp @s ~ ~ ~")
             # Step forward
@@ -540,6 +544,9 @@ async def _walk_toward(
     steps_taken = 0
     failed_at = ""
     for step_n in range(min(max_steps, int(distance / step_size) + 1)):
+        if _safety_interrupted():
+            failed_at = _INTERRUPTED_MESSAGE
+            break
         # Face the target
         await mc.run_as_player(
             f"execute as @p at @s facing {target_x} {py} {target_z} run tp @s ~ ~ ~"
@@ -659,6 +666,38 @@ def _command_failed(response: str) -> bool:
     return any(marker in normalized for marker in _COMMAND_FAILURE_MARKERS)
 
 
+# Set by ActionService while a preemptible strategic action runs; returns
+# True once a safety reflex is waiting for the dispatch lock.
+_SAFETY_INTERRUPT: ContextVar[Callable[[], bool] | None] = ContextVar(
+    "safety_interrupt", default=None
+)
+_INTERRUPTED_MESSAGE = "interrupted by safety intervention"
+
+
+@contextlib.contextmanager
+def safety_interrupt_scope(check: Callable[[], bool]) -> Iterator[None]:
+    """Let multi-step handlers stop between steps when ``check()`` is True."""
+    token = _SAFETY_INTERRUPT.set(check)
+    try:
+        yield
+    finally:
+        _SAFETY_INTERRUPT.reset(token)
+
+
+def _safety_interrupted() -> bool:
+    check = _SAFETY_INTERRUPT.get()
+    return check is not None and check()
+
+
+def _interrupted_result(action: ActionType, steps_taken: int) -> ActionResult:
+    return ActionResult(
+        success=False,
+        action=action,
+        message=f"Stopped after {steps_taken} steps: {_INTERRUPTED_MESSAGE}",
+        data={"steps_taken": steps_taken, "interrupted": True},
+    )
+
+
 _PLAYER_TARGET_RE = re.compile(r"^[A-Za-z0-9_]{1,16}$")
 
 
@@ -747,6 +786,8 @@ async def _move_forward(mc: WorldAdapter, params: dict) -> ActionResult:
     actual_steps = 0
 
     for _ in range(min(steps, 20)):
+        if _safety_interrupted():
+            return _interrupted_result(ActionType.MOVE_FORWARD, actual_steps)
         # Check where we'd be moving
         pos = await mc.get_player_pos()
         if pos is None:
@@ -819,6 +860,8 @@ async def _move_back(mc: WorldAdapter, params: dict) -> ActionResult:
     actual_steps = 0
 
     for _ in range(min(steps, 20)):
+        if _safety_interrupted():
+            return _interrupted_result(ActionType.MOVE_BACK, actual_steps)
         pos = await mc.get_player_pos()
         if pos is None:
             break
@@ -876,6 +919,8 @@ async def _sprint(mc: WorldAdapter, params: dict) -> ActionResult:
     actual_steps = 0
 
     for _ in range(min(steps, 30)):
+        if _safety_interrupted():
+            return _interrupted_result(ActionType.SPRINT, actual_steps)
         pos = await mc.get_player_pos()
         if pos is None:
             break
@@ -967,13 +1012,14 @@ async def _walk_to(mc: WorldAdapter, params: dict) -> ActionResult:
         )
 
     result = await _walk_toward(mc, float(x), float(z))
+    interrupted = _INTERRUPTED_MESSAGE in result
     new_pos = await mc.get_player_pos()
     new_dx = float(x) - (new_pos[0] if new_pos else pos[0])
     new_dz = float(z) - (new_pos[2] if new_pos else pos[2])
     remaining = (new_dx * new_dx + new_dz * new_dz) ** 0.5
 
     return ActionResult(
-        success=(remaining < 3),  # within 3 blocks = close enough
+        success=(remaining < 3 and not interrupted),  # within 3 blocks = close enough
         action=ActionType.WALK_TO,
         message=result,
         data={
@@ -981,6 +1027,7 @@ async def _walk_to(mc: WorldAdapter, params: dict) -> ActionResult:
             "z": z,
             "distance": distance,
             "remaining": remaining,
+            "interrupted": interrupted,
         },
     )
 

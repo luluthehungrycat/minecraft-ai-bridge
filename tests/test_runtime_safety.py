@@ -613,3 +613,62 @@ async def test_safety_polling_does_not_write_observations_to_memory(
     assert ticks == 30
     assert [entry.raw for entry in orch._memory._short_term][-1].startswith("Action: scan")
     assert len(orch._memory._short_term) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "params"),
+    [
+        (ActionType.MOVE_FORWARD, {"steps": 5}),
+        (ActionType.MOVE_BACK, {"steps": 5}),
+        (ActionType.SPRINT, {"steps": 5}),
+        (ActionType.WALK_TO, {"x": 40, "z": 0}),
+    ],
+)
+async def test_multi_step_actions_stop_when_a_reflex_is_waiting(
+    mock_mc: MockMcpqClient, action, params
+) -> None:
+    from minecraft_ai_bridge.minecraft.actions import execute_action, safety_interrupt_scope
+
+    mock_mc.set_position(0, 64, 0)
+    with safety_interrupt_scope(lambda: True):
+        result = await execute_action(mock_mc, action, params)
+
+    assert not result.success
+    assert result.data.get("interrupted") is True
+    assert not any("^ ^ ^" in command for command in mock_mc.commands_ran)
+
+
+@pytest.mark.asyncio
+async def test_reflex_is_not_delayed_by_a_long_strategic_walk(
+    mock_mc: MockMcpqClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reflex queued behind a running move_forward runs after one step, not 20."""
+    mock_mc.set_position(0, 64, 0)
+    original_pos = mock_mc.get_player_pos
+    steps_seen = 0
+
+    async def slow_pos():
+        nonlocal steps_seen
+        steps_seen += 1
+        await asyncio.sleep(0.01)
+        return await original_pos()
+
+    monkeypatch.setattr(mock_mc, "get_player_pos", slow_pos)
+    service = ActionService(McpqWorldAdapter(mock_mc))
+    service.enable_safety_preemption()
+
+    walk = asyncio.create_task(
+        service.execute(ActionType.MOVE_FORWARD, {"steps": 20}, preemptible=True)
+    )
+    while steps_seen < 3:
+        await asyncio.sleep(0.005)
+    reflex = await asyncio.wait_for(
+        service.execute(ActionType.CHAT, {"message": "reflex"}, preemptive=True), timeout=1
+    )
+    walked = await walk
+
+    assert reflex.success
+    assert walked.data.get("interrupted") is True
+    assert walked.data["steps_taken"] < 10
+    assert mock_mc.chat_messages_sent == ["reflex"]
