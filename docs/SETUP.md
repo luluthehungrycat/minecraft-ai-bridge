@@ -94,6 +94,37 @@ Set the default goal in `docker-compose.yml` or `.env`:
 echo 'GOAL="Build a cobblestone bridge over the river"' >> .env
 ```
 
+### Rootless Podman
+
+The `minecraft` service also runs under rootless Podman. Two differences
+from Docker:
+
+- Build the bot plugin in a Java 25 container if the host JDK is older:
+
+  ```bash
+  podman run --rm -v "$PWD/bot-plugin:/src:Z" -w /src \
+    docker.io/library/eclipse-temurin:25-jdk ./gradlew clean build --no-daemon
+  cp bot-plugin/build/libs/mc-bot-plugin-1.0.0.jar mcpq-plugins/
+  ```
+
+- Start the server with the `compose.podman.yml` override:
+
+  ```bash
+  MC_BIND_ADDRESS=127.0.0.1 \
+    podman-compose -f docker-compose.yml -f compose.podman.yml up -d minecraft
+  ```
+
+  The override runs the server as container root (`UID=0`/`GID=0`); the image
+  otherwise drops to UID 1000, which cannot write the `/data/plugins`
+  directory created by the MCPQ config bind mount. Under rootless Podman,
+  container root maps to your own host user. It also adds `:Z` to bind
+  mounts for SELinux hosts.
+
+`MC_BIND_ADDRESS` (default `0.0.0.0`) sets the host address for all
+published ports, with Docker or Podman. Set it to `127.0.0.1` for local
+testing: RCON uses the example password. Overrides cannot replace port
+bindings, so it is a variable rather than part of `compose.podman.yml`.
+
 ## Method 2: Local Installation
 
 For development or connecting to an existing Paper server.
@@ -206,6 +237,16 @@ online-mode=false          # Disable auth for local testing
 spawn-protection=0         # Allow block breaking at spawn
 difficulty=easy
 ```
+
+The default Compose configuration also uses offline mode. Protected Minecraft
+chat controls stay disabled in that mode because names are forgeable. To use
+the documented single-player name allowlist securely, run the server in online
+mode and set `ONLINE_MODE=true` plus `CHAT_CONTROL_ALLOWED_NAMES='["YourAccount"]'`
+in the bridge environment; Compose passes the same mode to Paper and the
+bridge's `CHAT_CONTROL_SERVER_ONLINE_MODE` check. The bridge cannot verify
+online mode on a separately managed server, so set
+`chat_control.server_online_mode: true` only when that server is configured
+with `online-mode=true`.
 
 ### 5. Start Server
 

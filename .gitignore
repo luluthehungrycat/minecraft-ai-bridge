@@ -33,3 +33,6 @@ config.local.yaml
 # Java / Gradle build artifacts
 bot-plugin/target/
 bot-plugin/.gradle/
+
+# Runtime state (SQLite authz, event journal, memory)
+data/

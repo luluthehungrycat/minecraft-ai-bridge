@@ -24,6 +24,10 @@ from . import __version__
 from .bridge.orchestrator import Orchestrator
 from .config import AppConfig
 
+# Exit code when the run ended in safety-only operation after the Authz
+# controller session expired, was revoked, or was fenced. 2 is argparse's.
+EXIT_AUTHORITY_LOST = 3
+
 
 def _setup_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.INFO
@@ -126,6 +130,9 @@ async def _async_main(args: argparse.Namespace) -> int:
     try:
         orch = Orchestrator(config)
         await orch.run(args.goal)
+        if orch.strategic_authority_lost:
+            logging.error("Shut down after losing controller authority.")
+            return EXIT_AUTHORITY_LOST
     except KeyboardInterrupt:
         print("\nInterrupted by user.")
         return 130

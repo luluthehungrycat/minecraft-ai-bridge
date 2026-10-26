@@ -196,13 +196,75 @@ Built-in fallback decomposition plans in `goal_manager.py`:
 
 ### Chat Commands
 
+Control commands (`!goal`, `!stop`, `!goto`, `!follow`, `!come`) are denied
+unless the MCPQ chat event's player metadata matches `chat_control.allowed_uuids`
+or `chat_control.allowed_names`. A supplied UUID is authoritative: if it is
+not allowlisted, a matching name cannot override it. The current MCPQ
+ChatEvent exposes a player name but no UUID. Protected commands are denied
+unless `chat_control.server_online_mode` is explicitly true, because the
+bridge cannot verify Paper's authentication mode through MCPQ. For a
+single-player server, set Paper `online-mode=true` and configure the exact
+authenticated account name:
+
+```yaml
+chat_control:
+  server_online_mode: true
+  allowed_names:
+    - YourAccount
+```
+
+Names are an explicit fallback and are trustworthy only when the server
+authenticates online-mode identities. The mode assertion and both allowlists
+default to deny; the bridge does not independently verify a remote server's
+`online-mode` setting. Docker Compose derives `CHAT_CONTROL_SERVER_ONLINE_MODE`
+and Paper's `ONLINE_MODE` from the same `ONLINE_MODE` variable (default
+`false`), so offline-mode deployment rejects all protected commands. `!status`
+and `!help` are public read-only commands. Formatted chat markup and sender
+strings supplied to direct dispatch never grant authority.
+
 The `chat_commands.py` parser intercepts incoming Minecraft chat messages for live agent control without restarting:
 
 | Command | Purpose |
 |---------|---------|
 | `!stop` | Gracefully shuts down the agent after the current action |
 | `!status` | Agent broadcasts goal progress and last action summary to chat |
-| `!follow` | Sets follow-player mode for coordinated building |
+| `!follow` | Sets follow-player mode for coordinated building; each turn teleports within ~4 blocks of the target via the policy-gated `follow_teleport` action |
+| `!goto <player>` | Teleports the agent to the named player via the policy-gated internal `goto_teleport` action |
+| `!come` | Teleports the speaker to the agent via the policy-gated internal `come_teleport` action |
+
+Startup provisioning (the `/botsummon` bot summon and the safe-spawn
+platform preparation) is also routed through the action gate as the internal
+`provision_bot` and `prepare_safe_spawn` actions, which are hidden from the
+LLM action space; the bot player name is validated as a strict Minecraft
+username before command interpolation.
+
+The built-in chat handler routes `!goto` and `!come` through the
+orchestrator's shared ActionService as the internal `goto_teleport` and
+`come_teleport` actions, which are also hidden from the LLM action space
+(the orchestrator rejects them if a model names them). The `!goto` target
+and the `!come` sender are untrusted chat-derived strings: both are
+validated with the same strict Minecraft username validator used by
+follow-mode teleports and provisioning before they are interpolated into
+teleport commands. ActionService and the dispatcher report failures as
+failed results rather than raising, so the handler sends the failure
+message to the chat explicitly. A handler constructed directly without an
+orchestrator ActionService (test/direct harness construction) defaults to
+a local ActionService bound to its MCPQ client, so the mutation still
+crosses the policy/audit gate; there is no raw command bypass. A harness
+exposing only an ActionService (with no adapter and no raw client)
+resolves the world from that service, so polling, status, and chat replies
+still work. Protected commands are separately authorized against the MCPQ
+event's player metadata using the explicit chat-control allowlist and online-
+mode requirement described above; this gate is independent of the
+orchestrator's controller session and the ActionService policy.
+
+The self-preservation layer (see below) routes its mutating reflexes —
+reflex ATTACK, auto EAT, and auto HEAL — through the same shared
+ActionService instance as LLM-selected actions, so policy and audit see
+them. Its SCAN_ENTITIES and damage-source checks are observations and stay
+direct. The boundary is routing only: a directly constructed layer without
+an ActionService still dispatches directly, so this is not complete
+mutation mediation or independent safety enforcement.
 
 The parser regex `_COMMAND_RE = r"<([^>]+)>\s+((?:/[!\u00a7]?|!)\w+)(.*)"` handles both `/!status` (with leading slash) and `!status` formats.
 

@@ -6,6 +6,8 @@ think-act-observe loop without needing a real Minecraft server.
 
 from __future__ import annotations
 
+import logging
+import os
 import re
 
 import pytest
@@ -13,6 +15,35 @@ import pytest
 from minecraft_ai_bridge.bridge.orchestrator import Orchestrator
 from minecraft_ai_bridge.config import AppConfig
 from minecraft_ai_bridge.llm.models import Role
+
+
+def _llm_api_errors(records: list[logging.LogRecord]) -> list[str]:
+    """Return LLM transport/API failures that the clients turned into WAITs."""
+    import openai
+
+    return [
+        record.getMessage()
+        for record in records
+        if record.name == "minecraft_ai_bridge.llm.client"
+        and any(isinstance(arg, openai.APIError) for arg in (record.args or ()))
+    ]
+
+
+@pytest.fixture(autouse=True)
+def fail_on_llm_api_errors(caplog: pytest.LogCaptureFixture):
+    """Fail instead of passing on fallback WAITs when the provider rejects calls.
+
+    The LLM clients log API errors and return a WAIT so the agent keeps
+    running. That is right in production but lets a dead key or exhausted
+    budget pass these tests. Malformed model output is not treated as an
+    error here; fallback decomposition covers it.
+    """
+    caplog.set_level(logging.WARNING, logger="minecraft_ai_bridge.llm.client")
+    yield
+    # caplog.records only holds the current (teardown) phase at this point.
+    errors = _llm_api_errors(caplog.get_records("setup") + caplog.get_records("call"))
+    if errors:
+        pytest.fail(f"LLM API call failed {len(errors)} time(s); first: {errors[0]}")
 
 
 async def _no_sleep(x: float) -> None:
@@ -99,10 +130,16 @@ def make_config(**overrides) -> AppConfig:
     cfg.bridge.memory_window = 20
     cfg.goals.default = overrides.get("goal", "Explore")
     cfg.goals.max_depth = 5
-    # Use OpenRouter with a model that supports tool calling
+    # Use an OpenAI-compatible router with a model that supports tool calling.
+    # OPENROUTER_API_KEY selects OpenRouter; otherwise REQUESTY_API_KEY selects
+    # Requesty. INTEGRATION_LLM_MODEL overrides the router's default model.
     cfg.llm.provider = "openrouter"
-    cfg.llm.model = "openai/gpt-oss-20b"
-    # API key comes from OPENROUTER_API_KEY env var
+    if not os.getenv("OPENROUTER_API_KEY") and os.getenv("REQUESTY_API_KEY"):
+        cfg.llm.openrouter_api_key = os.environ["REQUESTY_API_KEY"]
+        cfg.llm.openrouter_base_url = "https://router.requesty.ai/v1"
+        cfg.llm.model = os.getenv("INTEGRATION_LLM_MODEL", "runware/gpt-oss-120b")
+    else:
+        cfg.llm.model = os.getenv("INTEGRATION_LLM_MODEL", "openai/gpt-oss-20b")
     return cfg
 
 

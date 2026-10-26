@@ -29,6 +29,24 @@ from minecraft_ai_bridge.minecraft.observer import InventorySlot
 
 
 class TestExecuteAction:
+    @pytest.mark.parametrize(
+        ("action", "params"),
+        [
+            (ActionType.FOLLOW_TELEPORT, {"target": None}),
+            (ActionType.PROVISION_BOT, {"player_name": ["Bot"]}),
+            (ActionType.GOTO_TELEPORT, {"target": 42}),
+            (ActionType.COME_TELEPORT, {"sender": {"name": "Player"}}),
+        ],
+    )
+    async def test_internal_player_target_actions_reject_non_strings_without_dispatch(
+        self, mock_mc, action, params
+    ):
+        result = await execute_action(mock_mc, action, params)
+
+        assert not result.success
+        assert "invalid" in result.message.lower()
+        assert mock_mc.commands_ran == []
+
     async def test_unknown_action(self, mock_mc):
         result = await execute_action(mock_mc, ActionType.SCAN, {"radius": 5})
         assert result.success is True  # scan always succeeds
@@ -561,8 +579,39 @@ class TestCombat:
         assert result.success is True  # mock returns "Damaged 1 entity"
 
     async def test_attack_with_target(self, mock_mc):
-        result = await execute_action(mock_mc, ActionType.ATTACK, {"entity_type": "TestPlayer"})
+        result = await execute_action(mock_mc, ActionType.ATTACK, {"entity_type": "zombie"})
         assert result.success is True
+
+    async def test_attack_is_anchored_to_bot_and_limited_to_six_blocks(self, mock_mc):
+        await execute_action(mock_mc, ActionType.ATTACK, {"entity_type": "zombie"})
+        assert any(
+            "execute as AIBot at @s run damage "
+            "@e[type=minecraft:zombie,distance=..6,limit=1,sort=nearest]" in command
+            for command in mock_mc.commands_ran
+        )
+
+    async def test_attack_rejects_selector_and_command_injection(self, mock_mc):
+        for target in ("@a", "zombie],limit=100", "zombie; kill @a", "Player Name"):
+            before = len(mock_mc.commands_ran)
+            result = await execute_action(mock_mc, ActionType.ATTACK, {"entity_type": target})
+            assert not result.success
+            assert len(mock_mc.commands_ran) == before
+
+    async def test_attack_rejects_protected_targets(self, mock_mc):
+        for target in ("minecraft:villager", "iron_golem", "warden", "wither"):
+            result = await execute_action(mock_mc, ActionType.ATTACK, {"entity_type": target})
+            assert not result.success
+
+    async def test_attack_empty_target_uses_non_player_selector(self, mock_mc):
+        result = await execute_action(mock_mc, ActionType.ATTACK, {"entity_type": ""})
+        assert result.success
+        damage_commands = [command for command in mock_mc.commands_ran if "damage" in command]
+        assert damage_commands
+        assert all("type=minecraft:" in command for command in damage_commands)
+
+    async def test_attack_missing_target_uses_default(self, mock_mc):
+        result = await execute_action(mock_mc, ActionType.ATTACK, {})
+        assert result.success
 
     async def test_attack_custom_damage(self, mock_mc):
         """Custom damage_amount should be reflected in the response."""
@@ -999,3 +1048,116 @@ class TestScanEntitiesDetailed:
         # Creeper is high, so it should be picked over zombie (low)
         # and skeleton (medium)
         assert target == "creeper"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "params"),
+    [
+        (ActionType.PLACE_BLOCK, {"block_type": "stone[snowy=true]"}),
+        (ActionType.PLACE_BLOCK, {"block_type": "stone{}"}),
+        (ActionType.PLACE_BLOCK, {"block_type": "stone replace"}),
+        (ActionType.PLACE_BLOCK, {"block_type": "Stone", "x": 1, "y": 64, "z": 1}),
+        (ActionType.CRAFT_ITEM, {"item_type": "stone{}"}),
+        (ActionType.CRAFT_ITEM, {"item_type": "stone", "amount": 65}),
+        (ActionType.CRAFT_ITEM, {"item_type": "stone", "amount": "1 extra"}),
+        (ActionType.DROP_ITEM, {"item_type": "stone extra"}),
+        (ActionType.DROP_ITEM, {"item_type": "stone", "amount": 0}),
+    ],
+)
+async def test_command_ids_and_amounts_are_validated_before_interpolation(mock_mc, action, params):
+    mock_mc.set_position(0, 64, 0)
+    result = await execute_action(mock_mc, action, params)
+
+    assert not result.success
+    assert mock_mc.commands_ran == []
+
+
+@pytest.mark.asyncio
+async def test_namespaced_ids_are_accepted(mock_mc):
+    result = await execute_action(
+        mock_mc, ActionType.CRAFT_ITEM, {"item_type": "minecraft:oak_planks", "amount": 4}
+    )
+
+    assert result.success
+    mock_mc.assert_command_contains("give")
+    assert "oak_planks 4" in mock_mc.last_command()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", [ActionType.MOVE_TO, ActionType.TELEPORT])
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"x": "1 2", "y": 64, "z": 0},
+        {"x": True, "y": 64, "z": 0},
+        {"x": float("nan"), "y": 64, "z": 0},
+        {"x": 0, "y": float("inf"), "z": 0},
+        {"x": 0, "y": 64, "z": [1]},
+        {"x": 0, "y": 64, "z": "~"},
+    ],
+)
+async def test_teleport_coordinates_must_be_finite_numbers(mock_mc, action, params):
+    mock_mc.set_position(0, 64, 0)
+    result = await execute_action(mock_mc, action, params)
+
+    assert not result.success
+    assert mock_mc.commands_ran == []
+    assert await mock_mc.get_player_pos() == (0, 64, 0)
+
+
+@pytest.mark.asyncio
+async def test_teleport_accepts_numeric_strings(mock_mc):
+    result = await execute_action(mock_mc, ActionType.TELEPORT, {"x": "5", "y": 64.5, "z": -3})
+
+    assert result.success
+    assert result.data == {"x": 5.0, "y": 64.5, "z": -3.0}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "block_type",
+    [
+        "other:stone",
+        "minecraft:stone/slab",
+        "minecraft:minecraft:stone",
+        "STONE",
+        "stone\t",
+        "a" * 65,
+        "",
+        None,
+        7,
+        ["stone"],
+    ],
+)
+async def test_place_block_rejects_non_plain_ids(mock_mc, block_type):
+    result = await execute_action(mock_mc, ActionType.PLACE_BLOCK, {"block_type": block_type})
+
+    assert not result.success
+    assert mock_mc.commands_ran == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("amount", [True, 1.5, "1", -1, None])
+async def test_item_amounts_must_be_bounded_integers(mock_mc, amount):
+    mock_mc.set_position(0, 64, 0)
+    for action in (ActionType.CRAFT_ITEM, ActionType.DROP_ITEM):
+        result = await execute_action(mock_mc, action, {"item_type": "stone", "amount": amount})
+        assert not result.success
+    assert mock_mc.commands_ran == []
+
+
+@pytest.mark.asyncio
+async def test_valid_block_and_item_operations_still_run(mock_mc):
+    mock_mc.set_position(0, 64, 0)
+
+    params = {"block_type": "minecraft:oak_log", "x": 1, "y": 64, "z": 1}
+    placed = await execute_action(mock_mc, ActionType.PLACE_BLOCK, params)
+    dropped = await execute_action(
+        mock_mc, ActionType.DROP_ITEM, {"item_type": "cobblestone", "amount": 64}
+    )
+
+    assert placed.success
+    assert await mock_mc.get_block(1, 64, 1) == "oak_log"
+    assert dropped.success
+    assert any("summon item" in command for command in mock_mc.commands_ran)

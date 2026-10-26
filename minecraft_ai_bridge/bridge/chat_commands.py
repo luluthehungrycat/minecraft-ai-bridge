@@ -17,19 +17,23 @@ Supported commands
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import re
+from collections.abc import Callable, Collection
 from typing import TYPE_CHECKING
+
+from ..minecraft.actions import ActionType
+from ..runtime import ActionService, McpqWorldAdapter
 
 if TYPE_CHECKING:
     from .orchestrator import Orchestrator
 
 logger = logging.getLogger(__name__)
 
-# Pattern for parsing chat messages that look like command invocations.
-# Matches:  "<PlayerName> !command args" or "<PlayerName> !command"
-_COMMAND_RE = re.compile(r"<([^>]+)>\s+((?:/[!\u00a7]?|!)\w+)(.*)")
+_COMMAND_RE = re.compile(r"^\s*((?:/[!\u00a7]?|!)\w+)(.*)$")
+_PUBLIC_COMMANDS = {"!status", "!help"}
 
 # Commands the handler recognises
 COMMANDS = {
@@ -55,22 +59,64 @@ class ChatCommandHandler:
 
     def __init__(self, orchestrator: Orchestrator) -> None:
         self._orch = orchestrator
+        # Resolve the world reference once: the orchestrator's adapter when
+        # present, otherwise a wrapper around a legacy raw MCPQ client so
+        # harness/direct construction keeps polling, status, and chat replies
+        # working. Use the orchestrator's shared ActionService when present
+        # so chat teleports share the same policy hook and audit trace as
+        # other mutations; direct/test construction falls back to a local
+        # service bound to the resolved world (no direct run_as_player
+        # bypass). A harness exposing only an ActionService (with no
+        # adapter and no raw client) resolves the world from that service
+        # so polling, status, and replies still work.
+        service = getattr(orchestrator, "_action_service", None)
+        internal_authority = getattr(orchestrator, "_internal_action_authority", None)
+        world = getattr(orchestrator, "_world", None)
+        if world is None:
+            mc = getattr(orchestrator, "_mc", None)
+            if mc is not None:
+                world = McpqWorldAdapter(mc)
+        if world is None and service is not None:
+            world = service.world
+        if service is None:
+            if world is None:
+                raise ValueError(
+                    "ChatCommandHandler requires an orchestrator with a "
+                    "world adapter, an ActionService, or a raw MCPQ client"
+                )
+            policy = getattr(orchestrator, "_action_policy", None)
+            service = ActionService(
+                world,
+                policy=policy,
+                internal_authority=internal_authority,
+            )
+        self._action_service = service
+        self._internal_action_authority = internal_authority
+        self._world = world
         self._last_check: str | None = None
+        config = getattr(orchestrator, "_config", None)
+        chat_control = getattr(config, "chat_control", None)
+        self._chat_control = chat_control
 
     # ── Polling ──────────────────────────────────────────────────────
 
-    async def poll(self) -> None:
+    async def poll(
+        self,
+        *,
+        allowed_commands: Collection[str] | Callable[[], Collection[str] | None] | None = None,
+    ) -> None:
         """Check for new chat messages and process any matching commands.
 
         Uses MCPQ's ``ChatEvent`` polling API to catch in-game chat
-        messages.  Should be called once per agent turn.
+        messages. ``allowed_commands`` can narrow dispatch for suspended
+        runtime states without changing the normal command policy.
         """
-        mc = getattr(self._orch, "_mc", None)
-        if mc is None:
+        world = self._world
+        if world is None:
             return
 
         try:
-            events = await mc.get_chat_events()
+            events = await world.get_chat_events()
         except Exception:
             return
 
@@ -78,37 +124,85 @@ class ChatCommandHandler:
             return
 
         for event in events:
-            # Each ChatEvent has .player.name and .message
-            sender = getattr(event, "player", None)
-            sender_name = getattr(sender, "name", "?") if sender else "?"
+            event_allowlist = allowed_commands() if callable(allowed_commands) else allowed_commands
+            player = getattr(event, "player", None)
+            sender_name = getattr(player, "name", "") if player else ""
             message = getattr(event, "message", "")
-            line = f"<{sender_name}> {message}"
-            await self._process_line(line.strip())
+            await self._process_message(
+                message,
+                sender_name,
+                player,
+                allowed_commands=event_allowlist,
+            )
+            if getattr(self._orch, "_stop_requested", False):
+                break
+
+    async def _process_message(
+        self,
+        message: str,
+        sender_name: str,
+        player: object | None,
+        *,
+        allowed_commands: Collection[str] | None = None,
+    ) -> None:
+        """Process message text while deriving authority only from event metadata."""
+        match = _COMMAND_RE.match(message)
+        if not match:
+            return
+        command = match.group(1).strip().lower().removeprefix("/")
+        args = match.group(2).strip()
+        if command not in COMMANDS:
+            return
+        if allowed_commands is not None and command not in allowed_commands:
+            logger.info("Ignoring chat command %s in restricted runtime state", command)
+            return
+        if command not in _PUBLIC_COMMANDS and not self._authorized_player(player):
+            logger.warning("Denied chat control command %s from untrusted player metadata", command)
+            return
+        await self.handle_command(command, args, sender_name, trusted_player=player)
+
+    def _authorized_player(self, player: object | None) -> bool:
+        if player is None or not getattr(self._chat_control, "server_online_mode", False):
+            return False
+        player_uuid = getattr(player, "uuid", None) or getattr(player, "unique_id", None)
+        allowed_uuids = {
+            str(value).strip().casefold()
+            for value in getattr(self._chat_control, "allowed_uuids", [])
+            if str(value).strip()
+        }
+        allowed_names = {
+            str(value).strip().casefold()
+            for value in getattr(self._chat_control, "allowed_names", [])
+            if str(value).strip()
+        }
+        if player_uuid is not None and str(player_uuid).strip():
+            # An event that supplies a UUID has a stronger identity than its
+            # display name. Never let an unlisted/malformed UUID fall back to
+            # a name allowlist entry; that would permit name-based spoofing.
+            return str(player_uuid).strip().casefold() in allowed_uuids
+        name = getattr(player, "name", None)
+        return bool(name and str(name).strip().casefold() in allowed_names)
 
     async def _process_line(self, line: str) -> None:
-        """Parse a single chat line and dispatch any command found."""
-        m = _COMMAND_RE.match(line)
-        if not m:
-            return
-
-        sender = m.group(1)
-        raw_cmd = m.group(2).strip().lower()
-        args = m.group(3).strip()
-
-        # Strip leading slash if present (some server formats include one)
-        if raw_cmd.startswith("/"):
-            raw_cmd = raw_cmd[1:]
-
-        if raw_cmd not in COMMANDS:
-            return
-
-        logger.info("Chat command from %s: %s %s", sender, raw_cmd, args)
-        await self.handle_command(raw_cmd, args, sender)
+        """Compatibility parser; formatted chat lines carry no trusted identity."""
+        match = re.match(r"^<([^>]+)>\s+(.*)$", line)
+        if match:
+            await self._process_message(match.group(2), match.group(1), None)
 
     # ── Dispatch ─────────────────────────────────────────────────────
 
-    async def handle_command(self, command: str, args: str, sender: str) -> None:
+    async def handle_command(
+        self,
+        command: str,
+        args: str,
+        sender: str,
+        *,
+        trusted_player: object | None = None,
+    ) -> None:
         """Route a parsed command to the appropriate handler."""
+        if command not in _PUBLIC_COMMANDS and not self._authorized_player(trusted_player):
+            logger.warning("Denied direct chat control dispatch without trusted player identity")
+            return
         dispatch = {
             "!status": self._cmd_status,
             "!stop": self._cmd_stop,
@@ -133,10 +227,10 @@ class ChatCommandHandler:
             f"  Turns: {getattr(orch, '_turn', 0)}",
         ]
         # Add position if available
-        mc = getattr(orch, "_mc", None)
-        if mc and mc.connected:
+        world = self._world
+        if world and world.connected:
             try:
-                pos = await mc.get_player_pos()
+                pos = await world.get_player_pos()
                 if pos:
                     lines.append(f"  Position: ({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f})")
             except Exception:
@@ -145,9 +239,15 @@ class ChatCommandHandler:
 
     async def _cmd_stop(self, args: str, sender: str) -> None:
         """Signal the agent to stop after the current turn."""
-        await self._send(f"@{sender} Shutting down by request …")
         orch = self._orch
         orch._stop_requested = True  # checked in the main loop
+        try:
+            await asyncio.wait_for(
+                self._send(f"@{sender} Shutting down by request …"),
+                timeout=1.0,
+            )
+        except TimeoutError:
+            logger.warning("Could not send chat stop acknowledgment before timeout")
 
     async def _cmd_goal(self, args: str, sender: str) -> None:
         """Re-assign the agent's goal."""
@@ -156,8 +256,17 @@ class ChatCommandHandler:
             return
         orch = self._orch
         if hasattr(orch, "_goals") and hasattr(orch, "_memory"):
+            set_goal = getattr(orch, "_set_goal_or_authority_loss", None)
+            if callable(set_goal):
+                await set_goal(args)
+            else:
+                await orch._goals.set_goal(args)
+            revalidate = getattr(orch, "_suspend_strategy_if_session_invalid", None)
+            if callable(revalidate) and revalidate():
+                return
+            if getattr(orch, "_strategic_authority_lost", False):
+                return
             orch._memory.clear_short_term()
-            await orch._goals.set_goal(args)
             await self._send(
                 f'@{sender} Goal re-assigned to: "{args}" ({orch._goals.sub_goal_count} sub-goals)'
             )
@@ -168,13 +277,18 @@ class ChatCommandHandler:
             await self._send(f"@{sender} Usage: !goto <player>")
             return
         target = args.split()[0]
-        mc = getattr(self._orch, "_mc", None)
-        if mc and mc.connected:
-            try:
-                await mc.run_as_player(f"tp @p {target}")
-                await self._send(f"@{sender} Teleported to {target}")
-            except Exception as exc:
-                await self._send(f"@{sender} Could not teleport to {target}: {exc}")
+        result = await self._action_service.execute(
+            ActionType.GOTO_TELEPORT,
+            {"target": target},
+            authority=self._internal_action_authority,
+        )
+        if result.success:
+            await self._send(f"@{sender} Teleported to {target}")
+        else:
+            # ActionService reports failures as results (and handler
+            # exceptions become failed results in execute_action), so the
+            # chat response must surface them explicitly.
+            await self._send(f"@{sender} Could not teleport to {target}: {result.message}")
 
     async def _cmd_follow(self, args: str, sender: str) -> None:
         """Toggle follow-mode for a named player."""
@@ -189,13 +303,15 @@ class ChatCommandHandler:
 
     async def _cmd_come(self, args: str, sender: str) -> None:
         """Teleport the sender to the agent's position."""
-        mc = getattr(self._orch, "_mc", None)
-        if mc and mc.connected:
-            try:
-                await mc.run_as_player(f"tp {sender} @p")
-                await self._send(f"@{sender} You have been teleported to me!")
-            except Exception as exc:
-                await self._send(f"@{sender} Could not teleport you: {exc}")
+        result = await self._action_service.execute(
+            ActionType.COME_TELEPORT,
+            {"sender": sender},
+            authority=self._internal_action_authority,
+        )
+        if result.success:
+            await self._send(f"@{sender} You have been teleported to me!")
+        else:
+            await self._send(f"@{sender} Could not teleport you: {result.message}")
 
     async def _cmd_help(self, args: str, sender: str) -> None:
         """List available commands."""
@@ -209,8 +325,8 @@ class ChatCommandHandler:
     # ── Helper ───────────────────────────────────────────────────────
 
     async def _send(self, message: str) -> None:
-        """Send a chat message via the MCPQ client."""
-        mc = getattr(self._orch, "_mc", None)
-        if mc and mc.connected:
+        """Send a chat message through the world adapter."""
+        world = self._world
+        if world and world.connected:
             with contextlib.suppress(Exception):
-                await mc.post_to_chat(message)
+                await world.post_to_chat(message)

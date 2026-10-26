@@ -6,15 +6,29 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import logging
+import sqlite3
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from ..config import AppConfig
 from ..llm.client import LLMClient, OpenCodeServerClient, create_llm_client
 from ..llm.models import LLMResponse, Message, Role
 from ..llm.prompts import SYSTEM_PROMPT, format_failure_hint, format_state
-from ..minecraft import ActionResult, ActionType, McpqClient, Observer, WorldState, execute_action
+from ..minecraft import ActionResult, ActionType, McpqClient, Observer, WorldState
+from ..runtime import (
+    ActionPolicy,
+    ActionService,
+    AuthzControllerSession,
+    AuthzService,
+    EventJournal,
+    McpqWorldAdapter,
+    PolicyDecision,
+    SafetySupervisor,
+)
 from .chat_commands import ChatCommandHandler
 from .goal_manager import GoalManager
 from .inventory_manager import InventoryManager
@@ -22,6 +36,18 @@ from .memory import AgentMemory
 from .self_preservation import PreservationConfig, SelfPreservationLayer
 
 logger = logging.getLogger(__name__)
+
+_AUTH_LOST_CHAT_COMMANDS = frozenset({"!stop"})
+
+_INTERNAL_ACTION_TYPES = frozenset(
+    {
+        ActionType.FOLLOW_TELEPORT,
+        ActionType.PROVISION_BOT,
+        ActionType.PREPARE_SAFE_SPAWN,
+        ActionType.GOTO_TELEPORT,
+        ActionType.COME_TELEPORT,
+    }
+)
 
 
 @dataclass
@@ -48,10 +74,28 @@ class Orchestrator:
         await orch.run("Build a house")
     """
 
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        action_policy: ActionPolicy | None = None,
+    ) -> None:
         self._config = config
         self._llm: LLMClient = create_llm_client(config)
         self._mc: McpqClient | None = None
+        self._world: McpqWorldAdapter | None = None
+        self._action_policy = action_policy
+        self._runtime_action_policy = action_policy
+        self._action_service: ActionService | None = None
+        # Capability object shared only with trusted in-process lifecycle and
+        # chat handlers; it is never derived from action names or parameters.
+        self._internal_action_authority = object()
+        self._safety_action_authority = object()
+        self._authz_service: AuthzService | None = None
+        self._authz_session: AuthzControllerSession | None = None
+        self._strategic_authority_lost = False
+        self._strategic_authority_lost_event = asyncio.Event()
+        self._session_renewal_stop_event: asyncio.Event | None = None
+        self._session_renewal_task: asyncio.Task[None] | None = None
         self._observer: Observer | None = None
         self._memory = AgentMemory(window=config.bridge.memory_window)
         self._goals = GoalManager(
@@ -80,8 +124,17 @@ class Orchestrator:
         # Self-preservation layer — reflex attack + find-food injection
         # Initialised lazily in _connect() once we have an MC client.
         self._preservation: SelfPreservationLayer | None = None
+        self._safety_supervisor: SafetySupervisor | None = None
+        self._safety_stop_event: asyncio.Event | None = None
+        self._safety_task: asyncio.Task[None] | None = None
+        self._event_journal: EventJournal | None = None
 
     # ── Public API ───────────────────────────────────────────────────
+
+    @property
+    def strategic_authority_lost(self) -> bool:
+        """Whether strategy was suspended because controller authority was lost."""
+        return self._strategic_authority_lost
 
     async def run(self, goal: str | None = None) -> None:
         """Run the full agent loop until the goal is complete or
@@ -99,56 +152,101 @@ class Orchestrator:
             api_cfg.host,
             api_cfg.port,
         )
-        await self._connect()
-        logger.info("MCPQ connected — controlling player: %s", api_cfg.player_name)
+        try:
+            await self._connect()
+            logger.info("MCPQ connected — controlling player: %s", api_cfg.player_name)
+            self._start_session_renewal()
+            self._start_safety_supervisor()
+            # Let the independent task begin polling before goal setup can
+            # block on LLM inference.
+            await asyncio.sleep(0)
 
-        # 2. Set up goal hierarchy
-        logger.info("Decomposing goal into sub-tasks via LLM ...")
-        await self._goals.set_goal(goal_text)
-        logger.info("Goal decomposition complete — %d sub-goals", self._goals.sub_goal_count)
+            # 2. Set up goal hierarchy
+            logger.info("Decomposing goal into sub-tasks via LLM ...")
+            await self._set_goal_or_authority_loss(goal_text)
+            logger.info("Goal decomposition complete — %d sub-goals", self._goals.sub_goal_count)
 
-        # 3. Main loop
-        done = False
-        while not done and self._turn < self._max_iterations:
-            self._turn += 1
-            try:
-                done = await self._step()
-            except Exception as exc:
-                self._consecutive_failures += 1
-                logger.exception(
-                    "Fatal error on turn %d (consecutive failures: %d)",
-                    self._turn,
-                    self._consecutive_failures,
-                )
-                await self._chat(
-                    f"Error on turn {self._turn}: {exc}. "
-                    f"Consecutive failures: {self._consecutive_failures}"
-                )
-
-                # Backoff sleep after unexpected crashes
-                await asyncio.sleep(min(5 * self._consecutive_failures, 30))
-
-            # Check for graceful shutdown on consecutive failures
-            if self._stop_requested or self._consecutive_failures >= self._max_failures:
-                if self._stop_requested:
-                    logger.info("Stop requested via in-game command.")
-                    await self._chat("Shutting down as requested.")
-                else:
-                    logger.error(
-                        "Too many consecutive failures (%d). Shutting down.",
+            # 3. Main loop
+            done = False
+            while not done and self._turn < self._max_iterations:
+                if self._strategic_authority_lost:
+                    await self._wait_for_authorized_stop()
+                    break
+                self._turn += 1
+                try:
+                    done = await self._step()
+                except Exception as exc:
+                    self._consecutive_failures += 1
+                    logger.exception(
+                        "Fatal error on turn %d (consecutive failures: %d)",
+                        self._turn,
                         self._consecutive_failures,
                     )
                     await self._chat(
-                        f"Too many errors ({self._consecutive_failures}). Shutting down."
+                        f"Error on turn {self._turn}: {exc}. "
+                        f"Consecutive failures: {self._consecutive_failures}"
                     )
-                break
 
-        logger.info(
-            "Agent finished after %d turns. Goal complete: %s",
-            self._turn,
-            self._goals.is_complete,
-        )
-        await self._disconnect()
+                    # Backoff sleep after unexpected crashes
+                    await asyncio.sleep(min(5 * self._consecutive_failures, 30))
+
+                self._suspend_strategy_if_session_invalid()
+                if self._strategic_authority_lost:
+                    # Losing controller authority pauses strategy; it is not
+                    # a reason to shut down the independent safety task.
+                    self._consecutive_failures = 0
+                    await self._wait_for_authorized_stop()
+                    break
+
+                if self._stop_requested or self._consecutive_failures >= self._max_failures:
+                    if self._stop_requested:
+                        logger.info("Stop requested via in-game command.")
+                        await self._chat("Shutting down as requested.")
+                    else:
+                        logger.error(
+                            "Too many consecutive failures (%d). Shutting down.",
+                            self._consecutive_failures,
+                        )
+                        await self._chat(
+                            f"Too many errors ({self._consecutive_failures}). Shutting down."
+                        )
+                    break
+
+            logger.info(
+                "Agent finished after %d turns. Goal complete: %s",
+                self._turn,
+                self._goals.is_complete,
+            )
+        finally:
+            await self._finish_shutdown()
+
+    async def _finish_shutdown(self) -> None:
+        """Complete every shutdown phase before propagating caller cancellation."""
+        shutdown_task = asyncio.create_task(self._shutdown_components())
+        await self._await_cleanup_task(shutdown_task)
+
+    @staticmethod
+    async def _await_cleanup_task(task: asyncio.Task[None]) -> None:
+        """Wait for cleanup despite repeated cancellation, then re-raise it."""
+        cancelled = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+        task.result()
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _shutdown_components(self) -> None:
+        """Stop background workers and always proceed to resource cleanup."""
+        try:
+            await self._stop_session_renewal()
+        finally:
+            try:
+                await self._stop_safety_supervisor()
+            finally:
+                await self._disconnect()
 
     # ── Core step ────────────────────────────────────────────────────
 
@@ -158,22 +256,32 @@ class Orchestrator:
         Returns True if the agent should stop.
         """
         logger.info("─── Turn %d ───", self._turn)
+        world_adapter = self._world
+        if world_adapter is None:
+            raise RuntimeError("Orchestrator must connect before starting a step")
+
+        if self._suspend_strategy_if_session_invalid():
+            await self._defer_strategy()
+            return False
 
         # ── Check for in-game commands (N4) ──────────────────────
         if self._cmd_handler:
             with contextlib.suppress(Exception):
-                await self._cmd_handler.poll()
+                await self._cmd_handler.poll(allowed_commands=self._chat_command_allowlist)
         if self._stop_requested:
             return True
+        if self._suspend_strategy_if_session_invalid():
+            await self._defer_strategy()
+            return False
 
         # ── Follow-mode support (N4) ─────────────────────────────
         if self._follow_target:
             try:
-                my_pos = await self._mc.get_player_pos()
+                my_pos = await world_adapter.get_player_pos()
                 if my_pos is None:
                     pass
                 else:
-                    target_pos_raw = await self._mc.run_command_blocking(
+                    target_pos_raw = await world_adapter.run_command_blocking(
                         f"data get entity {self._follow_target} Pos"
                     )
                     if target_pos_raw:
@@ -189,10 +297,27 @@ class Orchestrator:
                                 dz = tz - my_pos[2]
                                 dist = (dx * dx + dz * dz) ** 0.5
                                 if dist > 4.0:
-                                    await self._mc.run_as_player(
-                                        f"execute as {self._follow_target} at @s "
-                                        f"run tp @p ^-3 ^ ^-3"
+                                    if self._action_service is None:
+                                        self._action_service = ActionService(
+                                            world_adapter,
+                                            policy=self._runtime_action_policy,
+                                            internal_authority=self._internal_action_authority,
+                                            safety_authority=self._safety_action_authority,
+                                        )
+                                    follow_result = await self._action_service.execute(
+                                        ActionType.FOLLOW_TELEPORT,
+                                        {"target": self._follow_target},
+                                        authority=self._internal_action_authority,
                                     )
+                                    if follow_result.success:
+                                        logger.info(
+                                            "Follow-mode teleport: %s", follow_result.message
+                                        )
+                                    else:
+                                        logger.warning(
+                                            "Follow-mode teleport failed: %s",
+                                            follow_result.message,
+                                        )
             except Exception:
                 pass
 
@@ -211,7 +336,9 @@ class Orchestrator:
         # the result via the regular last_action_result context on
         # the NEXT turn.
         reflex_result: ActionResult | None = None
-        if self._preservation is not None:
+        if self._safety_supervisor is not None:
+            reflex_result = self._safety_supervisor.take_nowait()
+        elif self._preservation is not None:
             reflex_result = await self._preservation.evaluate(world)
 
         retry_was_pending = self._retry_pending
@@ -242,15 +369,33 @@ class Orchestrator:
         if context.retry_hint:
             messages.append(Message(role=Role.USER, content=context.retry_hint))
 
-        response = await self._llm.decide(
-            system_prompt=SYSTEM_PROMPT,
-            messages=messages,
-        )
+        if reflex_result is not None:
+            response = LLMResponse(action="wait")
+        elif self._safety_supervisor is None:
+            response = await self._llm.decide(system_prompt=SYSTEM_PROMPT, messages=messages)
+        else:
+            response, safety_result = await self._decide_with_safety(messages)
+            if safety_result is not None:
+                reflex_result = safety_result
+        if self._suspend_strategy_if_session_invalid():
+            await self._defer_strategy(reflex_result)
+            return False
 
         if self._verbose:
             logger.info(
                 "LLM decision: %s → %s", response.action, json.dumps(response.action_params)
             )
+
+        completed_result: ActionResult | None = None
+        if (
+            reflex_result is None
+            and self._safety_supervisor is not None
+            and response.action == ActionType.WAIT.value
+        ):
+            completed_result, reflex_result = await self._wait_or_safety(response)
+            if self._suspend_strategy_if_session_invalid():
+                await self._defer_strategy(reflex_result)
+                return False
 
         # ── Act ───────────────────────────────────────────────────
         # A retry is evaluated on the following turn, but this block
@@ -273,6 +418,10 @@ class Orchestrator:
             self._last_result = result
             response_action = response.action
             self._clear_retry()
+        elif completed_result is not None:
+            result = completed_result
+            response_action = response.action
+            self._clear_retry()
         else:
             result = await self._act(response)
             response_action = response.action
@@ -290,8 +439,13 @@ class Orchestrator:
                     result.message,
                 )
 
-        # Track consecutive failures — count both action failures and exceptions
-        if result.success:
+        # Authorization loss pauses strategy instead of counting toward the
+        # fatal action-failure threshold. The safety supervisor stays active.
+        self._suspend_strategy_if_session_invalid()
+        if self._strategic_authority_lost:
+            self._clear_retry()
+            self._consecutive_failures = 0
+        elif result.success:
             self._consecutive_failures = 0
         else:
             self._consecutive_failures += 1
@@ -321,6 +475,239 @@ class Orchestrator:
 
         return self._turn >= self._max_iterations
 
+    def _authz_enabled(self) -> bool:
+        """Return whether Authz is enabled, including in lightweight test harnesses."""
+        config = getattr(self, "_config", None)
+        authz = getattr(config, "authz", None)
+        return bool(getattr(authz, "enabled", False))
+
+    def _suspend_strategy_if_session_invalid(self) -> bool:
+        """Fail closed into safety-only operation when Authz loses its session.
+
+        Returns True whenever strategy must not proceed right now. A definitive
+        invalid session latches ``_strategic_authority_lost``; a check that
+        could not complete without blocking (lock or SQLite busy) only skips
+        the current strategic work until the lease itself expires.
+        """
+        if self._strategic_authority_lost:
+            return True
+        if not self._config.authz.enabled:
+            return False
+
+        service = self._authz_service
+        session = self._authz_session
+        valid: bool | None
+        if service is None or session is None:
+            valid = False
+        else:
+            try:
+                valid = service.try_validate_session(session)
+            except sqlite3.Error:
+                logger.exception("Could not verify controller session; deferring strategy")
+                valid = None
+        if valid is True:
+            return False
+
+        if (
+            valid is None
+            and session is not None
+            and session.expires_at is not None
+            and datetime.now(UTC) < session.expires_at
+        ):
+            logger.warning(
+                "Controller authorization could not be verified without blocking; "
+                "deferring strategic work and retrying"
+            )
+            return True
+
+        self._strategic_authority_lost = True
+        self._strategic_authority_lost_event.set()
+        self._clear_retry()
+        if valid is None:
+            logger.error(
+                "Controller authorization could not be verified before the lease expired; "
+                "strategic actions are suspended while safety supervision remains active"
+            )
+        else:
+            logger.error(
+                "Controller authorization is no longer valid; strategic actions are suspended "
+                "while safety supervision remains active"
+            )
+        return True
+
+    async def _defer_strategy(self, reflex_result: ActionResult | None = None) -> None:
+        """Skip strategic work, keeping any consumed safety result in memory.
+
+        A reflex result has already been consumed from the supervisor, so it
+        is recorded here rather than dropped. If the session check merely
+        could not complete, back off before the next attempt.
+        """
+        if reflex_result is not None:
+            self._last_result = reflex_result
+            self._memory.record_action(
+                reflex_result.action.value,
+                {
+                    "success": reflex_result.success,
+                    "message": reflex_result.message,
+                    "data": reflex_result.data,
+                },
+            )
+        if not self._strategic_authority_lost:
+            await asyncio.sleep(max(self._config.bridge.cycle_delay, 0.05))
+
+    async def _set_goal_or_authority_loss(self, goal: str) -> None:
+        """Cancel strategic goal inference promptly if session authority is lost."""
+        if not self._config.authz.enabled:
+            await self._goals.set_goal(goal)
+            return
+        goal_task = asyncio.create_task(self._goals.set_goal(goal))
+        lost_task = asyncio.create_task(self._strategic_authority_lost_event.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {goal_task, lost_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if lost_task in done and self._strategic_authority_lost:
+                goal_task.cancel()
+                await asyncio.gather(goal_task, return_exceptions=True)
+                return
+            await goal_task
+        finally:
+            if not goal_task.done():
+                goal_task.cancel()
+            lost_task.cancel()
+            await asyncio.gather(goal_task, lost_task, return_exceptions=True)
+
+    def _start_session_renewal(self) -> None:
+        """Renew the built-in controller lease while its persisted authority is valid."""
+        if (
+            not self._config.authz.enabled
+            or self._authz_service is None
+            or self._authz_session is None
+            or self._session_renewal_task is not None
+        ):
+            return
+        self._session_renewal_stop_event = asyncio.Event()
+        self._session_renewal_task = asyncio.create_task(
+            self._session_renewal_loop(), name="minecraft-ai-bridge-session-renewal"
+        )
+
+    async def _session_renewal_loop(self) -> None:
+        service = self._authz_service
+        stop_event = self._session_renewal_stop_event
+        if service is None or stop_event is None:
+            return
+        lease_seconds = self._config.authz.session_lease_seconds
+        # Renew at a third of the lease so two further attempts fit before
+        # expiry; retry storage errors sooner than a full interval.
+        renew_interval = lease_seconds / 3
+        retry_interval = min(renew_interval, 5.0)
+        interval = renew_interval
+        while not stop_event.is_set() and not self._strategic_authority_lost:
+            session = self._authz_session
+            if session is None or session.expires_at is None:
+                self._mark_strategic_authority_lost(
+                    "controller session is unavailable or unbounded"
+                )
+                return
+            remaining = (session.expires_at - datetime.now(UTC)).total_seconds()
+            if remaining <= 0:
+                self._mark_strategic_authority_lost(
+                    "controller session expired before it could be renewed"
+                )
+                return
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=min(interval, remaining))
+                return
+            except TimeoutError:
+                pass
+
+            if datetime.now(UTC) >= session.expires_at:
+                self._mark_strategic_authority_lost(
+                    "controller session expired before it could be renewed"
+                )
+                return
+            try:
+                self._authz_session = service.renew_session(session, lease_seconds=lease_seconds)
+                interval = renew_interval
+            except PermissionError as exc:
+                self._mark_strategic_authority_lost(
+                    f"controller session could not be renewed: {exc}"
+                )
+                return
+            except ValueError as exc:
+                self._mark_strategic_authority_lost(str(exc))
+                return
+            except sqlite3.Error:
+                logger.exception("Controller session renewal failed; will retry before expiry")
+                interval = retry_interval
+
+    def _mark_strategic_authority_lost(self, reason: str) -> None:
+        self._strategic_authority_lost = True
+        self._strategic_authority_lost_event.set()
+        self._clear_retry()
+        logger.error("Controller session renewal stopped: %s; strategy suspended", reason)
+
+    async def _stop_session_renewal(self) -> None:
+        if self._session_renewal_stop_event is not None:
+            self._session_renewal_stop_event.set()
+        if self._session_renewal_task is not None:
+            await asyncio.gather(self._session_renewal_task, return_exceptions=True)
+        self._session_renewal_task = None
+        self._session_renewal_stop_event = None
+
+    def _chat_command_allowlist(self) -> frozenset[str] | None:
+        """Recheck authority before dispatching each event in a chat poll."""
+        if self._suspend_strategy_if_session_invalid():
+            return _AUTH_LOST_CHAT_COMMANDS
+        return None
+
+    def _chat_stop_available(self) -> bool:
+        """Return whether an in-game ``!stop`` could ever be authorized."""
+        chat_control = self._config.chat_control
+        return (
+            self._cmd_handler is not None
+            and chat_control.server_online_mode
+            and bool(chat_control.allowed_uuids or chat_control.allowed_names)
+        )
+
+    async def _wait_for_authorized_stop(self) -> None:
+        """Keep safety supervision alive after auth loss for a bounded grace period.
+
+        An authorized ``!stop`` ends the wait early. Lost authority is never
+        restored in-process, so the wait always ends at the grace deadline and
+        the caller shuts down instead of idling indefinitely.
+        """
+        pause = max(self._config.bridge.cycle_delay, 0.05)
+        grace = self._config.authz.suspended_shutdown_seconds
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + grace
+        if not self._chat_stop_available():
+            logger.warning(
+                "No authorized in-game !stop is possible; safety supervision continues for "
+                "%.0fs before shutdown",
+                grace,
+            )
+        poll_failing = False
+        while not self._stop_requested:
+            if self._cmd_handler is not None:
+                try:
+                    await self._cmd_handler.poll(allowed_commands=_AUTH_LOST_CHAT_COMMANDS)
+                    poll_failing = False
+                except Exception:
+                    # Log once per failure streak; this loop polls every cycle.
+                    if not poll_failing:
+                        logger.exception("Chat command poll failed while strategy is suspended")
+                    poll_failing = True
+            if self._stop_requested:
+                return
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                logger.error(
+                    "Controller authority was not restored within %.0fs; shutting down", grace
+                )
+                return
+            await asyncio.sleep(min(pause, remaining))
+
     # ── Sub-routines ────────────────────────────────────────────────
 
     async def _observe(self) -> WorldState:
@@ -329,6 +716,182 @@ class Orchestrator:
         state = await self._observer.observe()
         self._memory.record_observation(state)
         return state
+
+    async def _observe_for_safety(self) -> WorldState:
+        """Gather world state for safety polling without writing to memory.
+
+        The supervisor polls every 0.25s; recording each changing observation
+        would evict the action history the LLM sees from short-term memory.
+        """
+        assert self._observer is not None
+        return await self._observer.observe()
+
+    async def _decide_with_safety(
+        self, messages: list[Message]
+    ) -> tuple[LLMResponse, ActionResult | None]:
+        """Race one LLM decision against an independently scheduled intervention."""
+        supervisor = self._safety_supervisor
+        assert supervisor is not None
+        pending = supervisor.take_nowait()
+        if pending is not None:
+            return LLMResponse(action="wait"), pending
+
+        decision_task = asyncio.create_task(
+            self._llm.decide(system_prompt=SYSTEM_PROMPT, messages=messages)
+        )
+        intervention_task = asyncio.create_task(supervisor.wait_for_intervention())
+        authority_task = (
+            asyncio.create_task(self._strategic_authority_lost_event.wait())
+            if self._authz_enabled()
+            else None
+        )
+        try:
+            waiters: set[asyncio.Task[Any]] = {decision_task, intervention_task}
+            if authority_task is not None:
+                waiters.add(authority_task)
+            done, _ = await asyncio.wait(
+                waiters,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            # A finished intervention has already been consumed from the
+            # supervisor, so it wins over a simultaneous authority loss.
+            if intervention_task in done:
+                intervention = intervention_task.result()
+                decision_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await decision_task
+                return LLMResponse(action="wait"), intervention
+            if authority_task is not None and authority_task in done:
+                decision_task.cancel()
+                intervention_task.cancel()
+                await asyncio.gather(decision_task, intervention_task, return_exceptions=True)
+                return LLMResponse(action="wait"), self._completed_intervention(intervention_task)
+
+            response = decision_task.result()
+            intervention_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await intervention_task
+            # Resolve a result published at the same instant as the LLM.
+            pending = supervisor.take_nowait()
+            if pending is not None:
+                return LLMResponse(action="wait"), pending
+            return response, None
+        except BaseException:
+            decision_task.cancel()
+            intervention_task.cancel()
+            tasks: list[asyncio.Task[Any]] = [decision_task, intervention_task]
+            if authority_task is not None:
+                authority_task.cancel()
+                tasks.append(authority_task)
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        finally:
+            if authority_task is not None:
+                authority_task.cancel()
+                await asyncio.gather(authority_task, return_exceptions=True)
+
+    @staticmethod
+    def _completed_intervention(task: asyncio.Task[ActionResult]) -> ActionResult | None:
+        """Return an intervention consumed while its waiter was being cancelled."""
+        if task.done() and not task.cancelled() and task.exception() is None:
+            return task.result()
+        return None
+
+    async def _wait_or_safety(
+        self, response: LLMResponse
+    ) -> tuple[ActionResult | None, ActionResult | None]:
+        """Run a strategic WAIT unless the supervisor publishes an intervention."""
+        supervisor = self._safety_supervisor
+        assert supervisor is not None
+        pending = supervisor.take_nowait()
+        if pending is not None:
+            return None, pending
+
+        wait_task = asyncio.create_task(self._act(response))
+        intervention_task = asyncio.create_task(supervisor.wait_for_intervention())
+        authority_task = (
+            asyncio.create_task(self._strategic_authority_lost_event.wait())
+            if self._authz_enabled()
+            else None
+        )
+        try:
+            waiters: set[asyncio.Task[Any]] = {wait_task, intervention_task}
+            if authority_task is not None:
+                waiters.add(authority_task)
+            done, _ = await asyncio.wait(
+                waiters,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if intervention_task in done:
+                intervention = intervention_task.result()
+                wait_task.cancel()
+                await asyncio.gather(wait_task, return_exceptions=True)
+                return None, intervention
+            if authority_task is not None and authority_task in done:
+                wait_task.cancel()
+                intervention_task.cancel()
+                await asyncio.gather(wait_task, intervention_task, return_exceptions=True)
+                return None, self._completed_intervention(intervention_task)
+
+            result = wait_task.result()
+            intervention_task.cancel()
+            await asyncio.gather(intervention_task, return_exceptions=True)
+            pending = supervisor.take_nowait()
+            if pending is not None:
+                return None, pending
+            return result, None
+        except BaseException:
+            wait_task.cancel()
+            intervention_task.cancel()
+            tasks: list[asyncio.Task[Any]] = [wait_task, intervention_task]
+            if authority_task is not None:
+                authority_task.cancel()
+                tasks.append(authority_task)
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        finally:
+            if authority_task is not None:
+                authority_task.cancel()
+                await asyncio.gather(authority_task, return_exceptions=True)
+
+    def _start_safety_supervisor(self) -> None:
+        """Start periodic preservation checks after runtime wiring is ready."""
+        if self._preservation is None or self._safety_task is not None:
+            return
+        if self._action_service is not None:
+            self._action_service.enable_safety_preemption()
+        self._safety_supervisor = SafetySupervisor(
+            self._observe_for_safety,
+            self._preservation.evaluate,
+            on_intervention_consumed=(
+                self._action_service.acknowledge_safety_intervention
+                if self._action_service is not None
+                else None
+            ),
+            event_sink=(self._event_journal.append if self._event_journal is not None else None),
+        )
+        self._safety_stop_event = asyncio.Event()
+        self._safety_task = asyncio.create_task(
+            self._safety_supervisor.run(self._safety_stop_event),
+            name="minecraft-ai-bridge-safety-supervisor",
+        )
+
+    async def _stop_safety_supervisor(self) -> None:
+        """Stop the polling task before disconnecting the world adapter."""
+        if self._safety_stop_event is not None:
+            self._safety_stop_event.set()
+        if self._safety_task is not None:
+            await self._safety_task
+        if self._safety_supervisor is not None:
+            await self._safety_supervisor.close()
+        if self._action_service is not None:
+            self._action_service.disable_safety_preemption()
+        if self._event_journal is not None:
+            self._event_journal.close()
+            self._event_journal = None
+        self._safety_task = None
+        self._safety_stop_event = None
+        self._safety_supervisor = None
 
     def _build_context(self, world: WorldState) -> AgentContext:
         """Build structured context for the LLM prompt."""
@@ -384,8 +947,9 @@ class Orchestrator:
             return ActionType.WAIT
 
     async def _act(self, response: LLMResponse) -> ActionResult:
-        """Execute the LLM's chosen action via the MCPQ plugin."""
+        """Execute the LLM's chosen action through the runtime action gate."""
         assert self._mc is not None
+        assert self._world is not None
 
         try:
             action_type = ActionType(response.action)
@@ -397,10 +961,32 @@ class Orchestrator:
                 message=f"Unknown action: {response.action}",
             )
 
-        result = await execute_action(
-            self._mc,
+        if action_type in _INTERNAL_ACTION_TYPES:
+            # Internal-only actions (follow teleport, startup provisioning,
+            # and the !goto/!come chat-command teleports) must never be
+            # reachable from an LLM response, even though they exist in the
+            # ActionType enum. Reject them at the dispatch boundary so
+            # policy/audit cannot be reached with the identity of a trusted
+            # orchestrator-issued action.
+            logger.warning("LLM attempted internal action: %s", response.action)
+            return ActionResult(
+                success=False,
+                action=ActionType.WAIT,
+                message=f"Internal action not available: {response.action}",
+            )
+
+        if self._action_service is None:
+            self._action_service = ActionService(
+                self._world,
+                policy=self._runtime_action_policy,
+                internal_authority=self._internal_action_authority,
+                safety_authority=self._safety_action_authority,
+            )
+
+        result = await self._action_service.execute(
             action_type,
             response.action_params,
+            preemptible=True,
         )
 
         self._last_result = result
@@ -418,14 +1004,15 @@ class Orchestrator:
 
     async def _chat(self, message: str) -> None:
         """Send a chat message as the agent."""
-        if self._mc and self._mc.connected:
+        if self._world and self._world.connected:
             with contextlib.suppress(Exception):
-                await self._mc.post_to_chat(message)
+                await self._world.post_to_chat(message)
 
     # ── Connection management ────────────────────────────────────────
 
     async def _connect(self) -> None:
         """Connect to the Minecraft server via the MCPQ plugin."""
+        self._config.authz.validate_controller_credentials()
         api_cfg = self._config.mc_api
         self._mc = McpqClient(
             host=api_cfg.host,
@@ -433,7 +1020,40 @@ class Orchestrator:
             player_name=api_cfg.player_name,
         )
         await self._mc.connect()
-        self._observer = Observer(self._mc)
+        # Exactly one adapter wraps the connected client; raw MCPQ access
+        # stays confined to connection lifecycle (connect/disconnect).
+        self._world = McpqWorldAdapter(self._mc)
+        policy = self._action_policy
+        if self._config.authz.enabled:
+            authz_config = self._config.authz
+            self._authz_service = AuthzService(authz_config.database_path)
+            token = authz_config.controller_token.get_secret_value()
+            credential = self._authz_service.authenticate(token)
+            self._authz_session = self._authz_service.acquire_session(
+                token,
+                authz_config.steve_id,
+                owner_id=credential.owner_id,
+                lease_expires_at=datetime.now(UTC)
+                + timedelta(seconds=authz_config.session_lease_seconds),
+            )
+            # Startup provisioning can span multiple retries. Keep the finite
+            # controller lease alive from the moment it is acquired.
+            self._start_session_renewal()
+            world_admin_token = authz_config.world_admin_token.get_secret_value().strip() or None
+            authz_policy = self._authz_service.action_policy(
+                lambda: self._authz_session,
+                admin_token=world_admin_token,
+            )
+            policy = self._combine_action_policies(authz_policy, self._action_policy)
+        self._runtime_action_policy = policy
+        self._action_service = ActionService(
+            self._world,
+            policy=policy,
+            internal_authority=self._internal_action_authority,
+            safety_authority=self._safety_action_authority,
+        )
+        self._observer = Observer(self._world)
+        self._event_journal = EventJournal(self._config.bridge.event_journal_path)
         logger.info("Connected to MCPQ — player name: %s", api_cfg.player_name)
 
         # ── Ensure a fake player entity exists ────────────────────────
@@ -445,7 +1065,7 @@ class Orchestrator:
 
         try:
             # Try getting the player's position — if it works, they exist
-            pos = await self._mc.get_player_pos()
+            pos = await self._world.get_player_pos()
             if pos is not None:
                 logger.info("Player '%s' already present at %s", player_name, pos)
             else:
@@ -453,23 +1073,22 @@ class Orchestrator:
         except Exception:
             # Player doesn't exist yet — spawn via /botsummon
             logger.info("Player '%s' not found — summoning bot …", player_name)
-            try:
-                spawn_result = await self._mc.run_command_blocking(f"botsummon {player_name}")
-                logger.info("Bot summon command: %s", spawn_result or "OK")
-            except Exception as spawn_err:
-                logger.warning(
-                    "Failed to summon bot via /botsummon: %s  "
-                    "Continuing anyway — some MCPQ ops will fail "
-                    "without a player entity.",
-                    spawn_err,
-                )
 
+            provision_result = await self._provision_bot(player_name)
+            logger.warning(
+                "Bot provisioning: %s",
+                provision_result.message,
+            )
+            if not provision_result.success:
+                logger.warning(
+                    "Continuing anyway — some MCPQ ops will fail without a player entity.",
+                )
             # Poll until the player entity is confirmed present
             logger.info("Waiting for player '%s' to be registered …", player_name)
             for _poll_attempt in range(10):
                 await asyncio.sleep(1)
                 try:
-                    pos = await self._mc.get_player_pos()
+                    pos = await self._world.get_player_pos()
                     if pos is not None:
                         logger.info("Player '%s' confirmed at %s", player_name, pos)
                         break
@@ -485,47 +1104,13 @@ class Orchestrator:
         # The fake player often spawns underwater or in unsafe terrain.
         # We teleport to a high Y (above any terrain) and build a solid
         # platform underneath so the bot stands on dry land.
-        safe_x, safe_y, safe_z = 0, 65, 0
-        logger.info(
-            "Teleporting player '%s' to (%d, %d, %d) …",
-            player_name,
-            safe_x,
-            safe_y,
-            safe_z,
-        )
-        for attempt in range(3):
-            try:
-                await self._mc.teleport_player(float(safe_x), float(safe_y), float(safe_z))
-                # Build a 3×3 solid platform under the player
-                for dx in (-1, 0, 1):
-                    for dz in (-1, 0, 1):
-                        with contextlib.suppress(Exception):
-                            await self._mc.set_block(
-                                "dirt",
-                                safe_x + dx,
-                                safe_y - 1,
-                                safe_z + dz,
-                            )
-                await asyncio.sleep(2)
-                safe_pos = await self._mc.get_player_pos()
-                if safe_pos:
-                    logger.info(
-                        "Player at (%.1f, %.1f, %.1f) — feet: %s",
-                        *safe_pos,
-                        await self._mc.get_block(
-                            int(safe_pos[0]),
-                            int(safe_pos[1]) - 1,
-                            int(safe_pos[2]),
-                        ),
-                    )
-                    break
-                logger.warning("Teleport attempt %d: position unknown", attempt + 1)
-            except Exception as safe_err:
-                logger.warning("Safe teleport attempt %d failed: %s", attempt + 1, safe_err)
-                await asyncio.sleep(2)
 
+        # Routed through the action service as the internal
+        # `prepare_safe_spawn` action so policy and audit can distinguish
+        # trusted startup provisioning from ordinary gameplay mutations.
+        await self._prepare_safe_spawn()
         # Initialise sub-systems (N1 inventory, N4 chat commands)
-        self._inventory = InventoryManager(self._mc)
+        self._inventory = InventoryManager(self._world)
         try:
             await self._inventory.refresh()
             logger.info("Initial inventory: %s", self._inventory.summary)
@@ -534,12 +1119,17 @@ class Orchestrator:
 
         self._cmd_handler = ChatCommandHandler(self)
 
-        # Self-preservation layer (reflex attack + find-food injection)
+        # Self-preservation layer (reflex attack + find-food injection).
+        # The shared action service is passed so the layer's mutating
+        # reflexes (ATTACK, EAT, HEAL) use the same policy/audit boundary
+        # as LLM-selected actions; its observation checks stay direct.
         self._preservation = SelfPreservationLayer(
-            mc=self._mc,
+            mc=self._world,
             goal_manager=self._goals,
             memory=self._memory,
             config=PreservationConfig(),
+            action_service=self._action_service,
+            safety_authority=self._safety_action_authority,
         )
 
         # Persist the goal in memory database (N3)
@@ -551,21 +1141,188 @@ class Orchestrator:
 
     async def _disconnect(self) -> None:
         """Clean up the MCPQ connection, memory database, and other resources."""
-        if self._mc:
-            await self._chat("AI Agent signing off.")
-            await self._mc.disconnect()
+        cleanup_task = asyncio.create_task(self._disconnect_impl())
+        await self._await_cleanup_task(cleanup_task)
 
-        # Persist memory database (N3)
-        if hasattr(self._memory, "close"):
-            with contextlib.suppress(Exception):
-                self._memory.close()
+    async def _disconnect_impl(self) -> None:
+        """Perform shutdown work; _disconnect owns cancellation shielding."""
+        await self._stop_session_renewal()
+        try:
+            if self._authz_service is not None:
+                service = self._authz_service
+                session = self._authz_session
 
-        # Clean up OpenCodeServerClient HTTP session if applicable
-        if isinstance(self._llm, OpenCodeServerClient):
-            with contextlib.suppress(Exception):
-                await self._llm.close()
+                def release_and_close_authz() -> None:
+                    try:
+                        if session is not None:
+                            with contextlib.suppress(PermissionError):
+                                service.release_session(session)
+                    finally:
+                        service.close()
+
+                cleanup_task = asyncio.create_task(asyncio.to_thread(release_and_close_authz))
+                try:
+                    await self._await_cleanup_task(cleanup_task)
+                finally:
+                    # References are cleared only after the worker has stopped,
+                    # so cancellation cannot orphan a live SQLite cleanup thread.
+                    if cleanup_task.done():
+                        self._authz_service = None
+                        self._authz_session = None
+        finally:
+            try:
+                if self._mc:
+                    try:
+                        await self._chat("AI Agent signing off.")
+                    finally:
+                        await self._mc.disconnect()
+            finally:
+                try:
+                    if self._event_journal is not None:
+                        self._event_journal.close()
+                        self._event_journal = None
+                finally:
+                    try:
+                        # Persist memory database (N3).
+                        if hasattr(self._memory, "close"):
+                            with contextlib.suppress(Exception):
+                                self._memory.close()
+                    finally:
+                        # Clean up OpenCodeServerClient HTTP session if applicable.
+                        if isinstance(self._llm, OpenCodeServerClient):
+                            with contextlib.suppress(Exception):
+                                await self._llm.close()
+
+    @staticmethod
+    def _combine_action_policies(
+        authz_policy: ActionPolicy,
+        additional_policy: ActionPolicy | None,
+    ) -> ActionPolicy:
+        """Require local session authorization and any caller-supplied policy."""
+
+        async def combined(request):
+            authorization_decision = None
+            caller_decision = None
+            for index, policy in enumerate((authz_policy, additional_policy)):
+                if policy is None:
+                    continue
+                decision = policy(request)
+                if inspect.isawaitable(decision):
+                    decision = await decision
+                if not decision.allowed:
+                    return decision
+                if index == 0:
+                    authorization_decision = decision
+                if index == 1:
+                    caller_decision = decision
+                    # A caller policy may await while the session is revoked,
+                    # expires, or is fenced by ownership transfer. Revalidate
+                    # at the dispatch boundary after that await completes.
+                    final_decision = authz_policy(request)
+                    if inspect.isawaitable(final_decision):
+                        final_decision = await final_decision
+                    if not final_decision.allowed:
+                        return final_decision
+                    authorization_decision = final_decision
+            return PolicyDecision(
+                allowed=True,
+                allow_privileged=bool(
+                    authorization_decision
+                    and authorization_decision.allow_privileged
+                    and (caller_decision is None or caller_decision.allow_privileged)
+                ),
+                identity_scope=(
+                    authorization_decision.identity_scope if authorization_decision else None
+                ),
+            )
+
+        return combined
 
     # ── Logging ──────────────────────────────────────────────────────
+
+    async def _provision_bot(self, player_name: str) -> ActionResult:
+        """Summon the bot entity through the action gate (startup-only).
+
+        Uses the internal `provision_bot` action so the trusted startup
+        provisioning path is visible to policy and audit. The player name
+        is validated as a strict Minecraft username before command
+        interpolation. Returns the service's ActionResult unchanged: a
+        failed result is logged by the caller and startup continues,
+        preserving the previous degraded-start behavior.
+        """
+        assert self._mc is not None
+        assert self._world is not None
+        assert self._action_service is not None
+
+        try:
+            return await self._action_service.execute(
+                ActionType.PROVISION_BOT,
+                {"player_name": player_name},
+                authority=self._internal_action_authority,
+            )
+        except Exception as provision_err:
+            logger.warning(
+                "Failed to summon bot via /botsummon: %s  "
+                "Continuing anyway — some MCPQ ops will fail "
+                "without a player entity.",
+                provision_err,
+            )
+            return ActionResult(
+                success=False,
+                action=ActionType.PROVISION_BOT,
+                message=f"Failed to summon bot via /botsummon: {provision_err}",
+            )
+
+    async def _prepare_safe_spawn(self) -> None:
+        """Teleport to the startup spawn point and place a 3x3 dirt platform."""
+        assert self._mc is not None
+        assert self._world is not None
+        assert self._action_service is not None
+        player_name = self._config.mc_api.player_name
+        safe_x, safe_y, safe_z = 0, 65, 0
+        logger.info(
+            "Teleporting player '%s' to (%d, %d, %d) …",
+            player_name,
+            safe_x,
+            safe_y,
+            safe_z,
+        )
+        for attempt in range(3):
+            try:
+                result = await self._action_service.execute(
+                    ActionType.PREPARE_SAFE_SPAWN,
+                    {"x": safe_x, "y": safe_y, "z": safe_z},
+                    authority=self._internal_action_authority,
+                )
+                if not result.success:
+                    logger.warning(
+                        "Safe teleport attempt %d: %s",
+                        attempt + 1,
+                        result.message,
+                    )
+                    await asyncio.sleep(2)
+                    continue
+                await asyncio.sleep(2)
+                safe_pos = await self._world.get_player_pos()
+                if safe_pos:
+                    logger.info(
+                        "Player at (%.1f, %.1f, %.1f) — feet: %s",
+                        *safe_pos,
+                        await self._world.get_block(
+                            int(safe_pos[0]),
+                            int(safe_pos[1]) - 1,
+                            int(safe_pos[2]),
+                        ),
+                    )
+                    return
+                logger.warning("Teleport attempt %d: position unknown", attempt + 1)
+            except Exception as safe_err:
+                logger.warning(
+                    "Safe teleport attempt %d failed: %s",
+                    attempt + 1,
+                    safe_err,
+                )
+                await asyncio.sleep(2)
 
     def _log_context(self, ctx: AgentContext) -> None:
         """Pretty-print context in verbose mode."""

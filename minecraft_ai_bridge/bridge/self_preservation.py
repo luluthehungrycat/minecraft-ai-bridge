@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from ..llm.models import AgentGoal
 from ..minecraft.actions import (
@@ -47,8 +47,8 @@ from ..minecraft.actions import (
     _is_food,
     execute_action,
 )
-from ..minecraft.mc_api import McpqClient
 from ..minecraft.observer import InventorySlot, WorldState
+from ..runtime import ActionService, WorldAdapter
 
 if TYPE_CHECKING:
     from .goal_manager import GoalManager
@@ -114,18 +114,53 @@ class SelfPreservationLayer:
 
     def __init__(
         self,
-        mc: McpqClient,
+        mc: WorldAdapter,
         goal_manager: GoalManager,
         memory: AgentMemory,
         config: PreservationConfig | None = None,
+        action_service: ActionService | None = None,
+        safety_authority: object | None = None,
     ) -> None:
         self._mc = mc
         self._goals = goal_manager
         self._memory = memory
         self._config = config or PreservationConfig()
+        # Shared policy/audit boundary for self-preservation mutations.
+        # The orchestrator supplies its ActionService instance so reflex
+        # ATTACK, auto EAT, and auto HEAL pass the same policy hook and
+        # audit trace as LLM-selected actions. When None (legacy direct
+        # construction), those mutations fall back to the raw dispatcher
+        # and remain outside the boundary. Read-only observation calls
+        # (SCAN_ENTITIES, get_hurt_by_entity) are never routed through
+        # the service.
+        self._action_service = action_service
+        self._safety_authority = safety_authority
         # Last seen health — used to detect sudden drops. None means
         # the first observation hasn't happened yet.
         self._previous_health: float | None = None
+
+    async def _dispatch(
+        self,
+        action: ActionType,
+        params: dict[str, Any],
+    ) -> ActionResult:
+        """Dispatch a self-preservation mutation through the action gate.
+
+        Reflex ATTACK, auto EAT, and auto HEAL are the layer's mutating
+        actions: when the orchestrator supplied its shared ActionService
+        they go through the same policy hook and audit trace as
+        LLM-selected actions. Without a service (legacy direct
+        construction) they dispatch directly, preserving the previous
+        behavior. Observation calls are never dispatched through here.
+        """
+        if self._action_service is not None:
+            return await self._action_service.execute(
+                action,
+                params,
+                safety_authority=self._safety_authority,
+                preemptive=True,
+            )
+        return await execute_action(self._mc, action, params)
 
     async def evaluate(self, world: WorldState) -> ActionResult | None:
         """Run the preservation checks against the latest world state.
@@ -317,8 +352,7 @@ class SelfPreservationLayer:
         if not mobs:
             return None
         target = mobs[0]
-        attack = await execute_action(
-            self._mc,
+        attack = await self._dispatch(
             ActionType.ATTACK,
             {
                 "entity_type": target,
@@ -480,8 +514,7 @@ class SelfPreservationLayer:
             return None  # no food in inventory, can't auto-consume
 
         item, slot = best
-        eat = await execute_action(
-            self._mc,
+        eat = await self._dispatch(
             ActionType.EAT,
             {"food_item": item, "slot": slot},
         )
@@ -521,12 +554,11 @@ class SelfPreservationLayer:
     # ── Auto-heal ─────────────────────────────────────────────────
 
     async def _maybe_auto_heal(self, world: WorldState) -> ActionResult | None:
-        """Auto-heal when health is critically low and a healing item
-        (golden apple, golden carrot, etc.) is in inventory.
+        """Auto-heal when health is critical and a supported apple is present.
 
         Uses the ``HEAL`` action rather than ``EAT``, which applies
         regeneration, absorption, and instant-health effects.
-        Skips if no golden apples/golden carrots are in inventory.
+        Skips if no golden apple or enchanted golden apple is in inventory.
 
         ``enable_auto_heal`` must be True in ``PreservationConfig``
         (default True).
@@ -539,8 +571,7 @@ class SelfPreservationLayer:
             return None
 
         item, slot = best
-        heal = await execute_action(
-            self._mc,
+        heal = await self._dispatch(
             ActionType.HEAL,
             {"heal_item": item, "slot": slot},
         )
@@ -553,13 +584,12 @@ class SelfPreservationLayer:
     def _pick_healing_item(inventory: list[InventorySlot]) -> tuple[str, int] | None:
         """Return (item_id, slot) for the best healing item in inventory.
 
-        Priority: enchanted_golden_apple > golden_apple > golden_carrot.
+        Priority: enchanted_golden_apple > golden_apple.
         Returns None if no healing item is present.
         """
         priority = {
             "enchanted_golden_apple": 3,
             "golden_apple": 2,
-            "golden_carrot": 1,
         }
         best_priority = -1
         best_item: str | None = None

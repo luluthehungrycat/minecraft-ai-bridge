@@ -25,7 +25,7 @@ class ActionType(str, Enum):
 **File**: `minecraft_ai_bridge/minecraft/actions.py`
 
 ```python
-async def _inspect_entity(mc: McpqClient, params: dict) -> ActionResult:
+async def _inspect_entity(mc: WorldAdapter, params: dict) -> ActionResult:
     entity_type = params.get("entity_type", "nearest")
     # MCPQ doesn't directly support entity inspection,
     # so use a command

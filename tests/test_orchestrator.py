@@ -8,6 +8,8 @@ from minecraft_ai_bridge.bridge.orchestrator import Orchestrator
 from minecraft_ai_bridge.config import AppConfig
 from minecraft_ai_bridge.minecraft import ActionResult, ActionType
 from minecraft_ai_bridge.minecraft.observer import WorldState
+from minecraft_ai_bridge.runtime import ActionService
+from minecraft_ai_bridge.runtime.world_adapter import McpqWorldAdapter
 from tests.conftest import MockLLMClient
 
 
@@ -43,6 +45,13 @@ def _make_orchestrator(mock_mc, monkeypatch, responses: list[tuple[str, dict[str
     orch._goals._llm = llm
     orch._goals.set_goal_from_subgoals("Test goal", [{"description": "Test task"}])
     orch._mc = mock_mc
+    # Mirror the production _connect wiring: one adapter around the mock
+    # client plus one shared ActionService, so _act routes through the gate.
+    orch._world = McpqWorldAdapter(mock_mc)
+    orch._action_service = ActionService(
+        orch._world,
+        policy=orch._action_policy,
+    )
     orch._preservation = None
 
     async def observe() -> WorldState:

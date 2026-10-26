@@ -514,6 +514,7 @@ class OpenRouterClient(LLMClient):
         max_tokens: int = 2048,
         referer: str = "",
         title: str = "Minecraft AI Bridge",
+        base_url: str = "https://openrouter.ai/api/v1",
     ) -> None:
         from openai import AsyncOpenAI
 
@@ -523,7 +524,7 @@ class OpenRouterClient(LLMClient):
         }
 
         self._client = AsyncOpenAI(
-            base_url="https://openrouter.ai/api/v1",
+            base_url=base_url,
             api_key=api_key,
             default_headers=headers,
         )
@@ -909,6 +910,7 @@ def create_llm_client(config: Any) -> LLMClient:
             max_tokens=max_tok,
             referer=config.llm.openrouter_referer,
             title=config.llm.openrouter_title,
+            base_url=config.llm.openrouter_base_url,
         )
 
     elif provider == "opencode_server":

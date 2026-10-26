@@ -3,10 +3,12 @@ services:
     image: itzg/minecraft-server@sha256:c1a267d9ed6de3d1157859753a002aa35f8366d8db00463df3d6b07e86d2bf1d
     container_name: mc-paper
     restart: unless-stopped
+    # Set MC_BIND_ADDRESS=127.0.0.1 (e.g. in .env) to keep these off other
+    # interfaces; RCON uses the example password below.
     ports:
-      - "25565:25565"   # Minecraft client
-      - "25575:25575"   # RCON (admin fallback)
-      - "1789:1789"     # MCPQ plugin (gRPC)
+      - "${MC_BIND_ADDRESS:-0.0.0.0}:25565:25565"   # Minecraft client
+      - "${MC_BIND_ADDRESS:-0.0.0.0}:25575:25575"   # RCON (admin fallback)
+      - "${MC_BIND_ADDRESS:-0.0.0.0}:1789:1789"     # MCPQ plugin (gRPC)
     environment:
       EULA: "TRUE"
       TYPE: PAPER
@@ -17,7 +19,7 @@ services:
       RCON_PASSWORD: "changeme"
       RCON_PORT: 25575
       # Server properties
-      ONLINE_MODE: "false"
+      ONLINE_MODE: "${ONLINE_MODE:-false}"
       DIFFICULTY: "easy"
       MOTD: "Minecraft AI Bridge — MCPQ"
       MAX_PLAYERS: 10
@@ -66,6 +68,10 @@ services:
       LLM_OPENROUTER_API_KEY: "${OPENROUTER_API_KEY}"
       # Persistent memory database (SQLite)
       AGENT_MEMORY_DB: /app/data/agent_memory.db
+      # Durable safety intervention event journal
+      BRIDGE_EVENT_JOURNAL_PATH: /app/data/safety-events.sqlite3
+      # Must match the Paper ONLINE_MODE setting; offline-mode names are forgeable.
+      CHAT_CONTROL_SERVER_ONLINE_MODE: "${ONLINE_MODE:-false}"
     # Array form keeps the goal as a single argument (no shell splitting)
     command: ["--verbose", "${GOAL:-Explore the area and report what you see}"]
     # The bridge has built-in retry logic (20 attempts with backoff),
