@@ -28,6 +28,18 @@ The wording **"There is no requirement to establish a community" is not fully ne
 
 Even "other inhabitants" provides social salience; therefore compare this against a **minimal world-only control**: "You control one character in a persistent Minecraft world. Decide what to do based on your observations, needs, capabilities, and priorities. Follow the server rules." Do not hide other players from the actual observation stream. Keep system-level safety/security instructions identical across conditions. Freeze and version all prompts; pre-register outcomes to limit post hoc story-making. SOUL/personality diversity must vary behavioral preferences, not confer artificial social roles ("king", "police", "merchant"). Include identical-profile and no-social-instruction controls.
 
+### Communication-capability disclosure and discovery controls
+
+**Default for communication-enabled conditions: neutral capability awareness, not social encouragement.** The baseline must tell every Steve which capabilities exist without advising it to socialize, cooperate, build a village, or send messages. Use a standardized, versioned capability overview that gives communication no greater prominence than movement, observation, inventory, crafting and other available tools. A candidate neutral line is:
+
+> Communication with other inhabitants is available through the `send_chat_message` tool. Whether and when to use it is up to you.
+
+The exact tool name must match the implementation; this text is illustrative. The notice is **not** present in communication-disabled conditions, and tool availability must match the condition. In public-only conditions, explain that messages are public; in private-channel conditions, accurately describe recipients, visibility, delivery limitations and experiment logging. Never falsely imply messages are invisible to administrators.
+
+Run an **orthogonal discovery ablation** within communication-enabled conditions: (D0) tools discoverable only through tool schemas/descriptions, (D1) neutral standardized capability overview (default), and optionally (D2) explicit cooperation encouragement as a **positive control only**, excluded from primary spontaneous-emergence estimates. Do not compare D0 and D1 as though they differed only in social motivation: they also differ in tool salience. Keep identical capabilities, tools, token budgets, model configuration and observation access within each D0/D1 pair.
+
+Measure tool recognition/first use, time to first **voluntary outgoing** message, response to incoming messages, message frequency, meaningful exchanges and downstream verified cooperative behavior separately. A reply to another agent is evidence of responsiveness, not spontaneous initiation. Avoid interpreting silence as a preference for solitude until tool discovery and basic competence have been established.
+
 ## 4. Architecture and hard boundaries
 - One Steve ↔ one controller agent/harness instance ↔ one fenced Steve identity/session. No shared controller token or private memory by default.
 - Shared authoritative Paper/Minecraft world, MCPQ adapter and server-side identity registry. Separate observation scopes (public/private), per-Steve authz, bounded action execution, and audit/event logs.
