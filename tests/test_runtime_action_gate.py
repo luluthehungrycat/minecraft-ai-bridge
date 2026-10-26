@@ -673,3 +673,35 @@ class TestProductionWiring:
         assert provision_records
         assert all(record.allowed for record in provision_records)
         assert any("botsummon AIBot" in cmd for cmd in mock_mc.commands_ran)
+
+
+def test_every_action_type_has_an_explicit_security_class():
+    from minecraft_ai_bridge.runtime.action_service import ActionClass, classify_action
+
+    unclassified = [a.value for a in ActionType if classify_action(a) is ActionClass.UNCLASSIFIED]
+    assert unclassified == [], "classify new ActionTypes in action_service.py"
+
+
+@pytest.mark.asyncio
+async def test_unclassified_action_fails_closed_before_policy(mock_mc: MockMcpqClient):
+    from enum import StrEnum
+
+    from minecraft_ai_bridge.runtime import ActionService, PolicyDecision
+    from minecraft_ai_bridge.runtime.world_adapter import McpqWorldAdapter
+
+    class FutureAction(StrEnum):
+        SET_TIME = "set_time"
+
+    policy_calls: list[object] = []
+
+    def allow_everything(request):
+        policy_calls.append(request)
+        return PolicyDecision(True, allow_privileged=True)
+
+    service = ActionService(McpqWorldAdapter(mock_mc), policy=allow_everything)
+    result = await service.execute(FutureAction.SET_TIME, {})  # type: ignore[arg-type]
+
+    assert not result.success
+    assert "no security classification" in result.message
+    assert policy_calls == []
+    assert mock_mc.commands_ran == []

@@ -57,6 +57,8 @@ class ActionClass(StrEnum):
     PRIVILEGED_SIMULATED = "privileged_simulated"
     INTERNAL_CONTROL = "internal_control"
     LIFECYCLE_INTERNAL = "lifecycle_internal"
+    # Not listed in any class below; the gate rejects it before policy.
+    UNCLASSIFIED = "unclassified"
 
 
 _OBSERVATION_ACTIONS = frozenset(
@@ -107,11 +109,15 @@ _INTERNAL_CONTROL_ACTIONS = frozenset(
     }
 )
 _LIFECYCLE_INTERNAL_ACTIONS = frozenset({ActionType.PROVISION_BOT, ActionType.PREPARE_SAFE_SPAWN})
+# Actions with no world effect beyond chat. A new ActionType must be added to
+# exactly one set; unlisted actions fail closed instead of defaulting here.
+_SURVIVAL_ACTIONS = frozenset({ActionType.CHAT, ActionType.WAIT, ActionType.DONE})
 _PRIVILEGED_AUTHORIZATION_CLASSES = frozenset(
     {
         ActionClass.PRIVILEGED_SIMULATED,
         ActionClass.INTERNAL_CONTROL,
         ActionClass.LIFECYCLE_INTERNAL,
+        ActionClass.UNCLASSIFIED,
     }
 )
 _SAFETY_ACTIONS = frozenset({ActionType.ATTACK, ActionType.EAT, ActionType.HEAL})
@@ -127,7 +133,9 @@ def classify_action(action: ActionType) -> ActionClass:
         return ActionClass.INTERNAL_CONTROL
     if action in _LIFECYCLE_INTERNAL_ACTIONS:
         return ActionClass.LIFECYCLE_INTERNAL
-    return ActionClass.SURVIVAL
+    if action in _SURVIVAL_ACTIONS:
+        return ActionClass.SURVIVAL
+    return ActionClass.UNCLASSIFIED
 
 
 @dataclass(frozen=True)
@@ -824,6 +832,13 @@ class ActionService:
     ) -> tuple[PolicyDecision | None, ActionOutcome | None]:
         """Evaluate current policy and audit denials/errors consistently."""
         action_class = classify_action(request.action)
+        if action_class is ActionClass.UNCLASSIFIED:
+            return None, self._rejection_outcome(
+                request,
+                request_id,
+                f"{request.action.value} has no security classification",
+                status="rejected",
+            )
         if request.trusted_safety:
             if not self._safety_params_allowed(request.action, request.params):
                 return None, self._rejection_outcome(
