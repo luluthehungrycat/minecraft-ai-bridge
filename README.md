@@ -383,7 +383,7 @@ The project uses **GitHub Actions** for continuous integration. Every push and p
 
 | Job | What it checks |
 |-----|---------------|
-| **lint** | `ruff check` (code quality), `ruff format --check` (formatting); mypy is available as an opt-in check with `MYPY_ENABLED=true` |
+| **lint** | `ruff check` (code quality), `ruff format --check` (formatting), `mypy` (type checking) |
 | **test** | Deterministic pytest suite across Python 3.11, 3.12, and 3.13 |
 | **style** | `ruff check --select I` (import sorting) |
 | **integration** | Opt-in provider-backed tests; requires `RUN_LIVE_INTEGRATION=true`, Docker, and `OPENROUTER_API_KEY`; provisions pinned Paper 26.2 build 123 and the bot plugin automatically |

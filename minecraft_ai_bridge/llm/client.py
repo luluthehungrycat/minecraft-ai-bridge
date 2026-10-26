@@ -12,9 +12,16 @@ import logging
 import os
 import string
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 from .models import LLMResponse, Message, Role, ToolCall
+
+if TYPE_CHECKING:
+    from openai.types.chat import (
+        ChatCompletionMessageParam,
+        ChatCompletionToolChoiceOptionParam,
+        ChatCompletionToolParam,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -180,12 +187,12 @@ class OpenAIClient(LLMClient):
         try:
             response = await self._client.chat.completions.create(
                 model=self._model,
-                messages=openai_messages,
-                tools=[ACTION_TOOL],
-                tool_choice=tool_choice,
+                messages=cast("list[ChatCompletionMessageParam]", openai_messages),
+                tools=[cast("ChatCompletionToolParam", ACTION_TOOL)],
+                tool_choice=cast("ChatCompletionToolChoiceOptionParam", tool_choice),
                 temperature=self._temperature,
-                max_tokens=self._max_tokens,  # type: ignore[arg-type]
-            )  # type: ignore[arg-type]
+                max_tokens=self._max_tokens,
+            )
         except Exception as exc:
             logger.error("OpenAI API call failed: %s", exc)
             return _make_wait_response(f"API error: {exc}. Waiting and retrying.")
@@ -194,7 +201,8 @@ class OpenAIClient(LLMClient):
         msg = choice.message
 
         # Tool call path
-        if msg.tool_calls:
+        # Only function tool calls carry ACTION_TOOL arguments.
+        if msg.tool_calls and msg.tool_calls[0].type == "function":
             tc = msg.tool_calls[0]
             try:
                 args = json.loads(tc.function.arguments)
@@ -303,7 +311,7 @@ class AnthropicClient(LLMClient):
                 tools=[tool_config],
                 tool_choice={"type": "auto"} if tool_choice == "auto" else None,
                 temperature=self._temperature,
-                max_tokens=self._max_tokens,  # type: ignore[arg-type]
+                max_tokens=self._max_tokens,
             )
         except Exception as exc:
             logger.error("Anthropic API call failed: %s", exc)
@@ -346,7 +354,8 @@ class AnthropicClient(LLMClient):
             content = "".join(b.text for b in response.content if b.type == "text")
             parsed = json.loads(content)
             if isinstance(parsed, dict):
-                return parsed.get("subgoals", parsed.get("steps", []))
+                subgoals = parsed.get("subgoals", parsed.get("steps", []))
+                return subgoals if isinstance(subgoals, list) else []
             if isinstance(parsed, list):
                 return parsed
             return []
@@ -483,7 +492,8 @@ class OllamaClient(LLMClient):
                 content = resp.json().get("message", {}).get("content", "{}")
             parsed = json.loads(content)
             if isinstance(parsed, dict):
-                return parsed.get("subgoals", parsed.get("steps", []))
+                subgoals = parsed.get("subgoals", parsed.get("steps", []))
+                return subgoals if isinstance(subgoals, list) else []
             if isinstance(parsed, list):
                 return parsed
             return []
@@ -546,11 +556,11 @@ class OpenRouterClient(LLMClient):
         try:
             response = await self._client.chat.completions.create(
                 model=self._model,
-                messages=openai_messages,
-                tools=[ACTION_TOOL],
-                tool_choice=tool_choice,
+                messages=cast("list[ChatCompletionMessageParam]", openai_messages),
+                tools=[cast("ChatCompletionToolParam", ACTION_TOOL)],
+                tool_choice=cast("ChatCompletionToolChoiceOptionParam", tool_choice),
                 temperature=self._temperature,
-                max_tokens=self._max_tokens,  # type: ignore[arg-type]
+                max_tokens=self._max_tokens,
             )
         except Exception as exc:
             logger.error("OpenRouter API call failed: %s", exc)
@@ -559,7 +569,8 @@ class OpenRouterClient(LLMClient):
         choice = response.choices[0]
         msg = choice.message
 
-        if msg.tool_calls:
+        # Only function tool calls carry ACTION_TOOL arguments.
+        if msg.tool_calls and msg.tool_calls[0].type == "function":
             tc = msg.tool_calls[0]
             try:
                 args = json.loads(tc.function.arguments)
@@ -605,7 +616,8 @@ class OpenRouterClient(LLMClient):
             content = response.choices[0].message.content or "{}"
             parsed = json.loads(content)
             if isinstance(parsed, dict):
-                return parsed.get("subgoals", parsed.get("steps", []))
+                subgoals = parsed.get("subgoals", parsed.get("steps", []))
+                return subgoals if isinstance(subgoals, list) else []
             if isinstance(parsed, list):
                 return parsed
             return []
@@ -855,7 +867,8 @@ class OpenCodeServerClient(LLMClient):
         try:
             parsed = json.loads(content)
             if isinstance(parsed, dict):
-                return parsed.get("subgoals", parsed.get("steps", []))
+                subgoals = parsed.get("subgoals", parsed.get("steps", []))
+                return subgoals if isinstance(subgoals, list) else []
             if isinstance(parsed, list):
                 return parsed
             return []

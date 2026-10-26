@@ -27,6 +27,12 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
 
 ### Fixed
 
+- Fixed the 12 mypy errors in `llm/client.py`, `rcon.py`, and
+  `goal_manager.py`, and made mypy a required CI step (#2). Goal
+  decomposition now returns an empty list when a provider's JSON holds a
+  non-list `subgoals` value, and non-function tool calls fall back to text
+  parsing instead of raising.
+
 - Fixed automatic healing repeatedly selecting golden carrots that the
   safety-authorized HEAL action rejects. Golden carrots remain eligible for
   ordinary auto-consumption; healing now selects only supported golden apples.

@@ -112,7 +112,7 @@ examples and the conventions block at the top.
 
 ### Code Quality
 - **Tests**: 648 tests collected in total — 636 deterministic unit tests plus 12 integration tests. Unit tests use `MockMcpqClient` for deterministic MCPQ simulation. Integration tests use a real MCPQ server + real LLM (OpenRouter `openai/gpt-oss-20b`, or Requesty `runware/gpt-oss-120b` when only `REQUESTY_API_KEY` is set; override with `INTEGRATION_LLM_MODEL`) for end-to-end validation. The stack uses pinned Paper 26.2 build 123. Run with `pytest tests/`.
-- **Mypy**: The CI job is wired but skipped by default; enable it with the `MYPY_ENABLED` repository variable after SDK typing issues are resolved.
+- **Mypy**: runs in CI on every push and PR (`mypy minecraft_ai_bridge/ --ignore-missing-imports`) and must pass.
 - **gRPC stubs are synchronous**: MCPQ generated stubs block; dispatched via `asyncio.to_thread`. Not ideal but works.
 - **RCON client is unmaintained**: Since the MCPQ migration, `rcon.py` isn't tested. Consider removing or marking deprecated.
 
@@ -161,8 +161,8 @@ The 0.5.0 release completed the testing milestone:
 - Maybe control through MCPQ if the plugin adds it, or use Minecraft's `/execute` with `facing` + `move`
 
 ### P4: Infrastructure
-- Set up GitHub Actions CI (lint + type check + test) — **partial**: CI runs lint + unit tests on every PR; integration tests gated on `OPENROUTER_API_KEY` secret. See `.github/workflows/ci.yml`.
-- Re-enable `mypy` in CI — **tracking**: mypy is currently skipped due to strict OpenAI/Anthropic SDK type signatures in `llm/client.py`. Job is wired up but no-op until `MYPY_ENABLED` repo variable is set. Track re-enablement as a follow-up issue.
+- Set up GitHub Actions CI (lint + type check + test) — **partial**: CI runs lint, mypy, and unit tests on every PR; integration tests gated on `OPENROUTER_API_KEY` secret. See `.github/workflows/ci.yml`.
+- Re-enable `mypy` in CI — **done** (#2).
 - Add `mypy` configuration to `pyproject.toml`
 - Consider adding `pre-commit` hooks
 - Publish to PyPI as `minecraft-ai-bridge`

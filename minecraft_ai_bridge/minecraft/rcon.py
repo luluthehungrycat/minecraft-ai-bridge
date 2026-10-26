@@ -192,13 +192,16 @@ class RCONClient:
         """
         deadline = time.monotonic() + timeout
         chunks: list[bytes] = []
+        reader = self._reader
+        if reader is None:
+            raise ConnectionError("RCON connection is not open")
         remaining = n
         while remaining > 0:
             time_left = deadline - time.monotonic()
             if time_left <= 0:
                 raise TimeoutError()
             try:
-                chunk = await asyncio.wait_for(self._reader.read(remaining), timeout=time_left)
+                chunk = await asyncio.wait_for(reader.read(remaining), timeout=time_left)
             except TimeoutError:
                 raise
             if not chunk:
