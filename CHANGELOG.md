@@ -70,6 +70,10 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
 - Shutdown now completes renewal and safety-worker stops and Authz release/close
   before propagating repeated cancellation; blocking SQLite cleanup runs off the
   asyncio event loop.
+- `place_block`, `craft_item`, and `drop_item` now accept only plain block
+  and item IDs (optional `minecraft:` namespace) and amounts from 1 to 64.
+  These values were interpolated unvalidated into server commands, so block
+  or item data in a request could make a placed block run its own command.
 - Action security classification now fails closed. Only `chat`, `wait`,
   and `done` are survival actions; an ActionType missing from every class is
   rejected before policy instead of defaulting to survival, which an

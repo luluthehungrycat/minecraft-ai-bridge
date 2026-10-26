@@ -1048,3 +1048,37 @@ class TestScanEntitiesDetailed:
         # Creeper is high, so it should be picked over zombie (low)
         # and skeleton (medium)
         assert target == "creeper"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "params"),
+    [
+        (ActionType.PLACE_BLOCK, {"block_type": "stone[snowy=true]"}),
+        (ActionType.PLACE_BLOCK, {"block_type": "stone{}"}),
+        (ActionType.PLACE_BLOCK, {"block_type": "stone replace"}),
+        (ActionType.PLACE_BLOCK, {"block_type": "Stone", "x": 1, "y": 64, "z": 1}),
+        (ActionType.CRAFT_ITEM, {"item_type": "stone{}"}),
+        (ActionType.CRAFT_ITEM, {"item_type": "stone", "amount": 65}),
+        (ActionType.CRAFT_ITEM, {"item_type": "stone", "amount": "1 extra"}),
+        (ActionType.DROP_ITEM, {"item_type": "stone extra"}),
+        (ActionType.DROP_ITEM, {"item_type": "stone", "amount": 0}),
+    ],
+)
+async def test_command_ids_and_amounts_are_validated_before_interpolation(mock_mc, action, params):
+    mock_mc.set_position(0, 64, 0)
+    result = await execute_action(mock_mc, action, params)
+
+    assert not result.success
+    assert mock_mc.commands_ran == []
+
+
+@pytest.mark.asyncio
+async def test_namespaced_ids_are_accepted(mock_mc):
+    result = await execute_action(
+        mock_mc, ActionType.CRAFT_ITEM, {"item_type": "minecraft:oak_planks", "amount": 4}
+    )
+
+    assert result.success
+    mock_mc.assert_command_contains("give")
+    assert "oak_planks 4" in mock_mc.last_command()
