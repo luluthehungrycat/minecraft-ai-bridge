@@ -678,6 +678,29 @@ def _sanitize_player_target(target: object) -> str:
     return target
 
 
+_RESOURCE_ID_RE = re.compile(r"^(?:minecraft:)?[a-z0-9_]{1,64}$")
+
+
+def _sanitize_resource_id(value: object, label: str) -> str:
+    """Return a plain block/item ID, or raise `ValueError`.
+
+    Only lowercase IDs with an optional `minecraft:` namespace are accepted.
+    Block states, NBT data, whitespace, and any other syntax are rejected, so
+    the value cannot change what a `setblock`, `give`, `clear`, or `summon`
+    command does when embedded in it.
+    """
+    if not isinstance(value, str) or not _RESOURCE_ID_RE.fullmatch(value):
+        raise ValueError(f"{label} {value!r} is not a plain Minecraft ID")
+    return value.removeprefix("minecraft:")
+
+
+def _sanitize_amount(value: object) -> int:
+    """Return an item count from 1 to 64, or raise `ValueError`."""
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 64:
+        raise ValueError(f"amount {value!r} must be an integer from 1 to 64")
+    return value
+
+
 # ── Movement ────────────────────────────────────────────────────────────
 
 
@@ -1197,7 +1220,10 @@ async def _place_block(mc: WorldAdapter, params: dict) -> ActionResult:
     x = params.get("x")
     y = params.get("y")
     z = params.get("z")
-    block_type = params.get("block_type", "stone")
+    try:
+        block_type = _sanitize_resource_id(params.get("block_type", "stone"), "block_type")
+    except ValueError as exc:
+        return ActionResult(success=False, action=ActionType.PLACE_BLOCK, message=str(exc))
     try:
         if x is not None and y is not None and z is not None:
             await mc.set_block(block_type, int(x), int(y), int(z))
@@ -1341,8 +1367,11 @@ async def _craft_item(mc: WorldAdapter, params: dict) -> ActionResult:
     system (recipe matching + crafting table interaction) is tracked as a
     planned feature (see docs/features/).
     """
-    item = params.get("item_type", "crafting_table")
-    amount = params.get("amount", 1)
+    try:
+        item = _sanitize_resource_id(params.get("item_type", "crafting_table"), "item_type")
+        amount = _sanitize_amount(params.get("amount", 1))
+    except ValueError as exc:
+        return ActionResult(success=False, action=ActionType.CRAFT_ITEM, message=str(exc))
     try:
         resp = await _cmd(mc, f"give @p {item} {amount}")
         return ActionResult(
@@ -1366,8 +1395,11 @@ async def _drop_item(mc: WorldAdapter, params: dict) -> ActionResult:
     entity at the player's position.  This is a best-effort simulation;
     a proper drop system should use MCPQ's direct player-inventory API.
     """
-    item = params.get("item_type", "stone")
-    amount = params.get("amount", 1)
+    try:
+        item = _sanitize_resource_id(params.get("item_type", "stone"), "item_type")
+        amount = _sanitize_amount(params.get("amount", 1))
+    except ValueError as exc:
+        return ActionResult(success=False, action=ActionType.DROP_ITEM, message=str(exc))
     try:
         # Get player position to spawn item drop there
         pos = await mc.get_player_pos()

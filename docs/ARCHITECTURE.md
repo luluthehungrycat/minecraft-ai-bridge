@@ -406,8 +406,10 @@ require `admin:world` under Authz; ordinary controller sessions cannot reach
 them by selecting a different ActionType. Classification is an explicit
 allowlist: `chat`, `wait`, and `done` are the only survival actions, and an
 ActionType missing from every class is rejected before policy evaluation
-instead of defaulting to survival. Local mode preserves existing CLI
-behavior. Safety reflexes use a distinct bounded capability described above.
+instead of defaulting to survival. Handlers that build server commands from
+request strings validate them first: player targets as plain usernames, and
+block and item names as plain IDs without block states or NBT data. Local
+mode preserves existing CLI behavior. Safety reflexes use a distinct bounded capability described above.
 
 ### Independently scheduled preservation (safety prerequisite slice)
 
