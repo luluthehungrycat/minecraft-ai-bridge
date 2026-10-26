@@ -27,6 +27,8 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
 
 ### Fixed
 
+- `McpqClient.connect` now cleans up the MCPQ client created by each failed
+  attempt instead of leaving it to garbage collection.
 - `McpqClient.disconnect` now shuts down the MCPQ client explicitly. It
   previously only dropped the reference, leaving cleanup to garbage
   collection, which could run inside another thread's gRPC call and deadlock
@@ -135,7 +137,13 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
   idempotency. Pass it to `ActionService` or `ControllerService` as
   `outcome_store=`; a retry after a bridge restart replays the stored outcome,
   and a dispatch interrupted by a crash is reported as unknown instead of
-  running again (#23).
+  running again (#23). Requests move `reserved` → `dispatching` → terminal
+  with owner compare-and-set, so instances sharing a database dispatch a
+  request ID at most once; outcome writes run off the event loop; expired
+  outcomes leave tombstones for a 365-day idempotency window.
+- `ControllerService` results now carry a stable `action_id` for the logical
+  action, shared by replays and retries, and `ControllerService.aclose()`
+  waits for pending outcome writes.
 
 - Added `runtime.ControllerService`, a transport-independent controller API
   for one Steve (RFC-0001 Phase B slice). It opens exclusive Authz controller
