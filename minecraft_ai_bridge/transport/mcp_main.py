@@ -51,6 +51,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="SQLite file for durable request-ID outcomes",
     )
     parser.add_argument(
+        "--max-edit-distance",
+        type=float,
+        default=6.0,
+        help="Farthest block edit (break/place with coordinates) from the bot",
+    )
+    parser.add_argument(
+        "--max-move-distance",
+        type=float,
+        default=32.0,
+        help="Farthest teleport, move_to, or walk_to destination from the bot",
+    )
+    parser.add_argument(
         "--session-lease-seconds",
         type=float,
         default=300,
@@ -78,12 +90,14 @@ async def serve(args: argparse.Namespace, config: AppConfig) -> None:
     """Connect the runtime services and serve until the transport stops."""
     from ..minecraft.mc_api import McpqClient
     from ..runtime import AuthzService, ControllerService, SqliteActionOutcomeStore
+    from ..runtime.controller_service import ReachLimits
     from ..runtime.world_adapter import McpqWorldAdapter
     from .mcp_server import build_mcp_server
 
     steve_id = config.authz.steve_id.strip()
     if not steve_id:
         raise ValueError("config authz.steve_id must name the Steve to serve")
+    reach = ReachLimits(edit_distance=args.max_edit_distance, move_distance=args.max_move_distance)
     stdio_token = os.environ.get(STDIO_TOKEN_ENV, "").strip() or None
     if args.transport == "stdio" and stdio_token is None:
         raise ValueError(f"stdio transport requires the {STDIO_TOKEN_ENV} environment variable")
@@ -100,6 +114,7 @@ async def serve(args: argparse.Namespace, config: AppConfig) -> None:
         world_admin_token=config.authz.world_admin_token.get_secret_value(),
         session_lease_seconds=args.session_lease_seconds,
         outcome_store=store,
+        reach_limits=reach,
     )
     # Over HTTP each request authenticates with its own header; the process
     # token is only for stdio.

@@ -301,11 +301,26 @@ administrator grants scopes when creating the credential; changing them means
 issuing a new credential. Privileged actions with no delegation scope
 (internal and lifecycle actions) are always denied on this path. The
 built-in CLI agent is trusted in-process and does not use delegation scopes.
-Delegated actions still have no reach limit (#25), and parameter validation
-still applies. Authentication failures raise `PermissionError`; every other refusal
+Parameter validation still applies.
+
+Targeted actions are also limited by `ReachLimits` (#25), measured from the
+bot's current position before dispatch: `break_block`/`place_block` with
+explicit coordinates within `edit_distance` (default 6 blocks), and
+`teleport`/`move_to` (3D) and `walk_to` (horizontal) destinations within
+`move_distance` (default 32) and inside the world height range -64..320.
+Edits without coordinates act next to the bot and relative steps are already
+bounded, so they are not checked. If the position cannot be read the request
+is rejected; violations are `rejected` with reason code `OUT_OF_REACH` and
+nothing is dispatched. The check happens before the request takes the dispatch
+lock, so a move the same controller has in flight can shift the reference
+point by at most one move; and a replay of an earlier request is checked
+against the bot's current position, so it may be refused (never repeated)
+after the bot has moved. The built-in CLI agent is not limited.
+
+Authentication failures raise `PermissionError`; every other refusal
 is a `rejected` result with a `reason_code` (`STEVE_MISMATCH`,
 `SESSION_UNKNOWN`, `SESSION_NOT_OWNED`, `STALE_GENERATION`,
-`ACTION_NOT_EXPOSED`, `POLICY_REJECTED`).
+`ACTION_NOT_EXPOSED`, `OUT_OF_REACH`, `POLICY_REJECTED`).
 
 There is no task service or event API yet, and the safety supervisor does not
 run for externally controlled Steves.
@@ -338,8 +353,8 @@ MCP tool errors (`unauthorized: ...`, `invalid request: ...`); controller-level
 rejections are returned as `rejected` results with their `reason_code`.
 
 Limitations: the bot entity must already exist (the server does not summon
-it); externally controlled Steves have no safety supervisor; delegated world
-edits have no reach limit (#25); there is no event polling or task API.
+it); externally controlled Steves have no safety supervisor; there is no event
+polling or task API.
 
 ### Durable event journal (Phase C slice)
 

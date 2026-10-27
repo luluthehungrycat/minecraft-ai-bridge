@@ -149,6 +149,8 @@ minecraft-ai-bridge-mcp --transport http --port 8765
 | `--host` / `--port` | `127.0.0.1` / `8765` | HTTP bind address |
 | `--allow-remote` | off | Required to bind HTTP to a non-loopback address; terminate TLS in front of it |
 | `--outcome-store` | `data/action-outcomes.sqlite3` | Durable request-ID outcomes |
+| `--max-edit-distance` | `6` | Farthest `break_block`/`place_block` target (with coordinates) from the bot |
+| `--max-move-distance` | `32` | Farthest `teleport`/`move_to`/`walk_to` destination from the bot |
 | `--session-lease-seconds` | `300` | Controller session lease |
 
 | Variable | Used for |

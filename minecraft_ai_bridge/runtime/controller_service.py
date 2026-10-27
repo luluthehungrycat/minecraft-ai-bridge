@@ -26,14 +26,16 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import math
 from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4, uuid5
 
 from pydantic import ValidationError
 
-from ..minecraft.actions import ActionType
+from ..minecraft.actions import ActionType, _finite_coordinate
 from ..minecraft.observer import Observer
 from ..minecraft.world_types import WorldAdapter
 from .action_outcomes import SqliteActionOutcomeStore
@@ -104,6 +106,36 @@ _EXPOSABLE_CLASSES = frozenset(
 _OBSERVE_SCOPES = ("steve:observe:self", "steve:control")
 
 
+@dataclass(frozen=True)
+class ReachLimits:
+    """How far from the bot an external controller may act (#25).
+
+    ``edit_distance`` bounds block edits with explicit coordinates (vanilla
+    reach is about 4.5-5 blocks). ``move_distance`` bounds teleport and
+    move_to (3D) and walk_to (horizontal) destinations, which must also lie
+    within the world height range ``min_y``..``max_y``.
+    """
+
+    edit_distance: float = 6.0
+    move_distance: float = 32.0
+    min_y: float = -64.0
+    max_y: float = 320.0
+
+    def __post_init__(self) -> None:
+        if not (self.edit_distance > 0 and self.move_distance > 0 and self.min_y < self.max_y):
+            raise ValueError("reach limits must be positive and min_y below max_y")
+
+
+# Actions whose parameters name an absolute target, by reach rule.
+_REACH_KINDS: dict[ActionType, str] = {
+    ActionType.TELEPORT: "move",
+    ActionType.MOVE_TO: "move",
+    ActionType.WALK_TO: "walk",
+    ActionType.BREAK_BLOCK: "edit",
+    ActionType.PLACE_BLOCK: "edit",
+}
+
+
 class ControllerService:
     """Authenticated observation and action API for a single Steve."""
 
@@ -117,6 +149,7 @@ class ControllerService:
         session_lease_seconds: float = 300,
         safety_authority: object | None = None,
         outcome_store: SqliteActionOutcomeStore | None = None,
+        reach_limits: ReachLimits | None = None,
     ) -> None:
         if session_lease_seconds <= 0:
             raise ValueError("controller session lease must be positive")
@@ -124,6 +157,7 @@ class ControllerService:
         self._authz = authz
         self._steve_id = steve_id
         self._lease_seconds = session_lease_seconds
+        self._reach = reach_limits or ReachLimits()
         self._sessions: dict[str, AuthzControllerSession] = {}
         # The requesting session for the current task. ActionService's policy
         # reads it, so concurrent requests from different sessions cannot see
@@ -233,6 +267,11 @@ class ControllerService:
                 credential.credential_id, request, ActionStatus.REJECTED, *rejection
             )
         assert session is not None
+        reach = await self._reach_violation(request)
+        if reach is not None:
+            return self._result(
+                credential.credential_id, request, ActionStatus.REJECTED, "OUT_OF_REACH", reach
+            )
 
         correlation_id = str(uuid4())
         context = self._current.set(session)
@@ -266,6 +305,57 @@ class ControllerService:
         storage error still fails closed through ActionService.
         """
         return await asyncio.to_thread(self._authz_policy, request)
+
+    async def _reach_violation(self, request: ActionRequestSchema) -> str | None:
+        """Return why a targeted action is out of reach, or None if it is in reach.
+
+        Only actions with absolute targets are checked; relative steps and
+        edits next to the bot are already bounded. Malformed coordinates are
+        left to the handler, which rejects them without running a command.
+        """
+        kind = _REACH_KINDS.get(request.action)
+        if kind is None:
+            return None
+        params = request.params
+        if kind == "edit" and not all(axis in params for axis in ("x", "y", "z")):
+            return None
+        try:
+            # Same defaults as the handlers: move_to treats missing axes as 0,
+            # and walk_to's y is optional.
+            x = _finite_coordinate(params.get("x", 0), "x")
+            z = _finite_coordinate(params.get("z", 0), "z")
+            y = (
+                _finite_coordinate(params.get("y", 0), "y")
+                if kind != "walk" or "y" in params
+                else None
+            )
+        except ValueError:
+            return None
+        position = await self._world.get_player_pos()
+        if position is None:
+            return "the bot's position is unknown, so reach cannot be checked"
+        limits = self._reach
+        if kind == "edit":
+            assert y is not None
+            distance = math.dist(position, (x, y, z))
+            if distance > limits.edit_distance:
+                return (
+                    f"target is {distance:.1f} blocks away; edits are limited to "
+                    f"{limits.edit_distance:g}"
+                )
+            return None
+        if y is not None and not limits.min_y <= y <= limits.max_y:
+            return f"target y={y:g} is outside {limits.min_y:g}..{limits.max_y:g}"
+        if kind == "move" and y is not None:
+            distance = math.dist(position, (x, y, z))
+        else:
+            distance = math.dist((position[0], position[2]), (x, z))
+        if distance > limits.move_distance:
+            return (
+                f"target is {distance:.1f} blocks away; movement is limited to "
+                f"{limits.move_distance:g}"
+            )
+        return None
 
     @staticmethod
     def _revalidate(request: ActionRequestSchema) -> ActionRequestSchema:
@@ -380,4 +470,4 @@ def _action_id(steve_id: str, credential_id: str, request_id: str) -> str:
 
 _ACTION_ID_NAMESPACE = UUID("6f0d3c1e-6a0b-5c5e-9a8e-4a1d5f2b7c90")
 
-__all__ = ["ControllerService"]
+__all__ = ["ControllerService", "ReachLimits"]
