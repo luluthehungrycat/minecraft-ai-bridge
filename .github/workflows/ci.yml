@@ -34,18 +34,7 @@ jobs:
         run: ruff format --check minecraft_ai_bridge/ tests/
 
       - name: Type check with mypy
-        # TODO(#2): mypy is currently skipped because the
-        # `llm/client.py` kwargs annotation needs to be reconciled with
-        # the OpenAI SDK's strict types. See issue #2 for the
-        # re-enablement plan. Until that's done, this job is a no-op
-        # so the workflow stays green. Set the MYPY_ENABLED
-        # repository variable to override and run mypy anyway.
-        run: |
-          if [ -n "${{ vars.MYPY_ENABLED }}" ]; then
-            mypy minecraft_ai_bridge/ --ignore-missing-imports
-          else
-            echo "Type checking skipped (set MYPY_ENABLED var to re-enable)"
-          fi
+        run: mypy minecraft_ai_bridge/ --ignore-missing-imports
 
       - name: Check import sorting
         run: ruff check --select I minecraft_ai_bridge/ tests/

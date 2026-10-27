@@ -263,8 +263,12 @@ requests into its calls. It composes the pieces above:
   authorization, request-ID idempotency scoping, and audit match the CLI.
   Only actions on an explicit allowlist are exposed, so a new ActionType is
   unreachable until added; internal-control and lifecycle actions never are.
-  Request-ID replay protection is process-local and bounded, like the
-  ActionService it uses: a retry after a bridge restart can repeat a mutation.
+  Request-ID replay protection survives restarts when the service is given a
+  `SqliteActionOutcomeStore` (`outcome_store=`); without one it is
+  process-local, and a retry after a bridge restart can repeat a mutation.
+  `action_id` names the logical action: it is derived from the Steve,
+  credential, and request ID, so replays and retries, including after a
+  restart, report the same ID.
 - The service re-validates every `ActionRequestSchema` it receives, because
   Pydantic skips validation in `model_construct()` and
   `model_copy(update=...)`; malformed requests raise `ValueError` before
@@ -442,8 +446,10 @@ except that a later success never replaces an unconsumed failure. Goal
 decomposition is covered by the supervisor as well.
 Strategic WAIT actions are interruptible and do not hold
 the ActionService dispatch lock; other dispatch coroutines are serialized.
-A reflex therefore waits for any strategic action already dispatched to the
-backend to finish: a long `walk_to` delays reflex dispatch by its duration.
+Multi-step strategic actions (`walk_to`, `move_forward`, `move_back`,
+`sprint`) check between steps whether a reflex is waiting for that lock and
+stop with an `interrupted` result, so a reflex waits at most one step plus any
+MCPQ call already in flight. Single-step actions still run to completion.
 When a safety reflex starts, the shared action service invalidates strategic
 requests that have not crossed the backend dispatch boundary; it re-enables
 them after the intervention is consumed. Cancellation can release that lock
@@ -508,7 +514,42 @@ read-only commands.
 `ActionService.execute` accepts an optional `request_id`. Calls that omit it
 behave exactly as before. With an explicit `request_id` the service keeps a
 process-local, bounded terminal registry (plus separate in-flight entries,
-which are never evicted):
+which are never evicted). An optional `SqliteActionOutcomeStore` makes it
+durable with a per-request state machine, `reserved` → `dispatching` →
+terminal:
+
+- `claim` inserts a `reserved` row only if the request ID has none, so two
+  ActionService instances sharing a database cannot both own a request. An
+  existing terminal record replays (or conflicts); a request reserved or
+  dispatching elsewhere is refused without dispatching and without caching.
+- `begin_dispatch` moves the row to `dispatching` with a compare-and-set on
+  the owner token, under the dispatch lock and before policy evaluation, so
+  it is persisted before any backend call can start. A reservation whose
+  owner crashed while waiting for the lock can be taken over after
+  `reservation_timeout_seconds` (default 300); the old owner's
+  compare-and-set then fails and it does not dispatch, and it can no longer
+  record an outcome for the row. Takeover and `begin_dispatch` are each
+  atomic in SQLite, so when they race exactly one owner reaches
+  `dispatching`. A `dispatching` row is never taken over.
+- `complete` records the terminal outcome off the event loop in a tracked
+  task. The caller's result is returned only after the write; cancellation
+  does not abandon it, and `ActionService.flush()` /
+  `ControllerService.aclose()` wait for pending writes at shutdown. A row
+  left in `dispatching` (a crash after dispatch, or a failed write) reads as
+  an unknown outcome and never dispatches again.
+
+This is at-most-once dispatch per request ID within the retention window,
+not exactly-once execution: the backend is not part of the SQLite
+transaction, so a crash after dispatch leaves the outcome unknown. Full
+outcomes are kept for `max_age_seconds` (7 days) and the newest
+`max_records` (10,000); older ones become tombstones holding only the request
+ID, fingerprint, and identity scope, so the ID still cannot be reused.
+Tombstones are deleted after `tombstone_max_age_seconds` (365 days), which
+bounds the idempotency window; after that an ID may dispatch again. Records
+keep their identity scope, so a retry from a new controller session is
+refused rather than replayed. Unreadable or incompatible records read as
+unknown outcomes, and the store refuses to open a database with another
+schema version.
 
 - An identical action+params payload replays the stored terminal result
   instead of dispatching again. Replayed results are copies flagged with

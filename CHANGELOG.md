@@ -27,6 +27,21 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
 
 ### Fixed
 
+- `McpqClient.connect` now cleans up the MCPQ client created by each failed
+  attempt instead of leaving it to garbage collection.
+- `McpqClient.disconnect` now shuts down the MCPQ client explicitly. It
+  previously only dropped the reference, leaving cleanup to garbage
+  collection, which could run inside another thread's gRPC call and deadlock
+  the bridge (reproduced as a hang in the integration suite).
+- Safety reflexes no longer wait for a long strategic movement to finish.
+  `walk_to`, `move_forward`, `move_back`, and `sprint` stop between steps once
+  a reflex is waiting and report `interrupted` (#22).
+- Fixed the 12 mypy errors in `llm/client.py`, `rcon.py`, and
+  `goal_manager.py`, and made mypy a required CI step (#2). Goal
+  decomposition now returns an empty list when a provider's JSON holds a
+  non-list `subgoals` value, and non-function tool calls fall back to text
+  parsing instead of raising.
+
 - Fixed automatic healing repeatedly selecting golden carrots that the
   safety-authorized HEAL action rejects. Golden carrots remain eligible for
   ordinary auto-consumption; healing now selects only supported golden apples.
@@ -117,6 +132,18 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
   rejection message now says so. Bridges without a custom policy are unaffected.
 
 ### Added
+
+- Added `runtime.SqliteActionOutcomeStore` for durable request-ID
+  idempotency. Pass it to `ActionService` or `ControllerService` as
+  `outcome_store=`; a retry after a bridge restart replays the stored outcome,
+  and a dispatch interrupted by a crash is reported as unknown instead of
+  running again (#23). Requests move `reserved` → `dispatching` → terminal
+  with owner compare-and-set, so instances sharing a database dispatch a
+  request ID at most once; outcome writes run off the event loop; expired
+  outcomes leave tombstones for a 365-day idempotency window.
+- `ControllerService` results now carry a stable `action_id` for the logical
+  action, shared by replays and retries, and `ControllerService.aclose()`
+  waits for pending outcome writes.
 
 - Added `runtime.ControllerService`, a transport-independent controller API
   for one Steve (RFC-0001 Phase B slice). It opens exclusive Authz controller

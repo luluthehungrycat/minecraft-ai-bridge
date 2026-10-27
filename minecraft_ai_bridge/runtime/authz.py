@@ -1229,7 +1229,16 @@ class AuthzService:
         session: ControllerSession | Callable[[], ControllerSession | None],
         *,
         admin_token: str | None = None,
+        blocking: bool = False,
     ):
+        """Return an ActionService policy bound to a controller session.
+
+        By default the policy validates without waiting for the service lock
+        (``try_validate_session``) and denies when the lock is busy, so it is
+        safe to call on an event loop. With ``blocking=True`` it waits for
+        the lock instead, so concurrent requests are not denied by contention;
+        call that variant from a worker thread, never on the event loop.
+        """
         from .action_service import (
             _PRIVILEGED_AUTHORIZATION_CLASSES,
             PolicyDecision,
@@ -1241,7 +1250,7 @@ class AuthzService:
             privileged = classify_action(request.action) in _PRIVILEGED_AUTHORIZATION_CLASSES
             authorized = bool(
                 active_session
-                and self.try_validate_session(
+                and (self.validate_session if blocking else self.try_validate_session)(
                     active_session,
                     required_admin_scope="admin:world" if privileged else None,
                     admin_token=admin_token,

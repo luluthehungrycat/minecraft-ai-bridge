@@ -29,13 +29,14 @@ import logging
 from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4, uuid5
 
 from pydantic import ValidationError
 
 from ..minecraft.actions import ActionType
 from ..minecraft.observer import Observer
 from ..minecraft.world_types import WorldAdapter
+from .action_outcomes import SqliteActionOutcomeStore
 from .action_service import (
     ActionClass,
     ActionRequest,
@@ -115,6 +116,7 @@ class ControllerService:
         world_admin_token: str | None = None,
         session_lease_seconds: float = 300,
         safety_authority: object | None = None,
+        outcome_store: SqliteActionOutcomeStore | None = None,
     ) -> None:
         if session_lease_seconds <= 0:
             raise ValueError("controller session lease must be positive")
@@ -130,14 +132,21 @@ class ControllerService:
             f"controller_session_{steve_id}", default=None
         )
         self._authz_policy = authz.action_policy(
-            self._current.get, admin_token=(world_admin_token or "").strip() or None
+            self._current.get,
+            admin_token=(world_admin_token or "").strip() or None,
+            blocking=True,
         )
         self._action_service = ActionService(
             world,
             policy=self._policy,
             safety_authority=safety_authority,
+            outcome_store=outcome_store,
         )
         self._observer = Observer(world)
+
+    async def aclose(self) -> None:
+        """Wait for pending durable outcome writes; call before shutdown."""
+        await self._action_service.flush()
 
     @property
     def action_service(self) -> ActionService:
@@ -214,7 +223,9 @@ class ControllerService:
         session = self._sessions.get(request.controller_session_id)
         rejection = self._envelope_rejection(credential.credential_id, request, session)
         if rejection is not None:
-            return self._result(request, ActionStatus.REJECTED, *rejection)
+            return self._result(
+                credential.credential_id, request, ActionStatus.REJECTED, *rejection
+            )
         assert session is not None
 
         correlation_id = str(uuid4())
@@ -234,27 +245,21 @@ class ControllerService:
             ActionStatus.REJECTED: "POLICY_REJECTED",
             ActionStatus.FAILED: "ACTION_FAILED",
         }.get(status)
-        return self._result(request, status, reason_code, result.message)
+        return self._result(credential.credential_id, request, status, reason_code, result.message)
 
     # ── Helpers ──────────────────────────────────────────────────────
 
     async def _policy(self, request: ActionRequest) -> PolicyDecision:
-        """Evaluate the Authz policy without spurious contention denials.
+        """Evaluate the blocking Authz policy in a worker thread.
 
-        The Authz policy validates with a non-blocking lock attempt and denies
-        when another request's authentication holds the lock, which would
-        reject concurrent requests from a valid session. Here the worker
-        thread first waits for that re-entrant lock, so the policy's own
-        attempt succeeds. ``asyncio.to_thread`` copies the context, so the
-        requesting session is still the one bound in ``_current``. A busy
-        database in another process still fails closed.
+        The default Authz policy denies when its lock is busy, which would
+        reject concurrent requests from a valid session because each request
+        authenticates under that lock. The blocking variant waits instead, so
+        it runs off the event loop. ``asyncio.to_thread`` copies the context,
+        so the requesting session is still the one bound in ``_current``. A
+        storage error still fails closed through ActionService.
         """
-
-        def evaluate() -> PolicyDecision:
-            with self._authz._lock:
-                return self._authz_policy(request)
-
-        return await asyncio.to_thread(evaluate)
+        return await asyncio.to_thread(self._authz_policy, request)
 
     @staticmethod
     def _revalidate(request: ActionRequestSchema) -> ActionRequestSchema:
@@ -326,13 +331,14 @@ class ControllerService:
 
     def _result(
         self,
+        credential_id: str,
         request: ActionRequestSchema,
         status: ActionStatus,
         reason_code: str | None,
         message: str,
     ) -> ActionResultSchema:
         return ActionResultSchema(
-            action_id=f"act-{uuid4()}",
+            action_id=_action_id(request.steve_id, credential_id, request.request_id),
             steve_id=request.steve_id,
             request_id=request.request_id,
             status=status,
@@ -353,5 +359,19 @@ class ControllerService:
             status=SessionStatus.ACTIVE,
         )
 
+
+def _action_id(steve_id: str, credential_id: str, request_id: str) -> str:
+    """Return the stable ID of the logical action a request ID names.
+
+    RFC-0001 treats action IDs as durable across reconnects, so replays and
+    retries of one request ID from one credential share an ID, including
+    after a restart. It is derived rather than stored, so it needs no
+    persistence.
+    """
+    name = "\x00".join((steve_id, credential_id, request_id))
+    return f"act-{uuid5(_ACTION_ID_NAMESPACE, name)}"
+
+
+_ACTION_ID_NAMESPACE = UUID("6f0d3c1e-6a0b-5c5e-9a8e-4a1d5f2b7c90")
 
 __all__ = ["ControllerService"]

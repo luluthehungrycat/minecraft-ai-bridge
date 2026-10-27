@@ -78,7 +78,7 @@ class McpqClient:
                 return
             except Exception as exc:
                 last_exc = exc
-                self._mc = None
+                await self._discard_client()
                 if attempt < retries:
                     wait = min(delay * (1.5 ** (attempt - 1)), 30.0)
                     logger.warning(
@@ -98,11 +98,28 @@ class McpqClient:
         ) from last_exc
 
     async def disconnect(self) -> None:
-        """Close the gRPC channel."""
-        if self._mc is not None:
-            # gRPC channel close is best-effort
-            self._mc = None
+        """Stop MCPQ's event thread and close the gRPC channel.
+
+        Dropping the reference alone left cleanup to ``Minecraft.__del__``,
+        which garbage collection can run inside another thread's gRPC call;
+        that cleanup then deadlocks waiting on gRPC's own lock. Cleaning up
+        here, in a worker thread, keeps it deterministic and off the loop.
+        """
+        if await self._discard_client():
             logger.info("Disconnected from MCPQ plugin")
+
+    async def _discard_client(self) -> bool:
+        """Clean up and forget the current mcpq client; False if there was none."""
+        mc, self._mc = self._mc, None
+        if mc is None:
+            return False
+        try:
+            # mcpq exposes no public close(); _cleanup is idempotent, so the
+            # later __del__ call is a no-op.
+            await asyncio.to_thread(mc._cleanup)
+        except Exception:
+            logger.exception("MCPQ cleanup failed")
+        return True
 
     # ── Thread-pool helper ────────────────────────────────────────────
 

@@ -377,6 +377,9 @@ class GoalManager:
             ]
             logger.info("No keyword match; using generic fallback plan.")
 
+        root = self._root
+        if root is None:
+            raise RuntimeError("fallback decomposition requires a root goal")
         for i, step_desc in enumerate(steps):
             sg = AgentGoal(
                 description=step_desc,
@@ -384,8 +387,8 @@ class GoalManager:
                 depth=1,
                 parent_goal=description,
             )
-            sg._parent_ref = self._root
-            self._root.sub_goals.append(sg)
+            sg._parent_ref = root
+            root.sub_goals.append(sg)
         logger.info("Fallback decomposition: %d sub-goals", len(steps))
 
     @staticmethod
