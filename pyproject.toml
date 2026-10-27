@@ -35,7 +35,9 @@ dependencies = [
 [project.optional-dependencies]
 anthropic = ["anthropic>=0.30"]
 ollama = []
+mcp = ["mcp>=2.3,<3"]
 dev = [
+    "mcp>=2.3,<3",
     "pytest>=7.0",
     "pytest-asyncio>=0.21",
     "pytest-timeout>=2.0",
@@ -50,6 +52,7 @@ Repository = "https://github.com/luluthehungrycat/minecraft-ai-bridge"
 
 [project.scripts]
 minecraft-ai-bridge = "minecraft_ai_bridge.main:main"
+minecraft-ai-bridge-mcp = "minecraft_ai_bridge.transport.mcp_main:main"
 
 [tool.setuptools.packages.find]
 include = ["minecraft_ai_bridge*", "tests*"]

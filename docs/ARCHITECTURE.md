@@ -307,8 +307,39 @@ is a `rejected` result with a `reason_code` (`STEVE_MISMATCH`,
 `SESSION_UNKNOWN`, `SESSION_NOT_OWNED`, `STALE_GENERATION`,
 `ACTION_NOT_EXPOSED`, `POLICY_REJECTED`).
 
-This slice has no transport, task service, or event API, and does not run the
-safety supervisor for externally controlled Steves.
+There is no task service or event API yet, and the safety supervisor does not
+run for externally controlled Steves.
+
+### MCP transport (Phase B slice)
+
+`minecraft_ai_bridge.transport.mcp_server.build_mcp_server` exposes one
+`ControllerService` to MCP clients through six tools:
+`minecraft_get_capabilities`, `minecraft_get_state`, `minecraft_open_session`,
+`minecraft_renew_session`, `minecraft_close_session`, and
+`minecraft_submit_action`. Each tool makes exactly one `ControllerService`
+call, so authentication, session fencing, delegation scopes, the exposed-action
+allowlist, parameter validation, and idempotency are enforced there and nowhere
+else. The adapter only decides which bearer token a call carries:
+
+- Streamable HTTP: the `Authorization: Bearer <token>` header of the HTTP
+  request carrying the call. A missing header, another scheme, or an invalid
+  token is refused; there is no fallback to any other token. Requests are
+  stateless (`stateless_http=True`), since controller sessions live in
+  `ControllerService`, not in the MCP transport.
+- stdio: the controller token in `MAB_CONTROLLER_TOKEN`, supplied by the
+  harness that launches the process.
+
+The `minecraft-ai-bridge-mcp` command (`transport/mcp_main.py`) connects MCPQ,
+`AuthzService`, and a `SqliteActionOutcomeStore`, then serves stdio or
+Streamable HTTP. HTTP binds to `127.0.0.1` by default, where the SDK's
+DNS-rebinding protection applies; any non-loopback address requires
+`--allow-remote`, and the server does not terminate TLS itself. Refusals become
+MCP tool errors (`unauthorized: ...`, `invalid request: ...`); controller-level
+rejections are returned as `rejected` results with their `reason_code`.
+
+Limitations: the bot entity must already exist (the server does not summon
+it); externally controlled Steves have no safety supervisor; delegated world
+edits have no reach limit (#25); there is no event polling or task API.
 
 ### Durable event journal (Phase C slice)
 

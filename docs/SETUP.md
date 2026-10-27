@@ -187,6 +187,9 @@ minecraft-ai-bridge -c my-config.yaml "Plant a wheat farm"
 minecraft-ai-bridge --list-providers
 ```
 
+To let an external agent harness control the bot over MCP instead, see
+[MCP Server](CLI.md#mcp-server-minecraft-ai-bridge-mcp).
+
 ## Paper Server Setup (Manual)
 
 If not using Docker, here's how to set up the server manually.

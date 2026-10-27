@@ -1,0 +1,182 @@
+"""End-to-end: the minecraft-ai-bridge-mcp server against a live Paper/MCPQ server.
+
+Launches the real server command as a subprocess (stdio and Streamable HTTP)
+and drives it with the MCP client. Skips when no MCPQ server is reachable.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import socket
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+pytest.importorskip("mcp")
+
+import httpx2  # noqa: E402
+from mcp import Client, StdioServerParameters  # noqa: E402
+from mcp.client.streamable_http import streamable_http_client  # noqa: E402
+
+from minecraft_ai_bridge.minecraft.mc_api import McpqClient  # noqa: E402
+from minecraft_ai_bridge.runtime import AuthzService  # noqa: E402
+
+MC_HOST = os.environ.get("MC_API_HOST", "localhost")
+MC_PORT = int(os.environ.get("MC_API_PORT", "1789"))
+PLAYER = os.environ.get("MC_API_PLAYER_NAME", "AIBot")
+WORLD_SCOPES = {"steve:world:move", "steve:world:edit", "steve:world:items", "steve:world:combat"}
+
+
+def _mcpq_reachable() -> bool:
+    try:
+        with socket.create_connection((MC_HOST, MC_PORT), timeout=2):
+            return True
+    except OSError:
+        return False
+
+
+pytestmark = pytest.mark.skipif(not _mcpq_reachable(), reason="no MCPQ server reachable")
+
+
+@pytest.fixture
+async def stack(tmp_path):
+    """Authz database, config file, tokens, and a summoned bot."""
+    mc = McpqClient(host=MC_HOST, port=MC_PORT, player_name=PLAYER)
+    await mc.connect(retries=3)
+    if await mc.get_player_pos() is None:
+        await mc.run_command_blocking(f"botsummon {PLAYER}")
+        for _ in range(20):
+            if await mc.get_player_pos() is not None:
+                break
+            await asyncio.sleep(0.5)
+    await mc.disconnect()
+
+    auth = AuthzService(tmp_path / "authz.sqlite3")
+    auth.register_steve(PLAYER, ownership_mode="persistent", owner_id="owner")
+    admin = auth.create_admin_credential("root")
+    controller = auth.create_credential(
+        PLAYER,
+        "owner",
+        {"steve:control", "steve:observe:self", *WORLD_SCOPES},
+        admin_token=admin.token,
+    ).token
+    world_admin = auth.grant_admin_credential(admin.token, "world-op", {"admin:world"}).token
+    auth.close()
+
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        f"mc_api:\n  host: {MC_HOST}\n  port: {MC_PORT}\n  player_name: {PLAYER}\n"
+        f"authz:\n  database_path: {tmp_path / 'authz.sqlite3'}\n  steve_id: {PLAYER}\n"
+    )
+    env = {
+        **os.environ,
+        "MAB_CONTROLLER_TOKEN": controller,
+        "AUTHZ_WORLD_ADMIN_TOKEN": world_admin,
+    }
+    args = ["--config", str(config), "--outcome-store", str(tmp_path / "outcomes.sqlite3")]
+    return {"env": env, "args": args, "token": controller}
+
+
+async def _exercise(client: Client) -> None:
+    opened = await client.call_tool("minecraft_open_session", {})
+    assert not opened.is_error, opened.content
+    session = opened.structured_content
+
+    state = await client.call_tool("minecraft_get_state", {})
+    assert not state.is_error, state.content
+
+    async def submit(request_id: str, action: str, params: dict) -> dict:
+        result = await client.call_tool(
+            "minecraft_submit_action",
+            {
+                "session_id": session["session_id"],
+                "generation": session["generation"],
+                "request_id": request_id,
+                "action": action,
+                "params": params,
+            },
+        )
+        assert not result.is_error, result.content
+        return result.structured_content
+
+    chat = await submit("chat-1", "chat", {"message": "minecraft-ai-bridge MCP integration test"})
+    replay = await submit("chat-1", "chat", {"message": "minecraft-ai-bridge MCP integration test"})
+    moved = await submit("tp-1", "teleport", {"x": 0, "y": 120, "z": 0})
+    internal = await submit("internal-1", "goto_teleport", {"target": "Alex"})
+
+    assert chat["status"] == "succeeded"
+    assert replay["action_id"] == chat["action_id"]
+    assert moved["status"] == "succeeded", moved
+    assert internal["reason_code"] == "ACTION_NOT_EXPOSED"
+
+    closed = await client.call_tool(
+        "minecraft_close_session", {"session_id": session["session_id"]}
+    )
+    assert not closed.is_error
+
+
+async def test_stdio_server_against_live_mcpq(stack):
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=[
+            "-m",
+            "minecraft_ai_bridge.transport.mcp_main",
+            "--transport",
+            "stdio",
+            *stack["args"],
+        ],
+        env=stack["env"],
+        cwd=str(Path(__file__).resolve().parents[1]),
+    )
+    async with Client(params, read_timeout_seconds=60) as client:
+        await _exercise(client)
+
+
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+async def test_http_server_against_live_mcpq(stack):
+    port = _free_port()
+    env = {key: value for key, value in stack["env"].items() if key != "MAB_CONTROLLER_TOKEN"}
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "minecraft_ai_bridge.transport.mcp_main",
+            "--transport",
+            "http",
+            "--port",
+            str(port),
+            *stack["args"],
+        ],
+        env=env,
+        cwd=str(Path(__file__).resolve().parents[1]),
+    )
+    url = f"http://127.0.0.1:{port}/mcp"
+    try:
+        for _ in range(100):
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                    break
+            except OSError:
+                await asyncio.sleep(0.2)
+        else:
+            pytest.fail("MCP HTTP server did not start")
+
+        unauthenticated = httpx2.AsyncClient()
+        async with Client(streamable_http_client(url, http_client=unauthenticated)) as client:
+            refused = await client.call_tool("minecraft_open_session", {})
+        assert refused.is_error
+
+        http = httpx2.AsyncClient(headers={"Authorization": f"Bearer {stack['token']}"})
+        async with Client(streamable_http_client(url, http_client=http)) as client:
+            await _exercise(client)
+    finally:
+        process.terminate()
+        process.wait(timeout=20)
