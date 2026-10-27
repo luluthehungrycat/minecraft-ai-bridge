@@ -27,6 +27,7 @@ class Setup:
     second_controller: str
     observer: str
     world_admin: str
+    delegated: str
 
     def service(self, *, world_admin: bool = False) -> ControllerService:
         return ControllerService(
@@ -56,8 +57,12 @@ def setup(tmp_path):
         second_controller=credential({"steve:control"}),
         observer=credential({"steve:observe:self"}),
         world_admin=auth.grant_admin_credential(admin.token, "world-op", {"admin:world"}).token,
+        delegated=credential({"steve:control", *WORLD_SCOPES}),
     )
     auth.close()
+
+
+WORLD_SCOPES = {"steve:world:move", "steve:world:edit", "steve:world:items", "steve:world:combat"}
 
 
 def _request(session, action: ActionType, params=None, request_id: str = "req-1"):
@@ -132,10 +137,10 @@ async def test_privileged_actions_need_operator_world_admin(setup):
 
 async def test_operator_world_admin_allows_privileged_actions(setup):
     service = setup.service(world_admin=True)
-    session = await service.open_session(setup.controller)
+    session = await service.open_session(setup.delegated)
 
     moved = await service.submit_action(
-        setup.controller, _request(session, ActionType.TELEPORT, {"x": 5, "y": 64, "z": 5})
+        setup.delegated, _request(session, ActionType.TELEPORT, {"x": 5, "y": 64, "z": 5})
     )
     assert moved.status is ActionStatus.SUCCEEDED, moved.message
 
@@ -145,9 +150,9 @@ async def test_operator_world_admin_allows_privileged_actions(setup):
 )
 async def test_internal_actions_are_never_exposed(setup, action):
     service = setup.service(world_admin=True)
-    session = await service.open_session(setup.controller)
+    session = await service.open_session(setup.delegated)
 
-    result = await service.submit_action(setup.controller, _request(session, action))
+    result = await service.submit_action(setup.delegated, _request(session, action))
     assert result.status is ActionStatus.REJECTED
     assert result.reason_code == "ACTION_NOT_EXPOSED"
     assert setup.world.commands_ran == []
@@ -270,10 +275,10 @@ async def test_expired_lease_is_rejected(setup):
 
 async def test_world_admin_does_not_bypass_parameter_validation(setup):
     service = setup.service(world_admin=True)
-    session = await service.open_session(setup.controller)
+    session = await service.open_session(setup.delegated)
 
     result = await service.submit_action(
-        setup.controller, _request(session, ActionType.PLACE_BLOCK, {"block_type": "stone{}"})
+        setup.delegated, _request(session, ActionType.PLACE_BLOCK, {"block_type": "stone{}"})
     )
     assert result.status is ActionStatus.FAILED
     assert setup.world.commands_ran == []
@@ -294,11 +299,11 @@ async def test_world_admin_does_not_bypass_parameter_validation(setup):
 async def test_unvalidated_request_instances_are_revalidated(setup, update):
     """model_construct/model_copy skip validation; the service must not trust them."""
     service = setup.service()
-    session = await service.open_session(setup.controller)
+    session = await service.open_session(setup.delegated)
     fields = {**dict(_request(session, ActionType.CHAT, {"message": "hi"})), **update}
 
     with pytest.raises(ValueError, match="invalid action request"):
-        await service.submit_action(setup.controller, ActionRequestSchema.model_construct(**fields))
+        await service.submit_action(setup.delegated, ActionRequestSchema.model_construct(**fields))
     assert setup.world.chat_messages_sent == []
     assert setup.world.commands_ran == []
 

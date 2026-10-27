@@ -27,6 +27,12 @@ SCOPES = frozenset(
         "events:read",
         "admin:steves",
         "admin:world",
+        # Per-credential delegation for privileged-simulated MCPQ actions
+        # requested through ControllerService (see WORLD_DELEGATION_SCOPES).
+        "steve:world:move",
+        "steve:world:edit",
+        "steve:world:items",
+        "steve:world:combat",
     }
 )
 
@@ -45,6 +51,10 @@ _SCOPE_BINDING = {
     "events:read": "service",
     "admin:steves": "admin",
     "admin:world": "admin",
+    "steve:world:move": "steve",
+    "steve:world:edit": "steve",
+    "steve:world:items": "steve",
+    "steve:world:combat": "steve",
 }
 
 
@@ -1018,7 +1028,14 @@ class AuthzService:
         *,
         required_admin_scope: str | None = None,
         admin_token: str | None = None,
+        required_credential_scope: str | None = None,
     ) -> bool:
+        """Validate a controller session, optionally with extra authority.
+
+        ``required_credential_scope`` must be held by the session's own
+        credential; it is read in the same snapshot as the session, so a
+        revoked or replaced credential loses it immediately.
+        """
         with self._lock:
             owns_transaction = not self._db.in_transaction
             if owns_transaction:
@@ -1058,6 +1075,11 @@ class AuthzService:
                 )
                 if not valid_session:
                     return False
+                if (
+                    required_credential_scope is not None
+                    and required_credential_scope not in row["credential_scopes"].splitlines()
+                ):
+                    return False
                 if required_admin_scope is None:
                     return True
                 if admin_token is None:
@@ -1082,6 +1104,7 @@ class AuthzService:
         *,
         required_admin_scope: str | None = None,
         admin_token: str | None = None,
+        required_credential_scope: str | None = None,
     ) -> bool | None:
         """Validate without waiting for another local Authz operation.
 
@@ -1100,6 +1123,7 @@ class AuthzService:
                     session,
                     required_admin_scope=required_admin_scope,
                     admin_token=admin_token,
+                    required_credential_scope=required_credential_scope,
                 )
             except sqlite3.Error:
                 return None
@@ -1230,6 +1254,7 @@ class AuthzService:
         *,
         admin_token: str | None = None,
         blocking: bool = False,
+        require_delegation: bool = False,
     ):
         """Return an ActionService policy bound to a controller session.
 
@@ -1238,9 +1263,16 @@ class AuthzService:
         safe to call on an event loop. With ``blocking=True`` it waits for
         the lock instead, so concurrent requests are not denied by contention;
         call that variant from a worker thread, never on the event loop.
+
+        With ``require_delegation=True`` a privileged action also needs its
+        ``WORLD_DELEGATION_SCOPES`` scope on the session's credential, so the
+        operator's ``admin_token`` alone does not grant it to every
+        controller. Privileged actions without a delegation scope (internal
+        and lifecycle actions) are then always denied.
         """
         from .action_service import (
             _PRIVILEGED_AUTHORIZATION_CLASSES,
+            WORLD_DELEGATION_SCOPES,
             PolicyDecision,
             classify_action,
         )
@@ -1248,22 +1280,34 @@ class AuthzService:
         def policy(request: ActionRequest) -> PolicyDecision:
             active_session = session() if callable(session) else session
             privileged = classify_action(request.action) in _PRIVILEGED_AUTHORIZATION_CLASSES
+            delegation = (
+                WORLD_DELEGATION_SCOPES.get(request.action)
+                if privileged and require_delegation
+                else None
+            )
             authorized = bool(
                 active_session
+                and not (privileged and require_delegation and delegation is None)
                 and (self.validate_session if blocking else self.try_validate_session)(
                     active_session,
                     required_admin_scope="admin:world" if privileged else None,
                     admin_token=admin_token,
+                    required_credential_scope=delegation,
                 )
                 is True
             )
+            if not privileged or authorized:
+                reason = "controller session invalid or fenced"
+            elif require_delegation:
+                reason = (
+                    f"{request.action.value} requires admin:world on the service and "
+                    f"the {delegation or 'unavailable'} delegation on the credential"
+                )
+            else:
+                reason = "admin:world required for privileged backend action"
             return PolicyDecision(
                 authorized,
-                (
-                    "admin:world required for privileged backend action"
-                    if privileged and not authorized
-                    else "controller session invalid or fenced"
-                ),
+                reason,
                 allow_privileged=authorized if privileged else False,
                 identity_scope=(
                     (

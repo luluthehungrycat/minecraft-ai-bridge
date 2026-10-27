@@ -125,6 +125,12 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
 
 ### Changed
 
+- `ControllerService` no longer grants privileged-simulated actions to every
+  controller session when the operator supplies `world_admin_token`. A
+  controller credential also needs the delegation scope for the action's
+  group: `steve:world:move`, `steve:world:edit`, `steve:world:items`, or
+  `steve:world:combat` (#24). The built-in CLI agent is unaffected.
+
 - **Migration:** custom `action_policy` callables must now return
   `PolicyDecision(..., allow_privileged=True)` to permit privileged-simulated,
   internal-control, and lifecycle actions (bot provisioning, safe spawn, follow,

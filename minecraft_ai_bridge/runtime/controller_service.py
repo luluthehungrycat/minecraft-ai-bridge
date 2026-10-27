@@ -135,6 +135,7 @@ class ControllerService:
             self._current.get,
             admin_token=(world_admin_token or "").strip() or None,
             blocking=True,
+            require_delegation=True,
         )
         self._action_service = ActionService(
             world,
