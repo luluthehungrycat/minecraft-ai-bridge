@@ -134,7 +134,7 @@ jobs:
         run: docker compose up -d --wait minecraft
 
       - name: Run integration tests
-        run: pytest tests/test_integration.py -v --tb=short --timeout=120
+        run: pytest tests/test_integration.py tests/test_mcp_integration.py -v --tb=short --timeout=120
 
       - name: Stop Paper server
         if: ${{ always() }}

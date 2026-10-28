@@ -139,6 +139,14 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
 
 ### Added
 
+- Added an MCP server for external agent harnesses: `minecraft-ai-bridge-mcp`
+  (install with `pip install minecraft-ai-bridge[mcp]`) serves one Steve over
+  stdio or Streamable HTTP with six tools over `ControllerService`. HTTP calls
+  authenticate with their own `Authorization: Bearer` header and bind to
+  loopback unless `--allow-remote` is given, which also requires
+  `--allowed-host`; Host and Origin are always validated against DNS
+  rebinding. stdio uses `MAB_CONTROLLER_TOKEN`. See `docs/CLI.md`.
+
 - Added `runtime.SqliteActionOutcomeStore` for durable request-ID
   idempotency. Pass it to `ActionService` or `ControllerService` as
   `outcome_store=`; a retry after a bridge restart replays the stored outcome,

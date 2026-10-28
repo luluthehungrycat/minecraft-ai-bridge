@@ -124,6 +124,78 @@ All configuration is driven by environment variables. The full list:
 | `3` | Shut down after losing controller authority (Authz session expired, revoked, or fenced), after an authorized `!stop` or the `authz.suspended_shutdown_seconds` grace period |
 | `130` | Interrupted by user (Ctrl+C) |
 
+## MCP Server (`minecraft-ai-bridge-mcp`)
+
+Serves one Steve to MCP clients (Claude Code, Codex, OpenCode, and other
+harnesses) over stdio or Streamable HTTP. Install the extra first:
+
+```bash
+pip install "minecraft-ai-bridge[mcp]"
+```
+
+```bash
+# stdio: the harness launches the process and supplies the controller token
+MAB_CONTROLLER_TOKEN=mab_... minecraft-ai-bridge-mcp --transport stdio
+
+# Streamable HTTP on http://127.0.0.1:8765/mcp; every request sends
+# Authorization: Bearer <controller token>
+minecraft-ai-bridge-mcp --transport http --port 8765
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--config` | `config.yaml` | Reads `mc_api.*`, `authz.database_path`, and `authz.steve_id` |
+| `--transport` | `stdio` | `stdio` or `http` |
+| `--host` / `--port` | `127.0.0.1` / `8765` | HTTP bind address |
+| `--allow-remote` | off | Required to bind HTTP to a non-loopback address; terminate TLS in front of it |
+| `--allowed-host` | loopback hosts | Host header value to accept (repeatable; `name:*` allows any port). Required with `--allow-remote` |
+| `--allowed-origin` | loopback origins | Browser Origin to accept (repeatable). For remote binds, omit it unless a browser client needs it |
+| `--outcome-store` | `data/action-outcomes.sqlite3` | Durable request-ID outcomes |
+| `--session-lease-seconds` | `300` | Controller session lease |
+
+| Variable | Used for |
+|----------|----------|
+| `MAB_CONTROLLER_TOKEN` | stdio only: the controller credential for this process |
+| `AUTHZ_WORLD_ADMIN_TOKEN` | Operator's `admin:world` token; needed for movement, block, item, and combat actions together with the credential's `steve:world:*` delegation |
+
+Tools: `minecraft_get_capabilities`, `minecraft_get_state`,
+`minecraft_open_session`, `minecraft_renew_session`, `minecraft_close_session`,
+and `minecraft_submit_action` (`session_id`, `generation`, `request_id`,
+`action`, `params`). Reuse a `request_id` only to retry the same action; the
+retry never runs it twice.
+
+Example stdio client configuration:
+
+```json
+{
+  "mcpServers": {
+    "minecraft": {
+      "command": "minecraft-ai-bridge-mcp",
+      "args": ["--transport", "stdio", "--config", "/path/to/config.yaml"],
+      "env": {"MAB_CONTROLLER_TOKEN": "mab_..."}
+    }
+  }
+}
+```
+
+Remote deployment behind a TLS-terminating reverse proxy:
+
+```bash
+minecraft-ai-bridge-mcp --transport http --host 0.0.0.0 --port 8765 \
+  --allow-remote --allowed-host mcp.example.com
+```
+
+The server checks every request's Host header (and Origin, when present)
+against these lists to block DNS-rebinding requests: a request with any other
+Host is answered `421`, and one with any other Origin `403`. Behind a proxy,
+list the Host value the server actually receives: the public hostname if the
+proxy preserves the Host header, or the upstream address it rewrites to
+otherwise. Loopback binds accept only loopback hosts and origins by default.
+
+The bot entity must already exist in the world (run the bridge once, or
+`/botsummon <name>`). Credentials and delegation scopes are created with
+`AuthzService` by an `admin:steves` administrator.
+
 ## Docker CLI
 
 When using Docker, the command format is:

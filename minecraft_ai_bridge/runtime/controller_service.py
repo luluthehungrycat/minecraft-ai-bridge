@@ -150,6 +150,11 @@ class ControllerService:
         await self._action_service.flush()
 
     @property
+    def steve_id(self) -> str:
+        """The Steve this service controls."""
+        return self._steve_id
+
+    @property
     def action_service(self) -> ActionService:
         """The Steve's action gate, for sharing with an in-process safety layer."""
         return self._action_service
