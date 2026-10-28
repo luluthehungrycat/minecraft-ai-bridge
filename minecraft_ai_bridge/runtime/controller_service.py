@@ -219,9 +219,12 @@ class ControllerService:
             )
 
         session = await asyncio.to_thread(acquire)
-        # Authz allows one session per Steve, so acquiring this one fenced
-        # every session cached here before it.
-        self._sessions = {session.session_id: session}
+        # Authz allows one session per Steve and every acquisition or fence
+        # raises its generation, so a session fences all lower generations.
+        # Responses can arrive out of order: if a newer session is already
+        # cached, this one is already fenced and must not displace it.
+        if all(cached.generation < session.generation for cached in self._sessions.values()):
+            self._sessions = {session.session_id: session}
         logger.info(
             "Controller session opened steve_id=%s credential_id=%s generation=%d",
             session.steve_id,
@@ -240,7 +243,10 @@ class ControllerService:
         except PermissionError:
             await self._forget_if_invalid(session)
             raise
-        self._sessions[session_id] = renewed
+        # Only replace the entry that was renewed; never re-add a session
+        # that a newer open dropped in the meantime.
+        if self._sessions.get(session_id) is session:
+            self._sessions[session_id] = renewed
         return self._contract(renewed)
 
     async def close_session(self, token: str, session_id: str) -> None:

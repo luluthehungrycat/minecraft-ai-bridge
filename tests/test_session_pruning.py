@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import threading
 
 import pytest
 
@@ -188,3 +189,70 @@ async def test_a_renewal_during_validation_is_not_forgotten(setup, monkeypatch):
 
     assert service._sessions[opened.session_id] is fresh
     assert validate(fresh)
+
+
+@pytest.mark.parametrize("invalidate", ["fence", "expiry"])
+async def test_a_late_open_does_not_evict_a_newer_session(setup, monkeypatch, invalidate):
+    # Round-1 review of #35: an open whose response arrives after a newer
+    # open completed must not replace the newer, still-valid session.
+    auth, world, admin, older, newer = setup
+    service = _service(auth, world, lease=0.2 if invalidate == "expiry" else 300)
+    acquired = threading.Event()
+    resume = threading.Event()
+    acquire = auth.acquire_session
+
+    def delayed_acquire(token, *args, **kwargs):
+        session = acquire(token, *args, **kwargs)
+        if token == older:
+            acquired.set()
+            assert resume.wait(10)
+        return session
+
+    monkeypatch.setattr(auth, "acquire_session", delayed_acquire)
+    late = asyncio.create_task(service.open_session(older))
+    try:
+        assert await asyncio.to_thread(acquired.wait, 5)
+        if invalidate == "fence":
+            _fence(auth, admin)
+        else:
+            await asyncio.sleep(0.25)
+        current = await service.open_session(newer)
+        resume.set()
+        await late
+
+        result = await service.submit_action(newer, _chat(current, "current"))
+        assert result.status is ActionStatus.SUCCEEDED, result
+        assert list(service._sessions) == [current.session_id]
+        await service.renew_session(newer, current.session_id)
+    finally:
+        resume.set()
+        await asyncio.gather(late, return_exceptions=True)
+
+
+async def test_a_late_renewal_does_not_restore_a_dropped_session(setup, monkeypatch):
+    auth, world, admin, older, newer = setup
+    service = _service(auth, world)
+    first = await service.open_session(older)
+    renewed = threading.Event()
+    resume = threading.Event()
+    renew = auth.renew_session
+
+    def delayed_renew(session, **kwargs):
+        result = renew(session, **kwargs)
+        renewed.set()
+        assert resume.wait(10)
+        return result
+
+    monkeypatch.setattr(auth, "renew_session", delayed_renew)
+    late = asyncio.create_task(service.renew_session(older, first.session_id))
+    try:
+        assert await asyncio.to_thread(renewed.wait, 5)
+        _fence(auth, admin)
+        current = await service.open_session(newer)
+        resume.set()
+        await late
+
+        assert list(service._sessions) == [current.session_id]
+    finally:
+        resume.set()
+        await asyncio.gather(late, return_exceptions=True)
