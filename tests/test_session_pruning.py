@@ -256,3 +256,37 @@ async def test_a_late_renewal_does_not_restore_a_dropped_session(setup, monkeypa
     finally:
         resume.set()
         await asyncio.gather(late, return_exceptions=True)
+
+
+async def test_pruning_during_a_renewal_does_not_lose_the_renewed_session(setup, monkeypatch):
+    # Round-2 review of #35: a request with the old lease prunes the entry
+    # after the renewal committed but before it returned.
+    auth, world, _, token, _ = setup
+    service = _service(auth, world)
+    opened = await service.open_session(token)
+    committed = threading.Event()
+    resume = threading.Event()
+    renew = auth.renew_session
+
+    def delayed_renew(session, **kwargs):
+        fresh = renew(session, **kwargs)
+        committed.set()
+        assert resume.wait(10)
+        return fresh
+
+    monkeypatch.setattr(auth, "renew_session", delayed_renew)
+    pending = asyncio.create_task(service.renew_session(token, opened.session_id))
+    try:
+        assert await asyncio.to_thread(committed.wait, 5)
+        racing = await service.submit_action(token, _chat(opened, "during"))
+        assert racing.reason_code == "POLICY_REJECTED"  # it used the old lease
+        assert service._sessions == {}
+        resume.set()
+        await pending
+
+        after = await service.submit_action(token, _chat(opened, "after"))
+        assert after.status is ActionStatus.SUCCEEDED, after
+        assert list(service._sessions) == [opened.session_id]
+    finally:
+        resume.set()
+        await asyncio.gather(pending, return_exceptions=True)

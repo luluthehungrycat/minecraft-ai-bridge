@@ -219,12 +219,7 @@ class ControllerService:
             )
 
         session = await asyncio.to_thread(acquire)
-        # Authz allows one session per Steve and every acquisition or fence
-        # raises its generation, so a session fences all lower generations.
-        # Responses can arrive out of order: if a newer session is already
-        # cached, this one is already fenced and must not displace it.
-        if all(cached.generation < session.generation for cached in self._sessions.values()):
-            self._sessions = {session.session_id: session}
+        self._publish(session)
         logger.info(
             "Controller session opened steve_id=%s credential_id=%s generation=%d",
             session.steve_id,
@@ -243,10 +238,9 @@ class ControllerService:
         except PermissionError:
             await self._forget_if_invalid(session)
             raise
-        # Only replace the entry that was renewed; never re-add a session
-        # that a newer open dropped in the meantime.
-        if self._sessions.get(session_id) is session:
-            self._sessions[session_id] = renewed
+        # Also restores an entry pruned while the renewal was in flight (a
+        # request with the old lease saw it as invalid).
+        self._publish(renewed)
         return self._contract(renewed)
 
     async def close_session(self, token: str, session_id: str) -> None:
@@ -436,6 +430,18 @@ class ControllerService:
         ):
             return "ACTION_NOT_EXPOSED", f"{request.action.value} is not a controller action"
         return None
+
+    def _publish(self, session: AuthzControllerSession) -> None:
+        """Cache ``session`` as the only entry unless a newer one is cached.
+
+        Authz allows one session per Steve and raises the Steve's generation
+        on every acquisition and fence, so ``session`` has fenced every lower
+        generation. Open and renew responses can arrive out of order; if a
+        higher generation is already cached, ``session`` is already fenced
+        and must not displace it.
+        """
+        if all(cached.generation <= session.generation for cached in self._sessions.values()):
+            self._sessions = {session.session_id: session}
 
     def _drop_expired(self) -> None:
         """Forget sessions whose lease has passed; Authz never revives them."""

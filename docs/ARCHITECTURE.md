@@ -256,10 +256,12 @@ requests into its calls. It composes the pieces above:
   token that opened it. The service keeps at most one cached session: opening
   a session drops every entry with a lower fencing generation (Authz has
   already fenced them), and a response that arrives after a newer session was
-  cached leaves the cache alone because its session is already fenced. A
-  renewal only replaces the entry it renewed. Expired leases are swept on each
-  `submit_action`, and a session is dropped once a policy rejection or failed
-  renewal is confirmed by Authz to mean the session itself is invalid.
+  cached leaves the cache alone because its session is already fenced.
+  Renewals follow the same rule, so a renewal restores an entry that a request
+  using the old lease pruned meanwhile, but never displaces a newer session.
+  Expired leases are swept on each `submit_action`, and a session is dropped
+  once a policy rejection or failed renewal is confirmed by Authz to mean the
+  session itself is invalid.
   Requests from other credentials cannot evict it. A dropped session ID then
   reads as unknown (`SESSION_UNKNOWN`).
 - `get_capabilities` and `get_state` need `steve:observe:self` or
