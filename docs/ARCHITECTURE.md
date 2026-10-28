@@ -301,11 +301,46 @@ administrator grants scopes when creating the credential; changing them means
 issuing a new credential. Privileged actions with no delegation scope
 (internal and lifecycle actions) are always denied on this path. The
 built-in CLI agent is trusted in-process and does not use delegation scopes.
-Delegated actions still have no reach limit (#25), and parameter validation
-still applies. Authentication failures raise `PermissionError`; every other refusal
+Parameter validation still applies.
+
+Targeted actions are also limited by `ReachLimits` (#25): `break_block`/
+`place_block` with explicit coordinates within `edit_distance` (default 6
+blocks, measured to the block the handler edits, `int()` of each coordinate), `teleport`/`move_to` destinations within `move_distance` (default
+32, 3D), and `walk_to` destinations within the smaller of `move_distance` and
+`walk_to`'s walking range (`WALK_TO_TELEPORT_DISTANCE`, 50 blocks horizontal),
+so a controller's walk never falls through to the handler's long-distance
+teleport. Destinations must also lie inside the world height range
+-64..320, and all limits must be finite. Edits without coordinates act next
+to the bot and relative steps are already bounded, so they are not checked.
+Targeted coordinates that are not finite numbers are refused with
+`INVALID_TARGET` rather than left to the handler, because handlers coerce
+some values (for example `int(True)`); `walk_to`'s `y: null` means "keep the
+current height", as in the handler.
+
+The check is an `ActionService` dispatch guard: it runs after policy, under the
+dispatch lock, immediately before the backend call. Every non-WAIT dispatch
+through the same `ActionService` holds that lock, so no other request through
+this controller service can move the bot between the position read and the
+backend call, however many are queued. The lock does not fence anything
+outside that service: another bridge process or a CLI agent driving the same
+bot (Authz admits one controller session per Steve, but the unauthenticated
+CLI is not a session), players, mobs, plugins, game physics such as falling or
+knockback, or MCPQ work still running from an earlier dispatch that was
+cancelled. Any of these can move the bot during the short window between the
+position read and the backend command (about one MCPQ round trip), so reach
+bounds where a controller can direct actions relative to the position just
+read; it is not a guarantee about the bot's position when the command lands.
+Replays of completed requests are answered
+from the idempotency cache before the guard and return their original
+outcome. A refusal is `rejected` with reason code `OUT_OF_REACH`, nothing is
+dispatched, and it becomes that request ID's final outcome; an unreadable
+position is refused too. The guard never applies to trusted internal or
+safety requests, and the built-in CLI agent is not limited.
+
+Authentication failures raise `PermissionError`; every other refusal
 is a `rejected` result with a `reason_code` (`STEVE_MISMATCH`,
 `SESSION_UNKNOWN`, `SESSION_NOT_OWNED`, `STALE_GENERATION`,
-`ACTION_NOT_EXPOSED`, `POLICY_REJECTED`).
+`ACTION_NOT_EXPOSED`, `OUT_OF_REACH`, `INVALID_TARGET`, `POLICY_REJECTED`).
 
 There is no task service or event API yet, and the safety supervisor does not
 run for externally controlled Steves.
@@ -346,8 +381,8 @@ MCP tool errors (`unauthorized: ...`, `invalid request: ...`); controller-level
 rejections are returned as `rejected` results with their `reason_code`.
 
 Limitations: the bot entity must already exist (the server does not summon
-it); externally controlled Steves have no safety supervisor; delegated world
-edits have no reach limit (#25); there is no event polling or task API.
+it); externally controlled Steves have no safety supervisor; there is no event
+polling or task API.
 
 ### Durable event journal (Phase C slice)
 

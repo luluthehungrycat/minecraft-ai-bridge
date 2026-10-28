@@ -698,6 +698,9 @@ def _interrupted_result(action: ActionType, steps_taken: int) -> ActionResult:
     )
 
 
+# walk_to walks up to this many blocks (horizontal) and teleports beyond it.
+WALK_TO_TELEPORT_DISTANCE = 50
+
 _PLAYER_TARGET_RE = re.compile(r"^[A-Za-z0-9_]{1,16}$")
 
 
@@ -998,7 +1001,7 @@ async def _walk_to(mc: WorldAdapter, params: dict) -> ActionResult:
     dz = float(z) - pos[2]
     distance = (dx * dx + dz * dz) ** 0.5
 
-    if distance > 50:
+    if distance > WALK_TO_TELEPORT_DISTANCE:
         # Long distance — teleport instead
         if y is not None:
             await mc.teleport_player(float(x), float(y), float(z))
@@ -1007,7 +1010,9 @@ async def _walk_to(mc: WorldAdapter, params: dict) -> ActionResult:
         return ActionResult(
             success=True,
             action=ActionType.WALK_TO,
-            message=f"Distance {distance:.0f}m > 50, teleported to ({x}, {z})",
+            message=(
+                f"Distance {distance:.0f}m > {WALK_TO_TELEPORT_DISTANCE}, teleported to ({x}, {z})"
+            ),
             data={"x": x, "z": z, "teleported": True},
         )
 
