@@ -27,6 +27,7 @@ import asyncio
 import dataclasses
 import logging
 import math
+import sqlite3
 from collections.abc import Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -218,7 +219,9 @@ class ControllerService:
             )
 
         session = await asyncio.to_thread(acquire)
-        self._sessions[session.session_id] = session
+        # Authz allows one session per Steve, so acquiring this one fenced
+        # every session cached here before it.
+        self._sessions = {session.session_id: session}
         logger.info(
             "Controller session opened steve_id=%s credential_id=%s generation=%d",
             session.steve_id,
@@ -230,9 +233,13 @@ class ControllerService:
     async def renew_session(self, token: str, session_id: str) -> ControllerSession:
         """Extend a still-valid session's lease; expired sessions stay expired."""
         session = await self._owned_session(token, session_id)
-        renewed = await asyncio.to_thread(
-            self._authz.renew_session, session, lease_seconds=self._lease_seconds
-        )
+        try:
+            renewed = await asyncio.to_thread(
+                self._authz.renew_session, session, lease_seconds=self._lease_seconds
+            )
+        except PermissionError:
+            await self._forget_if_invalid(session)
+            raise
         self._sessions[session_id] = renewed
         return self._contract(renewed)
 
@@ -267,6 +274,7 @@ class ControllerService:
         credential = await asyncio.to_thread(self._authz.authenticate, token)
         request = self._revalidate(request)
         session = self._sessions.get(request.controller_session_id)
+        self._drop_expired()
         rejection = self._envelope_rejection(credential.credential_id, request, session)
         if rejection is not None:
             return self._result(
@@ -299,6 +307,8 @@ class ControllerService:
                 ActionStatus.REJECTED: "POLICY_REJECTED",
                 ActionStatus.FAILED: "ACTION_FAILED",
             }.get(status)
+            if reason_code == "POLICY_REJECTED":
+                await self._forget_if_invalid(session)
         return self._result(credential.credential_id, request, status, reason_code, result.message)
 
     # ── Helpers ──────────────────────────────────────────────────────
@@ -420,6 +430,29 @@ class ControllerService:
         ):
             return "ACTION_NOT_EXPOSED", f"{request.action.value} is not a controller action"
         return None
+
+    def _drop_expired(self) -> None:
+        """Forget sessions whose lease has passed; Authz never revives them."""
+        now = datetime.now(UTC)
+        for session_id, session in list(self._sessions.items()):
+            if session.expires_at is not None and session.expires_at <= now:
+                del self._sessions[session_id]
+
+    async def _forget_if_invalid(self, session: AuthzControllerSession) -> None:
+        """Forget ``session`` if Authz no longer considers it valid.
+
+        Depends only on the session's own state, never on who is asking, so
+        another credential cannot evict it. The identity check after
+        validation keeps an entry that a concurrent renewal replaced.
+        """
+        if self._sessions.get(session.session_id) is not session:
+            return  # already gone or replaced; skip the read
+        try:
+            valid = await asyncio.to_thread(self._authz.validate_session, session)
+        except sqlite3.Error:
+            return  # unverifiable now; a later rejection or expiry removes it
+        if not valid and self._sessions.get(session.session_id) is session:
+            del self._sessions[session.session_id]
 
     def _token_owns(self, token: str, session: AuthzControllerSession) -> bool:
         try:

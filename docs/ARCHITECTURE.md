@@ -253,7 +253,12 @@ requests into its calls. It composes the pieces above:
 - `open_session` acquires the Steve's exclusive Authz controller session for
   a `steve:control` credential; `renew_session` and `close_session` manage its
   lease. A session ID alone is not a bearer: every call must also present the
-  token that opened it.
+  token that opened it. The service keeps at most one cached session: opening
+  a session drops every earlier entry (Authz has already fenced them), expired
+  leases are swept on each `submit_action`, and a session is dropped once a
+  policy rejection or failed renewal is confirmed by Authz to mean the session
+  itself is invalid. Requests from other credentials cannot evict it. A
+  dropped session ID then reads as unknown (`SESSION_UNKNOWN`).
 - `get_capabilities` and `get_state` need `steve:observe:self` or
   `steve:control` for that Steve; observers never get a session.
 - `submit_action` takes an `ActionRequestSchema` and returns an
