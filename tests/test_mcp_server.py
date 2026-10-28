@@ -382,14 +382,17 @@ def _install_fakes(monkeypatch, stage: _Stage) -> None:
 
     class FakeMc:
         def __init__(self, **_kwargs):
-            pass
+            self.connected = False
 
         async def connect(self):
             stage.check("connect")
+            self.connected = True
             stage.events.append("mc.open")
 
         async def disconnect(self):
-            stage.events.append("mc.close")
+            # Like McpqClient: a no-op when never connected.
+            if self.connected:
+                stage.events.append("mc.close")
 
     class FakeAuthz:
         def __init__(self, _path):
@@ -481,3 +484,46 @@ async def test_serve_passes_explicit_transport_security(monkeypatch, tmp_path):
     security = stage.http_kwargs["transport_security"]
     assert security.enable_dns_rebinding_protection
     assert "127.0.0.2:*" in security.allowed_hosts
+
+
+async def test_serve_cleans_up_a_connection_cancelled_mid_connect(monkeypatch, tmp_path):
+    """Cancellation is not an Exception, so connect()'s own cleanup misses it."""
+    import asyncio
+    import threading
+
+    from minecraft_ai_bridge.minecraft import mc_api
+
+    verifying = threading.Event()
+    release = threading.Event()
+    created: list = []
+
+    class BlockingMinecraft:
+        def __init__(self, **_kwargs):
+            self.cleanups = 0
+            created.append(self)
+
+        def getMinecraftVersion(self) -> str:  # noqa: N802 - mirrors the mcpq API
+            verifying.set()
+            release.wait(timeout=5)
+            return "26.2"
+
+        def _cleanup(self) -> None:
+            self.cleanups += 1
+
+    monkeypatch.setattr(mc_api, "Minecraft", BlockingMinecraft)
+    args = build_parser().parse_args(
+        ["--transport", "http", "--outcome-store", str(tmp_path / "o.sqlite3")]
+    )
+    config = AppConfig()
+    config.authz.steve_id = "AIBot"
+
+    task = asyncio.create_task(serve(args, config))
+    while not verifying.is_set():
+        await asyncio.sleep(0.01)
+    task.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert len(created) == 1
+    assert created[0].cleanups == 1

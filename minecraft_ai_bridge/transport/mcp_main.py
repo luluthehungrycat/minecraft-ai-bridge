@@ -156,8 +156,11 @@ async def serve(args: argparse.Namespace, config: AppConfig) -> None:
     async with AsyncExitStack() as stack:
         api = config.mc_api
         mc = McpqClient(host=api.host, port=api.port, player_name=api.player_name)
-        await mc.connect()
+        # Registered before connect(): connect() cleans up after an ordinary
+        # failure itself, but not after cancellation mid-connect, and
+        # disconnect() is a no-op on a client that never connected.
         stack.push_async_callback(mc.disconnect)
+        await mc.connect()
         authz = AuthzService(config.authz.database_path)
         stack.callback(authz.close)
         store = SqliteActionOutcomeStore(Path(args.outcome_store))
