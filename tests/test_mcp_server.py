@@ -21,6 +21,7 @@ from minecraft_ai_bridge.transport.mcp_main import (  # noqa: E402
     build_parser,
     check_bind_address,
     serve,
+    transport_security_for,
 )
 from minecraft_ai_bridge.transport.mcp_server import build_mcp_server  # noqa: E402
 from tests.conftest import MockMcpqClient  # noqa: E402
@@ -261,3 +262,222 @@ async def test_serve_requires_a_steve_and_a_stdio_token(monkeypatch):
     config.authz.steve_id = "AIBot"
     with pytest.raises(ValueError, match="MAB_CONTROLLER_TOKEN"):
         await serve(args, config)
+
+
+# ── Host/Origin validation (DNS rebinding) ──────────────────────────
+
+INITIALIZE = {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "initialize",
+    "params": {
+        "protocolVersion": "2025-06-18",
+        "capabilities": {},
+        "clientInfo": {"name": "test", "version": "1"},
+    },
+}
+
+
+async def _post_status(env, security, headers: dict[str, str]) -> int:
+    server = build_mcp_server(env.service())
+    app = server.streamable_http_app(
+        stateless_http=True, json_response=True, transport_security=security
+    )
+    async with (
+        app.router.lifespan_context(app),
+        httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app), base_url="http://placeholder"
+        ) as http,
+    ):
+        response = await http.post(
+            "/mcp",
+            json=INITIALIZE,
+            headers={"Accept": "application/json, text/event-stream", **headers},
+        )
+    return response.status_code
+
+
+@pytest.mark.parametrize(
+    ("bind", "allowed_hosts", "allowed_origins", "headers", "status"),
+    [
+        # Loopback: loopback hosts and origins only.
+        ("127.0.0.1", [], [], {"Host": "127.0.0.1:8765"}, 200),
+        ("127.0.0.1", [], [], {"Host": "localhost:8765", "Origin": "http://localhost:3000"}, 200),
+        ("127.0.0.1", [], [], {"Host": "evil.example"}, 421),
+        ("127.0.0.1", [], [], {"Host": "127.0.0.1:8765", "Origin": "http://evil.example"}, 403),
+        # Other loopback addresses, which the SDK does not protect by itself.
+        ("127.0.0.2", [], [], {"Host": "127.0.0.2:8765"}, 200),
+        ("127.0.0.2", [], [], {"Host": "evil.example"}, 421),
+        ("::1", [], [], {"Host": "[::1]:8765"}, 200),
+        # Remote / reverse proxy: only the configured public host.
+        ("0.0.0.0", ["mcp.example.com"], [], {"Host": "mcp.example.com"}, 200),
+        ("0.0.0.0", ["mcp.example.com"], [], {"Host": "mcp.example.com:8443"}, 421),
+        ("0.0.0.0", ["mcp.example.com:*"], [], {"Host": "mcp.example.com:8443"}, 200),
+        ("0.0.0.0", ["mcp.example.com"], [], {"Host": "127.0.0.1:8765"}, 421),
+        ("0.0.0.0", ["mcp.example.com"], [], {"Host": "evil.example"}, 421),
+        (
+            "0.0.0.0",
+            ["mcp.example.com"],
+            [],
+            {"Host": "mcp.example.com", "Origin": "https://mcp.example.com"},
+            403,
+        ),
+        (
+            "0.0.0.0",
+            ["mcp.example.com"],
+            ["https://app.example.com"],
+            {"Host": "mcp.example.com", "Origin": "https://app.example.com"},
+            200,
+        ),
+        (
+            "0.0.0.0",
+            ["mcp.example.com"],
+            ["https://app.example.com"],
+            {"Host": "mcp.example.com", "Origin": "https://evil.example"},
+            403,
+        ),
+    ],
+)
+async def test_host_and_origin_are_validated(
+    env, bind, allowed_hosts, allowed_origins, headers, status
+):
+    security = transport_security_for(bind, allowed_hosts, allowed_origins)
+    assert await _post_status(env, security, headers) == status
+
+
+@pytest.mark.parametrize("bind", ["0.0.0.0", "192.168.1.10", "::"])
+def test_remote_binds_require_explicit_allowed_hosts(bind):
+    with pytest.raises(ValueError, match="allowed-host"):
+        transport_security_for(bind, [], [])
+
+
+def test_main_refuses_a_remote_bind_without_allowed_hosts(monkeypatch):
+    from minecraft_ai_bridge.transport import mcp_main
+
+    with pytest.raises(SystemExit) as exit_info:
+        mcp_main.main(["--transport", "http", "--host", "0.0.0.0", "--allow-remote"])
+    assert exit_info.value.code == 2
+
+
+# ── Startup and shutdown cleanup ─────────────────────────────────────
+
+
+class _Stage:
+    """Fakes for serve()'s resources that record opens and closes."""
+
+    def __init__(self, fail_at: str | None) -> None:
+        self.fail_at = fail_at
+        self.events: list[str] = []
+        self.http_kwargs: dict = {}
+
+    def check(self, step: str) -> None:
+        if step == self.fail_at:
+            raise RuntimeError(f"injected failure at {step}")
+
+
+def _install_fakes(monkeypatch, stage: _Stage) -> None:
+    from minecraft_ai_bridge import runtime
+    from minecraft_ai_bridge.minecraft import mc_api
+    from minecraft_ai_bridge.transport import mcp_server
+
+    class FakeMc:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def connect(self):
+            stage.check("connect")
+            stage.events.append("mc.open")
+
+        async def disconnect(self):
+            stage.events.append("mc.close")
+
+    class FakeAuthz:
+        def __init__(self, _path):
+            stage.check("authz")
+            stage.events.append("authz.open")
+
+        def close(self):
+            stage.events.append("authz.close")
+
+    class FakeStore:
+        def __init__(self, _path):
+            stage.check("store")
+            stage.events.append("store.open")
+
+        def close(self):
+            stage.events.append("store.close")
+
+    class FakeController:
+        def __init__(self, *_args, **_kwargs):
+            stage.check("controller")
+            stage.events.append("controller.open")
+
+        async def aclose(self):
+            stage.events.append("controller.close")
+            stage.check("controller.aclose")
+
+    class FakeServer:
+        async def run_streamable_http_async(self, **kwargs):
+            stage.http_kwargs = kwargs
+            stage.check("run")
+
+    def fake_build(_controller, **_kwargs):
+        stage.check("build")
+        return FakeServer()
+
+    monkeypatch.setattr(mc_api, "McpqClient", FakeMc)
+    monkeypatch.setattr(runtime, "AuthzService", FakeAuthz)
+    monkeypatch.setattr(runtime, "SqliteActionOutcomeStore", FakeStore)
+    monkeypatch.setattr(runtime, "ControllerService", FakeController)
+    monkeypatch.setattr(mcp_server, "build_mcp_server", fake_build)
+
+
+OPENED = ["mc.open", "authz.open", "store.open", "controller.open"]
+
+
+@pytest.mark.parametrize(
+    ("fail_at", "opened"),
+    [
+        ("connect", 0),
+        ("authz", 1),
+        ("store", 2),
+        ("controller", 3),
+        ("build", 4),
+        ("run", 4),
+        ("controller.aclose", 4),
+        (None, 4),
+    ],
+)
+async def test_serve_closes_everything_it_opened(monkeypatch, tmp_path, fail_at, opened):
+    stage = _Stage(fail_at)
+    _install_fakes(monkeypatch, stage)
+    args = build_parser().parse_args(
+        ["--transport", "http", "--outcome-store", str(tmp_path / "o.sqlite3")]
+    )
+    config = AppConfig()
+    config.authz.steve_id = "AIBot"
+
+    if fail_at is None:
+        await serve(args, config)
+    else:
+        with pytest.raises(RuntimeError, match="injected"):
+            await serve(args, config)
+
+    closes = [event.replace("open", "close") for event in reversed(OPENED[:opened])]
+    assert stage.events == OPENED[:opened] + closes
+
+
+async def test_serve_passes_explicit_transport_security(monkeypatch, tmp_path):
+    stage = _Stage(None)
+    _install_fakes(monkeypatch, stage)
+    args = build_parser().parse_args(
+        ["--transport", "http", "--host", "127.0.0.2", "--outcome-store", str(tmp_path / "o")]
+    )
+    config = AppConfig()
+    config.authz.steve_id = "AIBot"
+
+    await serve(args, config)
+
+    security = stage.http_kwargs["transport_security"]
+    assert security.enable_dns_rebinding_protection
+    assert "127.0.0.2:*" in security.allowed_hosts

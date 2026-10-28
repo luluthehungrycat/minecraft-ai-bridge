@@ -331,9 +331,17 @@ else. The adapter only decides which bearer token a call carries:
 
 The `minecraft-ai-bridge-mcp` command (`transport/mcp_main.py`) connects MCPQ,
 `AuthzService`, and a `SqliteActionOutcomeStore`, then serves stdio or
-Streamable HTTP. HTTP binds to `127.0.0.1` by default, where the SDK's
-DNS-rebinding protection applies; any non-loopback address requires
-`--allow-remote`, and the server does not terminate TLS itself. Refusals become
+Streamable HTTP. HTTP binds to `127.0.0.1` by default; any non-loopback
+address requires `--allow-remote` plus at least one `--allowed-host`, and the
+server does not terminate TLS itself. Host and Origin validation against
+DNS rebinding is always configured explicitly (`transport_security_for`):
+SDK 2.3 only enables it on its own for the exact hosts `127.0.0.1`,
+`localhost`, and `::1`, leaving other binds unprotected. Loopback binds accept
+loopback Host and Origin values; other binds accept only the configured hosts
+and origins, and with no origins configured only requests without an Origin
+header. Startup registers each resource's cleanup as it is opened
+(`AsyncExitStack`), so a failure at any step, or in another cleanup, still
+closes everything opened before it. Refusals become
 MCP tool errors (`unauthorized: ...`, `invalid request: ...`); controller-level
 rejections are returned as `rejected` results with their `reason_code`.
 
