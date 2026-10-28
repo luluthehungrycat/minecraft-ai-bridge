@@ -1021,8 +1021,10 @@ class ActionService:
             and not request.trusted_safety
         ):
             # Runs after policy, under the dispatch lock, immediately before
-            # the backend call, so the world state it reads is the state the
-            # action will act on. Replays never reach this point.
+            # the backend call, so no other dispatch through this service can
+            # change the world in between. It does not fence other processes,
+            # players, game physics, or MCPQ work left running by a cancelled
+            # dispatch. Replays never reach this point.
             refusal = await self._dispatch_guard(request)
             if refusal is not None:
                 return self._rejection_outcome(

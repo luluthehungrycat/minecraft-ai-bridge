@@ -145,8 +145,9 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
   y -64..320, with reason code `OUT_OF_REACH` and nothing dispatched.
   `minecraft-ai-bridge-mcp` exposes `--max-edit-distance` and
   `--max-move-distance`. The check runs under the dispatch lock right before
-  the backend call, so queued requests are measured from the bot's actual
-  position, and replays of completed requests return their original outcome.
+  the backend call, so it is serialized with the controller's other requests
+  (movement by other processes, players, or physics is not fenced), and
+  replays of completed requests return their original outcome.
   `walk_to` is capped at its 50-block walking range so it never turns into a
   teleport, and limits must be finite. The built-in CLI agent is not
   limited.

@@ -314,9 +314,19 @@ teleport. Destinations must also lie inside the world height range
 to the bot and relative steps are already bounded, so they are not checked.
 
 The check is an `ActionService` dispatch guard: it runs after policy, under the
-dispatch lock, immediately before the backend call, so it measures from the
-position the action will actually act from, even when other requests from
-the same controller are queued. Replays of completed requests are answered
+dispatch lock, immediately before the backend call. Every non-WAIT dispatch
+through the same `ActionService` holds that lock, so no other request through
+this controller service can move the bot between the position read and the
+backend call, however many are queued. The lock does not fence anything
+outside that service: another bridge process or a CLI agent driving the same
+bot (Authz admits one controller session per Steve, but the unauthenticated
+CLI is not a session), players, mobs, plugins, game physics such as falling or
+knockback, or MCPQ work still running from an earlier dispatch that was
+cancelled. Any of these can move the bot during the short window between the
+position read and the backend command (about one MCPQ round trip), so reach
+bounds where a controller can direct actions relative to the position just
+read; it is not a guarantee about the bot's position when the command lands.
+Replays of completed requests are answered
 from the idempotency cache before the guard and return their original
 outcome. A refusal is `rejected` with reason code `OUT_OF_REACH`, nothing is
 dispatched, and it becomes that request ID's final outcome; an unreadable

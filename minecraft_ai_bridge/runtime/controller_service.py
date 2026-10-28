@@ -319,8 +319,10 @@ class ControllerService:
         """ActionService dispatch guard: refuse targets out of reach.
 
         Runs under the dispatch lock immediately before the backend call, so
-        the position it reads is the one the action will act from, and it is
-        never applied to replays of completed requests.
+        no other request through this service can move the bot in between; it
+        is never applied to replays of completed requests. Movement from
+        outside this service (other processes, players, physics) is not
+        fenced; see docs/ARCHITECTURE.md.
         """
         message = await self._reach_violation(request.action, request.params)
         return None if message is None else GuardRefusal("OUT_OF_REACH", message)
