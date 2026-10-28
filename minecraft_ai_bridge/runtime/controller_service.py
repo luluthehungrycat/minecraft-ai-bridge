@@ -26,14 +26,17 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import math
+from collections.abc import Mapping
 from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4, uuid5
 
 from pydantic import ValidationError
 
-from ..minecraft.actions import ActionType
+from ..minecraft.actions import WALK_TO_TELEPORT_DISTANCE, ActionType, _finite_coordinate
 from ..minecraft.observer import Observer
 from ..minecraft.world_types import WorldAdapter
 from .action_outcomes import SqliteActionOutcomeStore
@@ -41,6 +44,7 @@ from .action_service import (
     ActionClass,
     ActionRequest,
     ActionService,
+    GuardRefusal,
     PolicyDecision,
     classify_action,
 )
@@ -104,6 +108,39 @@ _EXPOSABLE_CLASSES = frozenset(
 _OBSERVE_SCOPES = ("steve:observe:self", "steve:control")
 
 
+@dataclass(frozen=True)
+class ReachLimits:
+    """How far from the bot an external controller may act (#25).
+
+    ``edit_distance`` bounds block edits with explicit coordinates (vanilla
+    reach is about 4.5-5 blocks). ``move_distance`` bounds teleport and
+    move_to (3D) and walk_to (horizontal) destinations, which must also lie
+    within the world height range ``min_y``..``max_y``.
+    """
+
+    edit_distance: float = 6.0
+    move_distance: float = 32.0
+    min_y: float = -64.0
+    max_y: float = 320.0
+
+    def __post_init__(self) -> None:
+        values = (self.edit_distance, self.move_distance, self.min_y, self.max_y)
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("reach limits must be finite numbers")
+        if not (self.edit_distance > 0 and self.move_distance > 0 and self.min_y < self.max_y):
+            raise ValueError("reach limits must be positive and min_y below max_y")
+
+
+# Actions whose parameters name an absolute target, by reach rule.
+_REACH_KINDS: dict[ActionType, str] = {
+    ActionType.TELEPORT: "move",
+    ActionType.MOVE_TO: "move",
+    ActionType.WALK_TO: "walk",
+    ActionType.BREAK_BLOCK: "edit",
+    ActionType.PLACE_BLOCK: "edit",
+}
+
+
 class ControllerService:
     """Authenticated observation and action API for a single Steve."""
 
@@ -117,6 +154,7 @@ class ControllerService:
         session_lease_seconds: float = 300,
         safety_authority: object | None = None,
         outcome_store: SqliteActionOutcomeStore | None = None,
+        reach_limits: ReachLimits | None = None,
     ) -> None:
         if session_lease_seconds <= 0:
             raise ValueError("controller session lease must be positive")
@@ -124,6 +162,7 @@ class ControllerService:
         self._authz = authz
         self._steve_id = steve_id
         self._lease_seconds = session_lease_seconds
+        self._reach = reach_limits or ReachLimits()
         self._sessions: dict[str, AuthzControllerSession] = {}
         # The requesting session for the current task. ActionService's policy
         # reads it, so concurrent requests from different sessions cannot see
@@ -142,6 +181,7 @@ class ControllerService:
             policy=self._policy,
             safety_authority=safety_authority,
             outcome_store=outcome_store,
+            dispatch_guard=self._reach_guard,
         )
         self._observer = Observer(world)
 
@@ -247,10 +287,18 @@ class ControllerService:
             self._current.reset(context)
 
         status = self._status(correlation_id, result.success)
-        reason_code = {
-            ActionStatus.REJECTED: "POLICY_REJECTED",
-            ActionStatus.FAILED: "ACTION_FAILED",
-        }.get(status)
+        if result.success:
+            reason_code = None
+        elif isinstance(result.data.get("reason_code"), str):
+            # A dispatch-guard refusal (e.g. OUT_OF_REACH), including when
+            # replayed from the idempotency cache.
+            status = ActionStatus.REJECTED
+            reason_code = result.data["reason_code"]
+        else:
+            reason_code = {
+                ActionStatus.REJECTED: "POLICY_REJECTED",
+                ActionStatus.FAILED: "ACTION_FAILED",
+            }.get(status)
         return self._result(credential.credential_id, request, status, reason_code, result.message)
 
     # ── Helpers ──────────────────────────────────────────────────────
@@ -266,6 +314,78 @@ class ControllerService:
         storage error still fails closed through ActionService.
         """
         return await asyncio.to_thread(self._authz_policy, request)
+
+    async def _reach_guard(self, request: ActionRequest) -> GuardRefusal | None:
+        """ActionService dispatch guard: refuse targets out of reach.
+
+        Runs under the dispatch lock immediately before the backend call, so
+        no other request through this service can move the bot in between; it
+        is never applied to replays of completed requests. Movement from
+        outside this service (other processes, players, physics) is not
+        fenced; see docs/ARCHITECTURE.md.
+        """
+        try:
+            message = await self._reach_violation(request.action, request.params)
+        except ValueError as exc:
+            # Fail closed: handlers coerce some values this parser rejects
+            # (e.g. int(True)), so an unparsed target must never pass.
+            return GuardRefusal("INVALID_TARGET", f"target coordinates are not valid: {exc}")
+        return None if message is None else GuardRefusal("OUT_OF_REACH", message)
+
+    async def _reach_violation(self, action: ActionType, params: Mapping[str, Any]) -> str | None:
+        """Return why a targeted action is out of reach, or None if it is in reach.
+
+        Only actions with absolute targets are checked; relative steps and
+        edits next to the bot are already bounded. Raises ``ValueError`` for
+        coordinates that are not finite numbers, which the guard refuses.
+        """
+        kind = _REACH_KINDS.get(action)
+        if kind is None:
+            return None
+        if kind == "edit" and not all(axis in params for axis in ("x", "y", "z")):
+            return None
+        # Same defaults as the handlers: move_to treats missing axes as 0, and
+        # walk_to treats a missing or null y as "keep the current height".
+        x = _finite_coordinate(params.get("x", 0), "x")
+        z = _finite_coordinate(params.get("z", 0), "z")
+        if kind == "walk" and params.get("y") is None:
+            y = None
+        else:
+            y = _finite_coordinate(params.get("y", 0), "y")
+        position = await self._world.get_player_pos()
+        if position is None:
+            return "the bot's position is unknown, so reach cannot be checked"
+        limits = self._reach
+        if kind == "edit":
+            assert y is not None
+            # The handlers edit the block at int(coordinate); measure that
+            # block, not the fractional target, so truncation cannot push an
+            # edit past the limit.
+            distance = math.dist(position, (int(x), int(y), int(z)))
+            if distance > limits.edit_distance:
+                return (
+                    f"target is {distance:.1f} blocks away; edits are limited to "
+                    f"{limits.edit_distance:g}"
+                )
+            return None
+        if y is not None and not limits.min_y <= y <= limits.max_y:
+            return f"target y={y:g} is outside {limits.min_y:g}..{limits.max_y:g}"
+        if kind == "move" and y is not None:
+            distance = math.dist(position, (x, y, z))
+            limit = limits.move_distance
+        else:
+            distance = math.dist((position[0], position[2]), (x, z))
+            # Beyond its walking range walk_to teleports instead; a
+            # controller's walk must stay a walk.
+            limit = (
+                min(limits.move_distance, WALK_TO_TELEPORT_DISTANCE)
+                if kind == "walk"
+                else limits.move_distance
+            )
+        if distance > limit:
+            noun = "walking" if kind == "walk" else "movement"
+            return f"target is {distance:.1f} blocks away; {noun} is limited to {limit:g}"
+        return None
 
     @staticmethod
     def _revalidate(request: ActionRequestSchema) -> ActionRequestSchema:
@@ -380,4 +500,4 @@ def _action_id(steve_id: str, credential_id: str, request_id: str) -> str:
 
 _ACTION_ID_NAMESPACE = UUID("6f0d3c1e-6a0b-5c5e-9a8e-4a1d5f2b7c90")
 
-__all__ = ["ControllerService"]
+__all__ = ["ControllerService", "ReachLimits"]

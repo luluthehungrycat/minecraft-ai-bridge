@@ -104,12 +104,17 @@ async def _exercise(client: Client) -> None:
 
     chat = await submit("chat-1", "chat", {"message": "minecraft-ai-bridge MCP integration test"})
     replay = await submit("chat-1", "chat", {"message": "minecraft-ai-bridge MCP integration test"})
-    moved = await submit("tp-1", "teleport", {"x": 0, "y": 120, "z": 0})
+    position = state.structured_content["position"]
+    assert position, "the live bot has no position"
+    target = {"x": position[0] + 3, "y": position[1], "z": position[2] + 3}
+    moved = await submit("tp-1", "teleport", target)
+    far = await submit("tp-far", "teleport", {**target, "x": position[0] + 500})
     internal = await submit("internal-1", "goto_teleport", {"target": "Alex"})
 
     assert chat["status"] == "succeeded"
     assert replay["action_id"] == chat["action_id"]
     assert moved["status"] == "succeeded", moved
+    assert far["reason_code"] == "OUT_OF_REACH", far
     assert internal["reason_code"] == "ACTION_NOT_EXPOSED"
 
     closed = await client.call_tool(

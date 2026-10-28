@@ -139,6 +139,20 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
 
 ### Added
 
+- Added reach limits for external controllers (#25): `ControllerService` rejects
+  block edits with explicit coordinates more than 6 blocks from the bot, and
+  `teleport`/`move_to`/`walk_to` destinations more than 32 blocks away or outside
+  y -64..320, with reason code `OUT_OF_REACH` and nothing dispatched.
+  `minecraft-ai-bridge-mcp` exposes `--max-edit-distance` and
+  `--max-move-distance`. The check runs under the dispatch lock right before
+  the backend call, so it is serialized with the controller's other requests
+  (movement by other processes, players, or physics is not fenced), and
+  replays of completed requests return their original outcome.
+  `walk_to` is capped at its 50-block walking range so it never turns into a
+  teleport, and limits must be finite. Targets whose coordinates are not
+  finite numbers are refused with `INVALID_TARGET` instead of being passed to
+  the handler. The built-in CLI agent is not limited.
+
 - Added an MCP server for external agent harnesses: `minecraft-ai-bridge-mcp`
   (install with `pip install minecraft-ai-bridge[mcp]`) serves one Steve over
   stdio or Streamable HTTP with six tools over `ControllerService`. HTTP calls
