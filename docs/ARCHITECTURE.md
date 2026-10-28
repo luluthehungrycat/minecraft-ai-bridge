@@ -303,19 +303,25 @@ issuing a new credential. Privileged actions with no delegation scope
 built-in CLI agent is trusted in-process and does not use delegation scopes.
 Parameter validation still applies.
 
-Targeted actions are also limited by `ReachLimits` (#25), measured from the
-bot's current position before dispatch: `break_block`/`place_block` with
-explicit coordinates within `edit_distance` (default 6 blocks), and
-`teleport`/`move_to` (3D) and `walk_to` (horizontal) destinations within
-`move_distance` (default 32) and inside the world height range -64..320.
-Edits without coordinates act next to the bot and relative steps are already
-bounded, so they are not checked. If the position cannot be read the request
-is rejected; violations are `rejected` with reason code `OUT_OF_REACH` and
-nothing is dispatched. The check happens before the request takes the dispatch
-lock, so a move the same controller has in flight can shift the reference
-point by at most one move; and a replay of an earlier request is checked
-against the bot's current position, so it may be refused (never repeated)
-after the bot has moved. The built-in CLI agent is not limited.
+Targeted actions are also limited by `ReachLimits` (#25): `break_block`/
+`place_block` with explicit coordinates within `edit_distance` (default 6
+blocks), `teleport`/`move_to` destinations within `move_distance` (default
+32, 3D), and `walk_to` destinations within the smaller of `move_distance` and
+`walk_to`'s walking range (`WALK_TO_TELEPORT_DISTANCE`, 50 blocks horizontal),
+so a controller's walk never falls through to the handler's long-distance
+teleport. Destinations must also lie inside the world height range
+-64..320, and all limits must be finite. Edits without coordinates act next
+to the bot and relative steps are already bounded, so they are not checked.
+
+The check is an `ActionService` dispatch guard: it runs after policy, under the
+dispatch lock, immediately before the backend call, so it measures from the
+position the action will actually act from, even when other requests from
+the same controller are queued. Replays of completed requests are answered
+from the idempotency cache before the guard and return their original
+outcome. A refusal is `rejected` with reason code `OUT_OF_REACH`, nothing is
+dispatched, and it becomes that request ID's final outcome; an unreadable
+position is refused too. The guard never applies to trusted internal or
+safety requests, and the built-in CLI agent is not limited.
 
 Authentication failures raise `PermissionError`; every other refusal
 is a `rejected` result with a `reason_code` (`STEVE_MISMATCH`,

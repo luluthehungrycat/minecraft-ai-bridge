@@ -212,6 +212,19 @@ ActionPolicy = Callable[[ActionRequest], PolicyDecision | Awaitable[PolicyDecisi
 
 
 @dataclass(frozen=True)
+class GuardRefusal:
+    """Why a dispatch guard refused a request, with a stable reason code."""
+
+    reason_code: str
+    message: str
+
+
+# Called under the dispatch lock right before the backend call; returns a
+# refusal or None. Not called for replays or trusted internal/safety requests.
+DispatchGuard = Callable[[ActionRequest], Awaitable[GuardRefusal | None]]
+
+
+@dataclass(frozen=True)
 class ActionOutcome:
     """Terminal outcome stored for an explicit action request ID.
 
@@ -367,8 +380,11 @@ class ActionService:
         internal_authority: object | None = None,
         safety_authority: object | None = None,
         outcome_store: SqliteActionOutcomeStore | None = None,
+        dispatch_guard: DispatchGuard | None = None,
     ) -> None:
         self._world = world
+        # Optional last check before backend dispatch for untrusted requests.
+        self._dispatch_guard = dispatch_guard
         # Optional durable request-ID outcomes; without it idempotency is
         # process-local and bounded by max_terminal_records.
         self._outcome_store = outcome_store
@@ -999,6 +1015,24 @@ class ActionService:
             )
             return ActionOutcome(result=result, status="preempted", allowed=False)
 
+        if (
+            self._dispatch_guard is not None
+            and not request.trusted_internal
+            and not request.trusted_safety
+        ):
+            # Runs after policy, under the dispatch lock, immediately before
+            # the backend call, so the world state it reads is the state the
+            # action will act on. Replays never reach this point.
+            refusal = await self._dispatch_guard(request)
+            if refusal is not None:
+                return self._rejection_outcome(
+                    request,
+                    request_id,
+                    refusal.message,
+                    status="rejected",
+                    reason_code=refusal.reason_code,
+                )
+
         if request_id is not None:
             # Mark the dispatch boundary before the backend call. Cancellation
             # before this point is a pre-dispatch cancellation; cancellation
@@ -1140,6 +1174,7 @@ class ActionService:
         reason: str,
         *,
         status: str,
+        reason_code: str | None = None,
     ) -> ActionOutcome:
         """Build and audit a fail-closed policy result."""
         self._record(
@@ -1153,6 +1188,8 @@ class ActionService:
         result.data["correlation_id"] = request.correlation_id
         if request_id is not None:
             result.data["request_id"] = request_id
+        if reason_code is not None:
+            result.data["reason_code"] = reason_code
         return ActionOutcome(result=result, status=status, allowed=False)
 
     def _record(

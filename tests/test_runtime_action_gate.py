@@ -705,3 +705,33 @@ async def test_unclassified_action_fails_closed_before_policy(mock_mc: MockMcpqC
     assert "no security classification" in result.message
     assert policy_calls == []
     assert mock_mc.commands_ran == []
+
+
+@pytest.mark.asyncio
+async def test_dispatch_guard_applies_only_to_untrusted_requests(mock_mc: MockMcpqClient):
+    from minecraft_ai_bridge.runtime import ActionService
+    from minecraft_ai_bridge.runtime.action_service import GuardRefusal
+    from minecraft_ai_bridge.runtime.world_adapter import McpqWorldAdapter
+
+    consulted: list[ActionType] = []
+
+    async def refuse_everything(request):
+        consulted.append(request.action)
+        return GuardRefusal("TEST_REFUSED", "refused by test guard")
+
+    internal = object()
+    service = ActionService(
+        McpqWorldAdapter(mock_mc), internal_authority=internal, dispatch_guard=refuse_everything
+    )
+    mock_mc.set_players(["Alex"])
+
+    untrusted = await service.execute(ActionType.CHAT, {"message": "hi"})
+    trusted = await service.execute(
+        ActionType.GOTO_TELEPORT, {"target": "Alex"}, authority=internal
+    )
+
+    assert not untrusted.success
+    assert untrusted.data["reason_code"] == "TEST_REFUSED"
+    assert mock_mc.chat_messages_sent == []
+    assert consulted == [ActionType.CHAT]  # the trusted request never reached the guard
+    assert "refused by test guard" not in trusted.message

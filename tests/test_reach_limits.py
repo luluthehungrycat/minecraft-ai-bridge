@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from uuid import uuid4
 
 import pytest
@@ -80,7 +81,7 @@ async def test_targets_within_reach_run(setup, action, params):
         (ActionType.TELEPORT, {"x": 140, "y": 64, "z": 100}, "movement"),
         (ActionType.MOVE_TO, {"x": 0, "y": 0, "z": 0}, "movement"),  # missing axes are 0
         (ActionType.MOVE_TO, {"x": 100, "z": 100}, "movement"),  # y defaults to 0: 64 down
-        (ActionType.WALK_TO, {"x": 100, "z": 140}, "movement"),
+        (ActionType.WALK_TO, {"x": 100, "z": 140}, "walking"),
         (ActionType.TELEPORT, {"x": 100, "y": 330, "z": 100}, "outside"),
         (ActionType.TELEPORT, {"x": 100, "y": -70, "z": 100}, "outside"),
     ],
@@ -146,3 +147,46 @@ async def test_malformed_coordinates_are_left_to_the_handler(setup):
 def test_invalid_limits_are_refused(kwargs):
     with pytest.raises(ValueError):
         ReachLimits(**kwargs)
+
+
+@pytest.mark.parametrize("field", ["edit_distance", "move_distance", "min_y", "max_y"])
+@pytest.mark.parametrize("value", [math.inf, -math.inf, math.nan])
+def test_non_finite_limits_are_refused(field, value):
+    with pytest.raises(ValueError):
+        ReachLimits(**{field: value})
+
+
+def test_server_command_refuses_non_finite_limits(tmp_path):
+    from minecraft_ai_bridge.transport import mcp_main
+
+    pytest.importorskip("mcp")
+    config = tmp_path / "config.yaml"
+    config.write_text("authz:\n  steve_id: AIBot\n")
+    with pytest.raises(SystemExit) as exit_info:
+        mcp_main.main(
+            ["--transport", "http", "--config", str(config), "--max-move-distance", "inf"]
+        )
+    assert exit_info.value.code == 2
+
+
+async def test_walk_to_never_becomes_a_teleport_for_controllers(setup):
+    """With a movement radius above walk_to's walking range, walk_to stays a walk."""
+    _, world, _, _ = setup
+    wide = ReachLimits(move_distance=200)
+
+    long_walk = await _submit(setup, ActionType.WALK_TO, {"x": 180, "z": 100}, wide)
+    teleport = await _submit(setup, ActionType.TELEPORT, {"x": 180, "y": 64, "z": 100}, wide)
+
+    assert long_walk.reason_code == "OUT_OF_REACH"
+    assert "walking is limited to 50" in long_walk.message
+    assert teleport.status is ActionStatus.SUCCEEDED  # teleport is its own action
+    assert await world.get_player_pos() == (180.0, 64.0, 100.0)
+
+
+async def test_walk_to_within_walking_range_still_walks(setup):
+    _, world, _, _ = setup
+    result = await _submit(
+        setup, ActionType.WALK_TO, {"x": 140, "z": 100}, ReachLimits(move_distance=200)
+    )
+    assert result.reason_code != "OUT_OF_REACH", result.message
+    assert not any(command.startswith("teleport to (140") for command in world.commands_ran)

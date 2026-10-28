@@ -152,7 +152,7 @@ minecraft-ai-bridge-mcp --transport http --port 8765
 | `--allowed-origin` | loopback origins | Browser Origin to accept (repeatable). For remote binds, omit it unless a browser client needs it |
 | `--outcome-store` | `data/action-outcomes.sqlite3` | Durable request-ID outcomes |
 | `--max-edit-distance` | `6` | Farthest `break_block`/`place_block` target (with coordinates) from the bot |
-| `--max-move-distance` | `32` | Farthest `teleport`/`move_to`/`walk_to` destination from the bot |
+| `--max-move-distance` | `32` | Farthest `teleport`/`move_to`/`walk_to` destination from the bot (`walk_to` is also capped at its 50-block walking range); must be finite |
 | `--session-lease-seconds` | `300` | Controller session lease |
 
 | Variable | Used for |

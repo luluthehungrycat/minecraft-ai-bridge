@@ -144,7 +144,12 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
   `teleport`/`move_to`/`walk_to` destinations more than 32 blocks away or outside
   y -64..320, with reason code `OUT_OF_REACH` and nothing dispatched.
   `minecraft-ai-bridge-mcp` exposes `--max-edit-distance` and
-  `--max-move-distance`. The built-in CLI agent is not limited.
+  `--max-move-distance`. The check runs under the dispatch lock right before
+  the backend call, so queued requests are measured from the bot's actual
+  position, and replays of completed requests return their original outcome.
+  `walk_to` is capped at its 50-block walking range so it never turns into a
+  teleport, and limits must be finite. The built-in CLI agent is not
+  limited.
 
 - Added an MCP server for external agent harnesses: `minecraft-ai-bridge-mcp`
   (install with `pip install minecraft-ai-bridge[mcp]`) serves one Steve over
