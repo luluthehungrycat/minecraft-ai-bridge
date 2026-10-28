@@ -91,3 +91,29 @@ async def test_malformed_targets_are_refused_without_backend_effects(
     assert await world.get_player_pos() == (100, 64, 100)
     assert await world.get_block(1000, 1, 100) == "air"
     assert await world.get_block(1000, 64, 100) == "air"
+
+
+@pytest.mark.parametrize("action", [ActionType.PLACE_BLOCK, ActionType.BREAK_BLOCK])
+@pytest.mark.parametrize(
+    ("bot", "target", "allowed"),
+    [
+        # Handlers edit int(coordinate); the guard must measure that block.
+        ((100.9, 64, 100), {"x": 94.99, "y": 64, "z": 100}, False),  # int -> 94: 6.9 away
+        ((100.9, 64, 100), {"x": 95.5, "y": 64, "z": 100}, True),  # int -> 95: 5.9 away
+        ((-100.9, 64, 0), {"x": -106.5, "y": 64, "z": 0}, True),  # int -> -106: 5.1 away
+        ((-100.9, 64, 0), {"x": -107.5, "y": 64, "z": 0}, False),  # int -> -107: 6.1 away
+    ],
+)
+async def test_edits_are_measured_to_the_block_the_handler_edits(
+    setup, action, bot, target, allowed
+):
+    _, world, _ = setup
+    world.set_position(*bot)
+    params = {"block_type": "stone", **target} if action is ActionType.PLACE_BLOCK else target
+    result = await _submit(setup, action, params)
+
+    if allowed:
+        assert result.reason_code != "OUT_OF_REACH", result.message
+    else:
+        assert result.reason_code == "OUT_OF_REACH", result
+        assert world.commands_ran == []

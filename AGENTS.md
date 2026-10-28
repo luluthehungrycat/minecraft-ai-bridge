@@ -114,7 +114,7 @@ examples and the conventions block at the top.
 - **config.yaml volume mount**: Mounted read-only at `/app/config.yaml`. Changes require `docker compose restart bridge`.
 
 ### Code Quality
-- **Tests**: 806 tests collected in total — 792 deterministic unit tests plus 14 integration tests (12 agent-loop, 2 MCP end-to-end). The 54 MCP adapter unit tests and both MCP end-to-end tests need the `mcp` extra (included in `[dev]`) and skip without it. Unit tests use `MockMcpqClient` for deterministic MCPQ simulation. Integration tests use a real MCPQ server + real LLM (OpenRouter `openai/gpt-oss-20b`, or Requesty `runware/gpt-oss-120b` when only `REQUESTY_API_KEY` is set; override with `INTEGRATION_LLM_MODEL`) for end-to-end validation. The stack uses pinned Paper 26.2 build 123. Run with `pytest tests/`.
+- **Tests**: 814 tests collected in total — 800 deterministic unit tests plus 14 integration tests (12 agent-loop, 2 MCP end-to-end). The 54 MCP adapter unit tests and both MCP end-to-end tests need the `mcp` extra (included in `[dev]`) and skip without it. Unit tests use `MockMcpqClient` for deterministic MCPQ simulation. Integration tests use a real MCPQ server + real LLM (OpenRouter `openai/gpt-oss-20b`, or Requesty `runware/gpt-oss-120b` when only `REQUESTY_API_KEY` is set; override with `INTEGRATION_LLM_MODEL`) for end-to-end validation. The stack uses pinned Paper 26.2 build 123. Run with `pytest tests/`.
 - **Mypy**: runs in CI on every push and PR (`mypy minecraft_ai_bridge/ --ignore-missing-imports`) and must pass.
 - **gRPC stubs are synchronous**: MCPQ generated stubs block; dispatched via `asyncio.to_thread`. Not ideal but works.
 - **RCON client is unmaintained**: Since the MCPQ migration, `rcon.py` isn't tested. Consider removing or marking deprecated.
@@ -140,7 +140,7 @@ Some LLMs (especially smaller/local ones) can't reliably output structured JSON 
 
 ### P0: None (Testing Complete)
 The 0.5.0 release completed the testing milestone:
-- **Unit tests** (792): MockMcpqClient covers all 36 actions, observer parsing, memory, goal fallback plans, config, inventory manager, chat commands, pathfinding, the runtime action gate, the safety supervisor, the event journal, webhook delivery, and the local authorization service
+- **Unit tests** (800): MockMcpqClient covers all 36 actions, observer parsing, memory, goal fallback plans, config, inventory manager, chat commands, pathfinding, the runtime action gate, the safety supervisor, the event journal, webhook delivery, and the local authorization service
 - **Integration tests** (12): Full think-act-observe loop with real MCPQ server + real LLM inference (OpenRouter `openai/gpt-oss-20b`). Covers teleport, exploration, disconnect handling, fallback decomposition, failure counting, memory recording, chat command stop, and inventory creation.
 - **Goal-verification assertions**: Integration tests verify agent behavior via:
   - `action_taken(orch, *names) → bool` — checks if the agent performed a specific action (parses `MemoryEntry.raw`)
@@ -214,7 +214,7 @@ The 0.5.0 release completed the testing milestone:
 | `docker-compose.yml` | Paper server + bridge services |
 | `docs/*.md` | Full documentation set |
 | `tests/conftest.py` | MockMcpqClient, MockLLMClient, test fixtures |
-| `tests/test_*.py` | Unit + integration tests (806 total: 792 unit + 14 integration) |
+| `tests/test_*.py` | Unit + integration tests (814 total: 800 unit + 14 integration) |
 | `AGENTS.md` | This file |
 
 ## Environment Info
@@ -266,7 +266,7 @@ Helpers in `tests/test_integration.py`:
 | `tests/test_authz_orchestrator.py` | 27 | Optional built-in Orchestrator Authz configuration, session gating, revocation, and cleanup |
 | `tests/test_controller_service.py` | 33 | Phase B controller API gate: exclusive sessions, observers, privileged and internal actions |
 | `tests/test_reach_limits.py` | 37 | Reach limits for external controllers' targeted edits and moves; finite limits; walk_to stays a walk |
-| `tests/test_reach_bypass.py` | 7 | Malformed targets refused before dispatch (no reach bypass via handler coercion) |
+| `tests/test_reach_bypass.py` | 15 | No reach bypass via handler coercion: malformed targets refused, edits measured to the truncated block |
 | `tests/test_reach_races.py` | 4 | Reach checked at dispatch under concurrency; replays and request-ID reuse |
 | `tests/test_world_delegation.py` | 19 | Per-credential world delegation scopes for ControllerService |
 | `tests/test_authz_service.py` | 93 | Local credentials, scopes, ownership, sessions, fencing, peer-grant audit migration |

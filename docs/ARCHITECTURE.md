@@ -305,7 +305,7 @@ Parameter validation still applies.
 
 Targeted actions are also limited by `ReachLimits` (#25): `break_block`/
 `place_block` with explicit coordinates within `edit_distance` (default 6
-blocks), `teleport`/`move_to` destinations within `move_distance` (default
+blocks, measured to the block the handler edits, `int()` of each coordinate), `teleport`/`move_to` destinations within `move_distance` (default
 32, 3D), and `walk_to` destinations within the smaller of `move_distance` and
 `walk_to`'s walking range (`WALK_TO_TELEPORT_DISTANCE`, 50 blocks horizontal),
 so a controller's walk never falls through to the handler's long-distance

@@ -358,7 +358,10 @@ class ControllerService:
         limits = self._reach
         if kind == "edit":
             assert y is not None
-            distance = math.dist(position, (x, y, z))
+            # The handlers edit the block at int(coordinate); measure that
+            # block, not the fractional target, so truncation cannot push an
+            # edit past the limit.
+            distance = math.dist(position, (int(x), int(y), int(z)))
             if distance > limits.edit_distance:
                 return (
                     f"target is {distance:.1f} blocks away; edits are limited to "
