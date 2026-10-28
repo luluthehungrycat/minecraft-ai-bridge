@@ -290,6 +290,19 @@ class TestCommandDispatch:
         )
         assert harness._follow_target == "Player2"
 
+    @pytest.mark.parametrize(
+        "target", ["@a", "@e[type=player]", "Player2]", "a" * 17, "Pl\u00e9yer"]
+    )
+    async def test_handle_follow_rejects_non_username_targets(self, harness, target):
+        handler = ChatCommandHandler(harness)
+        await handler.handle_command(
+            "!follow", target, "Player", trusted_player=SimpleNamespace(name="Player")
+        )
+        assert harness._follow_target is None
+        # Only the chat reply ran; no command used the target.
+        assert all(c.startswith("chat: ") for c in harness._mc.commands_ran)
+        assert any("Cannot follow" in m for m in harness._mc.chat_messages_sent)
+
     async def test_handle_follow_no_args(self, harness):
         handler = ChatCommandHandler(harness)
         await handler.handle_command(

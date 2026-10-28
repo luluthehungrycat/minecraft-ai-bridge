@@ -27,6 +27,9 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
 
 ### Fixed
 
+- `!follow` now rejects targets that are not plain Minecraft usernames (such as
+  `@a` selectors) and replies with an error, and follow mode never runs its
+  position read with an unvalidated target (#21).
 - `McpqClient.connect` now cleans up the MCPQ client created by each failed
   attempt instead of leaving it to garbage collection.
 - `McpqClient.disconnect` now shuts down the MCPQ client explicitly. It
