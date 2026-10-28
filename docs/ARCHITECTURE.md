@@ -312,6 +312,10 @@ so a controller's walk never falls through to the handler's long-distance
 teleport. Destinations must also lie inside the world height range
 -64..320, and all limits must be finite. Edits without coordinates act next
 to the bot and relative steps are already bounded, so they are not checked.
+Targeted coordinates that are not finite numbers are refused with
+`INVALID_TARGET` rather than left to the handler, because handlers coerce
+some values (for example `int(True)`); `walk_to`'s `y: null` means "keep the
+current height", as in the handler.
 
 The check is an `ActionService` dispatch guard: it runs after policy, under the
 dispatch lock, immediately before the backend call. Every non-WAIT dispatch
@@ -336,7 +340,7 @@ safety requests, and the built-in CLI agent is not limited.
 Authentication failures raise `PermissionError`; every other refusal
 is a `rejected` result with a `reason_code` (`STEVE_MISMATCH`,
 `SESSION_UNKNOWN`, `SESSION_NOT_OWNED`, `STALE_GENERATION`,
-`ACTION_NOT_EXPOSED`, `OUT_OF_REACH`, `POLICY_REJECTED`).
+`ACTION_NOT_EXPOSED`, `OUT_OF_REACH`, `INVALID_TARGET`, `POLICY_REJECTED`).
 
 There is no task service or event API yet, and the safety supervisor does not
 run for externally controlled Steves.

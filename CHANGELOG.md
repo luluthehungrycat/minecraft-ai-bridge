@@ -149,8 +149,9 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
   (movement by other processes, players, or physics is not fenced), and
   replays of completed requests return their original outcome.
   `walk_to` is capped at its 50-block walking range so it never turns into a
-  teleport, and limits must be finite. The built-in CLI agent is not
-  limited.
+  teleport, and limits must be finite. Targets whose coordinates are not
+  finite numbers are refused with `INVALID_TARGET` instead of being passed to
+  the handler. The built-in CLI agent is not limited.
 
 - Added an MCP server for external agent harnesses: `minecraft-ai-bridge-mcp`
   (install with `pip install minecraft-ai-bridge[mcp]`) serves one Steve over

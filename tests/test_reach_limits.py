@@ -127,12 +127,12 @@ async def test_unchecked_actions_are_unaffected(setup):
     assert result.reason_code != "OUT_OF_REACH"
 
 
-async def test_malformed_coordinates_are_left_to_the_handler(setup):
+async def test_malformed_coordinates_are_refused_before_dispatch(setup):
     _, world, _, _ = setup
     result = await _submit(setup, ActionType.TELEPORT, {"x": "far", "y": 64, "z": 0})
 
-    assert result.reason_code != "OUT_OF_REACH"
-    assert result.status is ActionStatus.FAILED
+    assert result.status is ActionStatus.REJECTED
+    assert result.reason_code == "INVALID_TARGET"
     assert world.commands_ran == []
 
 

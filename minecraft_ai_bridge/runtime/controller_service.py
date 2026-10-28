@@ -324,33 +324,34 @@ class ControllerService:
         outside this service (other processes, players, physics) is not
         fenced; see docs/ARCHITECTURE.md.
         """
-        message = await self._reach_violation(request.action, request.params)
+        try:
+            message = await self._reach_violation(request.action, request.params)
+        except ValueError as exc:
+            # Fail closed: handlers coerce some values this parser rejects
+            # (e.g. int(True)), so an unparsed target must never pass.
+            return GuardRefusal("INVALID_TARGET", f"target coordinates are not valid: {exc}")
         return None if message is None else GuardRefusal("OUT_OF_REACH", message)
 
     async def _reach_violation(self, action: ActionType, params: Mapping[str, Any]) -> str | None:
         """Return why a targeted action is out of reach, or None if it is in reach.
 
         Only actions with absolute targets are checked; relative steps and
-        edits next to the bot are already bounded. Malformed coordinates are
-        left to the handler, which rejects them without running a command.
+        edits next to the bot are already bounded. Raises ``ValueError`` for
+        coordinates that are not finite numbers, which the guard refuses.
         """
         kind = _REACH_KINDS.get(action)
         if kind is None:
             return None
         if kind == "edit" and not all(axis in params for axis in ("x", "y", "z")):
             return None
-        try:
-            # Same defaults as the handlers: move_to treats missing axes as 0,
-            # and walk_to's y is optional.
-            x = _finite_coordinate(params.get("x", 0), "x")
-            z = _finite_coordinate(params.get("z", 0), "z")
-            y = (
-                _finite_coordinate(params.get("y", 0), "y")
-                if kind != "walk" or "y" in params
-                else None
-            )
-        except ValueError:
-            return None
+        # Same defaults as the handlers: move_to treats missing axes as 0, and
+        # walk_to treats a missing or null y as "keep the current height".
+        x = _finite_coordinate(params.get("x", 0), "x")
+        z = _finite_coordinate(params.get("z", 0), "z")
+        if kind == "walk" and params.get("y") is None:
+            y = None
+        else:
+            y = _finite_coordinate(params.get("y", 0), "y")
         position = await self._world.get_player_pos()
         if position is None:
             return "the bot's position is unknown, so reach cannot be checked"
