@@ -148,6 +148,8 @@ minecraft-ai-bridge-mcp --transport http --port 8765
 | `--transport` | `stdio` | `stdio` or `http` |
 | `--host` / `--port` | `127.0.0.1` / `8765` | HTTP bind address |
 | `--allow-remote` | off | Required to bind HTTP to a non-loopback address; terminate TLS in front of it |
+| `--allowed-host` | loopback hosts | Host header value to accept (repeatable; `name:*` allows any port). Required with `--allow-remote` |
+| `--allowed-origin` | loopback origins | Browser Origin to accept (repeatable). For remote binds, omit it unless a browser client needs it |
 | `--outcome-store` | `data/action-outcomes.sqlite3` | Durable request-ID outcomes |
 | `--max-edit-distance` | `6` | Farthest `break_block`/`place_block` target (with coordinates) from the bot |
 | `--max-move-distance` | `32` | Farthest `teleport`/`move_to`/`walk_to` destination from the bot |
@@ -177,6 +179,20 @@ Example stdio client configuration:
   }
 }
 ```
+
+Remote deployment behind a TLS-terminating reverse proxy:
+
+```bash
+minecraft-ai-bridge-mcp --transport http --host 0.0.0.0 --port 8765 \
+  --allow-remote --allowed-host mcp.example.com
+```
+
+The server checks every request's Host header (and Origin, when present)
+against these lists to block DNS-rebinding requests: a request with any other
+Host is answered `421`, and one with any other Origin `403`. Behind a proxy,
+list the Host value the server actually receives: the public hostname if the
+proxy preserves the Host header, or the upstream address it rewrites to
+otherwise. Loopback binds accept only loopback hosts and origins by default.
 
 The bot entity must already exist in the world (run the bridge once, or
 `/botsummon <name>`). Credentials and delegation scopes are created with

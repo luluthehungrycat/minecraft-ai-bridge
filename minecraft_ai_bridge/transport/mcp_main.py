@@ -22,9 +22,14 @@ import ipaddress
 import logging
 import os
 import sys
+from contextlib import AsyncExitStack
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from ..config import AppConfig
+
+if TYPE_CHECKING:
+    from mcp.server.transport_security import TransportSecuritySettings
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +49,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-remote",
         action="store_true",
         help="Allow binding HTTP to a non-loopback address (put TLS in front of it)",
+    )
+    parser.add_argument(
+        "--allowed-host",
+        action="append",
+        default=[],
+        metavar="HOST[:PORT]",
+        help=(
+            "Host header value clients use (repeatable; 'name:*' allows any port). "
+            "Required with --allow-remote; behind a reverse proxy, the public hostname"
+        ),
+    )
+    parser.add_argument(
+        "--allowed-origin",
+        action="append",
+        default=[],
+        metavar="ORIGIN",
+        help="Browser Origin allowed to call the server (repeatable)",
     )
     parser.add_argument(
         "--outcome-store",
@@ -71,15 +93,55 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _is_loopback(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def transport_security_for(
+    host: str, allowed_hosts: list[str], allowed_origins: list[str]
+) -> TransportSecuritySettings:
+    """Return explicit Host/Origin validation for an HTTP bind address.
+
+    The SDK only auto-enables DNS-rebinding protection for the exact hosts
+    127.0.0.1, localhost, and ::1, and disables it otherwise, so this is
+    always passed explicitly. Loopback binds accept loopback Host and Origin
+    values plus any configured extras. Other binds accept only the configured
+    hosts and origins; with no origins, only requests without an Origin
+    header (non-browser clients) pass.
+    """
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    hosts = list(allowed_hosts)
+    origins = list(allowed_origins)
+    if _is_loopback(host):
+        bracketed = f"[{host}]" if ":" in host else host
+        hosts += ["127.0.0.1:*", "localhost:*", "[::1]:*", f"{bracketed}:*"]
+        origins += [
+            "http://127.0.0.1:*",
+            "http://localhost:*",
+            "http://[::1]:*",
+            f"http://{bracketed}:*",
+        ]
+    elif not hosts:
+        raise ValueError(
+            f"serving HTTP on {host!r} requires --allowed-host with the Host header "
+            "clients send (the public hostname behind a reverse proxy)"
+        )
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=list(dict.fromkeys(hosts)),
+        allowed_origins=list(dict.fromkeys(origins)),
+    )
+
+
 def check_bind_address(host: str, *, allow_remote: bool) -> None:
     """Refuse non-loopback HTTP binds unless explicitly allowed."""
-    if allow_remote or host == "localhost":
-        return
-    try:
-        loopback = ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        loopback = False
-    if not loopback:
+    if not allow_remote and not _is_loopback(host):
         raise ValueError(
             f"refusing to serve HTTP on non-loopback address {host!r}; pass "
             "--allow-remote and terminate TLS in front of this server"
@@ -102,38 +164,46 @@ async def serve(args: argparse.Namespace, config: AppConfig) -> None:
     if args.transport == "stdio" and stdio_token is None:
         raise ValueError(f"stdio transport requires the {STDIO_TOKEN_ENV} environment variable")
 
-    api = config.mc_api
-    mc = McpqClient(host=api.host, port=api.port, player_name=api.player_name)
-    await mc.connect()
-    authz = AuthzService(config.authz.database_path)
-    store = SqliteActionOutcomeStore(Path(args.outcome_store))
-    controller = ControllerService(
-        McpqWorldAdapter(mc),
-        authz,
-        steve_id,
-        world_admin_token=config.authz.world_admin_token.get_secret_value(),
-        session_lease_seconds=args.session_lease_seconds,
-        outcome_store=store,
-        reach_limits=reach,
-    )
-    # Over HTTP each request authenticates with its own header; the process
-    # token is only for stdio.
-    server = build_mcp_server(
-        controller, stdio_token=stdio_token if args.transport == "stdio" else None
-    )
-    try:
+    # Each resource registers its cleanup as soon as it exists, so a failure
+    # at any later step (or in another cleanup) still closes everything
+    # opened so far, in reverse order.
+    async with AsyncExitStack() as stack:
+        api = config.mc_api
+        mc = McpqClient(host=api.host, port=api.port, player_name=api.player_name)
+        await mc.connect()
+        stack.push_async_callback(mc.disconnect)
+        authz = AuthzService(config.authz.database_path)
+        stack.callback(authz.close)
+        store = SqliteActionOutcomeStore(Path(args.outcome_store))
+        stack.callback(store.close)
+        controller = ControllerService(
+            McpqWorldAdapter(mc),
+            authz,
+            steve_id,
+            world_admin_token=config.authz.world_admin_token.get_secret_value(),
+            session_lease_seconds=args.session_lease_seconds,
+            outcome_store=store,
+            reach_limits=reach,
+        )
+        stack.push_async_callback(controller.aclose)
+        # Over HTTP each request authenticates with its own header; the
+        # process token is only for stdio.
+        server = build_mcp_server(
+            controller, stdio_token=stdio_token if args.transport == "stdio" else None
+        )
         if args.transport == "stdio":
             await server.run_stdio_async()
         else:
             logger.info("Serving Steve %s over HTTP on %s:%d", steve_id, args.host, args.port)
             await server.run_streamable_http_async(
-                host=args.host, port=args.port, stateless_http=True, json_response=True
+                host=args.host,
+                port=args.port,
+                stateless_http=True,
+                json_response=True,
+                transport_security=transport_security_for(
+                    args.host, args.allowed_host, args.allowed_origin
+                ),
             )
-    finally:
-        await controller.aclose()
-        store.close()
-        authz.close()
-        await mc.disconnect()
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -151,6 +221,7 @@ def main(argv: list[str] | None = None) -> None:
     try:
         if args.transport == "http":
             check_bind_address(args.host, allow_remote=args.allow_remote)
+            transport_security_for(args.host, args.allowed_host, args.allowed_origin)
         config = AppConfig.from_yaml(args.config)
         asyncio.run(serve(args, config))
     except ValueError as exc:
