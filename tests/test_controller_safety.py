@@ -155,3 +155,48 @@ async def test_evaluation_failure_releases_preemption(setup, monkeypatch):
     with pytest.raises(ValueError, match="evaluation failed"):
         await safety._evaluate(WorldState())
     assert not service.action_service._safety_intervention_pending()
+
+
+async def test_reflex_starting_during_reach_read_preempts_dispatch(setup, monkeypatch):
+    authority = object()
+    service = ControllerService(
+        McpqWorldAdapter(setup.world),
+        setup.auth,
+        "AIBot",
+        world_admin_token=setup.world_admin,
+        safety_authority=authority,
+    )
+    safety = ControllerSafety(service, authority)
+    service.action_service.enable_safety_preemption()
+    session = await service.open_session(setup.delegated)
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = setup.world.get_player_pos
+
+    async def position():
+        entered.set()
+        await release.wait()
+        return await original()
+
+    monkeypatch.setattr(setup.world, "get_player_pos", position)
+    request = asyncio.create_task(
+        service.submit_action(
+            setup.delegated, _request(session, ActionType.MOVE_TO, {"x": 3, "y": 64, "z": 0})
+        )
+    )
+    await asyncio.wait_for(entered.wait(), 2)
+    reflex = asyncio.create_task(
+        safety._evaluate(
+            WorldState(health=20, hunger=2, inventory=[InventorySlot("minecraft:bread", 1, 0)])
+        )
+    )
+    try:
+        async with asyncio.timeout(2):
+            while not service.action_service._safety_intervention_pending():
+                await asyncio.sleep(0)
+    finally:
+        release.set()
+    result, intervention = await asyncio.gather(request, reflex)
+    assert intervention.success
+    assert result.status is ActionStatus.REJECTED
+    assert result.reason_code == "SAFETY_PREEMPTED"
+    assert await original() == (0, 64, 0)

@@ -1002,6 +1002,26 @@ class ActionService:
             )
 
         if (
+            self._dispatch_guard is not None
+            and not request.trusted_internal
+            and not request.trusted_safety
+        ):
+            # Runs after policy, under the dispatch lock, immediately before
+            # the backend call, so no other dispatch through this service can
+            # change the world in between. It does not fence other processes,
+            # players, game physics, or MCPQ work left running by a cancelled
+            # dispatch. Replays never reach this point.
+            refusal = await self._dispatch_guard(request)
+            if refusal is not None:
+                return self._rejection_outcome(
+                    request,
+                    request_id,
+                    refusal.message,
+                    status="rejected",
+                    reason_code=refusal.reason_code,
+                )
+
+        if (
             preemptible
             and request.action is not ActionType.WAIT
             and self._safety_preemption_enabled
@@ -1024,26 +1044,6 @@ class ActionService:
                 request_id=request_id,
             )
             return ActionOutcome(result=result, status="preempted", allowed=False)
-
-        if (
-            self._dispatch_guard is not None
-            and not request.trusted_internal
-            and not request.trusted_safety
-        ):
-            # Runs after policy, under the dispatch lock, immediately before
-            # the backend call, so no other dispatch through this service can
-            # change the world in between. It does not fence other processes,
-            # players, game physics, or MCPQ work left running by a cancelled
-            # dispatch. Replays never reach this point.
-            refusal = await self._dispatch_guard(request)
-            if refusal is not None:
-                return self._rejection_outcome(
-                    request,
-                    request_id,
-                    refusal.message,
-                    status="rejected",
-                    reason_code=refusal.reason_code,
-                )
 
         if request_id is not None:
             # Mark the dispatch boundary before the backend call. Cancellation
