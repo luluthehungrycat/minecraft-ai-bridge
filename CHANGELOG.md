@@ -27,6 +27,11 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
 
 ### Added
 
+- MCP-controlled Steves now run independent attack/eat/heal safety reflexes,
+  journal attributed interventions, and refuse stale queued actions with
+  `SAFETY_PREEMPTED`. Partially executed movement reports `SAFETY_INTERRUPTED`
+  instead; completed backend work cannot be undone (#18).
+
 - `minecraft-ai-bridge-mcp` serves the bot's events: `minecraft_get_events`
   polls a durable per-credential cursor (events repeat until acknowledged)
   and `minecraft_ack_events` acknowledges them. Both need `events:read` on a

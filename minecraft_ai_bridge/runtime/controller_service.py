@@ -23,8 +23,9 @@ events repeat until acknowledged), and opening or releasing a session records
 a ``controller.changed`` event. Only events attributed to this Steve are
 delivered; unattributed events and other Steves' events are skipped.
 
-This is not a transport or task service, and it does not run the safety
-supervisor; those are separate slices.
+This is not a transport or task service. It does not run the safety
+supervisor itself; ``bridge.controller_safety.ControllerSafety`` does, sharing
+this service's ActionService.
 """
 
 from __future__ import annotations
@@ -382,6 +383,9 @@ class ControllerService:
                 request.params,
                 correlation_id=correlation_id,
                 request_id=request.request_id,
+                # Yields to safety reflexes when preemption is enabled
+                # (ControllerSafety); otherwise it has no effect.
+                preemptible=True,
             )
         finally:
             self._current.reset(context)
@@ -389,9 +393,13 @@ class ControllerService:
         status = self._status(correlation_id, result.success)
         if result.success:
             reason_code = None
+        elif result.data.get("interrupted") is True:
+            status = ActionStatus.INTERRUPTED
+            reason_code = "SAFETY_INTERRUPTED"
         elif isinstance(result.data.get("reason_code"), str):
-            # A dispatch-guard refusal (e.g. OUT_OF_REACH), including when
-            # replayed from the idempotency cache.
+            # A dispatch-guard refusal (e.g. OUT_OF_REACH) or a safety
+            # preemption (SAFETY_PREEMPTED), including when replayed from
+            # the idempotency cache. Neither reached the backend.
             status = ActionStatus.REJECTED
             reason_code = result.data["reason_code"]
         else:

@@ -878,6 +878,7 @@ class Orchestrator:
                 else None
             ),
             event_sink=(self._event_journal.append if self._event_journal is not None else None),
+            steve_id=self._config.authz.steve_id.strip() or None,
         )
         self._safety_stop_event = asyncio.Event()
         self._safety_task = asyncio.create_task(
