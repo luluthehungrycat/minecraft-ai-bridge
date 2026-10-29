@@ -45,7 +45,7 @@ from .contracts import (
     Task,
     TaskStatus,
 )
-from .controller_service import ControllerService
+from .controller_service import ControllerService, EventPage
 from .event_journal import EventCursorExpiredError, EventIdConflictError, EventJournal, EventRecord
 from .safety_supervisor import SafetySupervisor
 from .webhooks import (
@@ -85,6 +85,7 @@ __all__ = [
     "EventCursorExpiredError",
     "EventIdConflictError",
     "EventJournal",
+    "EventPage",
     "EventRecord",
     "EventSeverity",
     "McpqWorldAdapter",

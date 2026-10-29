@@ -25,6 +25,16 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
 
 ## [Unreleased]
 
+### Added
+
+- `minecraft-ai-bridge-mcp` serves the bot's events: `minecraft_get_events`
+  polls a durable per-credential cursor (events repeat until acknowledged)
+  and `minecraft_ack_events` acknowledges them. Both need `events:read` on a
+  credential bound to the Steve, and only that Steve's events are delivered.
+  Opening and releasing a controller session now records a
+  `controller.changed` event. `--event-journal` selects the journal file
+  (default `bridge.event_journal_path`) (#18).
+
 ### Fixed
 
 - `!follow` now rejects targets that are not plain Minecraft usernames (such as

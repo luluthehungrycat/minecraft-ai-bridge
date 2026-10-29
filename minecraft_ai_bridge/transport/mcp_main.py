@@ -73,6 +73,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="SQLite file for durable request-ID outcomes",
     )
     parser.add_argument(
+        "--event-journal",
+        default=None,
+        metavar="PATH",
+        help="SQLite event journal (default: bridge.event_journal_path from the config)",
+    )
+    parser.add_argument(
         "--max-edit-distance",
         type=float,
         default=6.0,
@@ -151,7 +157,7 @@ def check_bind_address(host: str, *, allow_remote: bool) -> None:
 async def serve(args: argparse.Namespace, config: AppConfig) -> None:
     """Connect the runtime services and serve until the transport stops."""
     from ..minecraft.mc_api import McpqClient
-    from ..runtime import AuthzService, ControllerService, SqliteActionOutcomeStore
+    from ..runtime import AuthzService, ControllerService, EventJournal, SqliteActionOutcomeStore
     from ..runtime.controller_service import ReachLimits
     from ..runtime.world_adapter import McpqWorldAdapter
     from .mcp_server import build_mcp_server
@@ -179,6 +185,8 @@ async def serve(args: argparse.Namespace, config: AppConfig) -> None:
         stack.callback(authz.close)
         store = SqliteActionOutcomeStore(Path(args.outcome_store))
         stack.callback(store.close)
+        journal = EventJournal(args.event_journal or config.bridge.event_journal_path)
+        stack.callback(journal.close)
         controller = ControllerService(
             McpqWorldAdapter(mc),
             authz,
@@ -187,6 +195,7 @@ async def serve(args: argparse.Namespace, config: AppConfig) -> None:
             session_lease_seconds=args.session_lease_seconds,
             outcome_store=store,
             reach_limits=reach,
+            event_journal=journal,
         )
         stack.push_async_callback(controller.aclose)
         # Over HTTP each request authenticates with its own header; the

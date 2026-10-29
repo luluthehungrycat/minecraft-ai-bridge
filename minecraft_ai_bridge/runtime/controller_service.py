@@ -17,8 +17,14 @@ including teleporting and editing blocks at any coordinates; configure it only
 when all controller credentials for this Steve are trusted at that level.
 Only allowlisted actions are exposed; internal and lifecycle actions never are.
 
-This is not a transport, task service, or event API, and it does not run the
-safety supervisor; those are separate slices.
+With an ``event_journal``, credentials holding ``events:read`` for this Steve
+poll its events through a durable per-credential cursor (at-least-once:
+events repeat until acknowledged), and opening or releasing a session records
+a ``controller.changed`` event. Only events attributed to this Steve are
+delivered; unattributed events and other Steves' events are skipped.
+
+This is not a transport or task service, and it does not run the safety
+supervisor; those are separate slices.
 """
 
 from __future__ import annotations
@@ -57,7 +63,16 @@ from .contracts import (
     ActionStatus,
     Capabilities,
     ControllerSession,
+    Event,
+    EventSeverity,
     SessionStatus,
+)
+from .event_journal import (
+    MAX_EVENTS_PER_FETCH,
+    EventCursorExpiredError,
+    EventJournal,
+    EventJournalError,
+    EventRecord,
 )
 
 logger = logging.getLogger(__name__)
@@ -107,6 +122,23 @@ _EXPOSABLE_CLASSES = frozenset(
     {ActionClass.OBSERVATION, ActionClass.SURVIVAL, ActionClass.PRIVILEGED_SIMULATED}
 )
 _OBSERVE_SCOPES = ("steve:observe:self", "steve:control")
+_EVENTS_SCOPE = "events:read"
+# Journal pages read per poll while skipping events this Steve may not see,
+# so one poll stays bounded even after a long run of other Steves' events.
+_MAX_SKIP_PAGES = 10
+
+
+@dataclass(frozen=True)
+class EventPage:
+    """One poll of a credential's event cursor.
+
+    ``events`` repeat on later polls until acknowledged. ``reset`` is true
+    when retention had dropped unacknowledged events and the cursor was
+    moved to the oldest retained event, so some events were lost.
+    """
+
+    events: list[EventRecord]
+    reset: bool = False
 
 
 @dataclass(frozen=True)
@@ -156,6 +188,7 @@ class ControllerService:
         safety_authority: object | None = None,
         outcome_store: SqliteActionOutcomeStore | None = None,
         reach_limits: ReachLimits | None = None,
+        event_journal: EventJournal | None = None,
     ) -> None:
         if session_lease_seconds <= 0:
             raise ValueError("controller session lease must be positive")
@@ -164,6 +197,7 @@ class ControllerService:
         self._steve_id = steve_id
         self._lease_seconds = session_lease_seconds
         self._reach = reach_limits or ReachLimits()
+        self._journal = event_journal
         self._sessions: dict[str, AuthzControllerSession] = {}
         # The requesting session for the current task. ActionService's policy
         # reads it, so concurrent requests from different sessions cannot see
@@ -226,6 +260,7 @@ class ControllerService:
             session.credential_id,
             session.generation,
         )
+        await self._record_controller_change(session, "opened")
         return self._contract(session)
 
     async def renew_session(self, token: str, session_id: str) -> ControllerSession:
@@ -248,6 +283,7 @@ class ControllerService:
         session = await self._owned_session(token, session_id)
         self._sessions.pop(session_id, None)
         await asyncio.to_thread(self._authz.release_session, session)
+        await self._record_controller_change(session, "released")
 
     # ── Observation ──────────────────────────────────────────────────
 
@@ -260,6 +296,62 @@ class ControllerService:
         await self._require_observer(token)
         state = await self._observer.observe()
         return dataclasses.asdict(state)
+
+    # ── Events ───────────────────────────────────────────────────────
+
+    async def get_events(
+        self, token: str, *, limit: int = 100, reset_expired: bool = False
+    ) -> EventPage:
+        """Return the caller's next unacknowledged events for this Steve.
+
+        Requires ``events:read`` on a credential bound to this Steve; no
+        session is needed. Polling does not advance the cursor; call
+        ``ack_events`` after processing. If retention dropped events the
+        caller had not acknowledged, this raises ``EventCursorExpiredError``
+        unless ``reset_expired`` is set, which resumes from the oldest
+        retained event and reports ``reset=True``.
+        """
+        journal = self._require_journal()
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise ValueError("limit must be an integer")
+        if not 1 <= limit <= MAX_EVENTS_PER_FETCH:
+            raise ValueError(f"limit must be between 1 and {MAX_EVENTS_PER_FETCH}")
+        consumer = await self._event_consumer(token)
+
+        def poll() -> EventPage:
+            reset = False
+            for _ in range(_MAX_SKIP_PAGES):
+                try:
+                    records = journal.get_events(consumer, limit=MAX_EVENTS_PER_FETCH)
+                except EventCursorExpiredError:
+                    if not reset_expired or reset:
+                        raise
+                    journal.reset_consumer(consumer)
+                    reset = True
+                    continue
+                visible: list[EventRecord] = []
+                skip_through = 0
+                for record in records:
+                    if record.event.steve_id == self._steve_id:
+                        visible.append(record)
+                        if len(visible) == limit:
+                            break
+                    else:
+                        skip_through = record.cursor
+                if visible or not records:
+                    return EventPage(visible, reset)
+                # The page held only events this caller never sees, so
+                # acknowledging them hides nothing.
+                journal.ack_event(consumer, skip_through)
+            return EventPage([], reset)
+
+        return await asyncio.to_thread(poll)
+
+    async def ack_events(self, token: str, cursor: int) -> None:
+        """Acknowledge every event up to and including ``cursor``."""
+        journal = self._require_journal()
+        consumer = await self._event_consumer(token)
+        await asyncio.to_thread(journal.ack_event, consumer, cursor)
 
     # ── Actions ──────────────────────────────────────────────────────
 
@@ -466,6 +558,49 @@ class ControllerService:
         if not valid and self._sessions.get(session.session_id) is session:
             del self._sessions[session.session_id]
 
+    def _require_journal(self) -> EventJournal:
+        if self._journal is None:
+            raise ValueError("this service does not record events")
+        return self._journal
+
+    async def _event_consumer(self, token: str) -> str:
+        """Return the caller's journal consumer after checking ``events:read``.
+
+        The credential must be bound to this Steve; ``events:read`` alone is
+        service level and would otherwise admit another Steve's credential.
+        """
+
+        def consumer() -> str:
+            credential = self._authz.authenticate(token)
+            if credential.steve_id != self._steve_id or not self._authz.check_scope(
+                token, _EVENTS_SCOPE, steve_id=self._steve_id
+            ):
+                raise PermissionError(f"{_EVENTS_SCOPE} for this Steve required")
+            return f"controller-{credential.credential_id}"
+
+        return await asyncio.to_thread(consumer)
+
+    async def _record_controller_change(self, session: AuthzControllerSession, change: str) -> None:
+        """Journal a ``controller.changed`` event; never fails the session call."""
+        if self._journal is None:
+            return
+        event = Event(
+            event_id=f"evt-{uuid4()}",
+            type="controller.changed",
+            severity=EventSeverity.INFO,
+            steve_id=self._steve_id,
+            source="controller_service",
+            payload={
+                "change": change,
+                "controller_id": session.credential_id,
+                "generation": session.generation,
+            },
+        )
+        try:
+            await asyncio.to_thread(self._journal.append, event)
+        except (EventJournalError, sqlite3.Error):
+            logger.exception("Failed to record controller.changed event")
+
     def _token_owns(self, token: str, session: AuthzControllerSession) -> bool:
         try:
             credential = self._authz.authenticate(token)
@@ -545,4 +680,4 @@ def _action_id(steve_id: str, credential_id: str, request_id: str) -> str:
 
 _ACTION_ID_NAMESPACE = UUID("6f0d3c1e-6a0b-5c5e-9a8e-4a1d5f2b7c90")
 
-__all__ = ["ControllerService", "ReachLimits"]
+__all__ = ["ControllerService", "EventPage", "ReachLimits"]
