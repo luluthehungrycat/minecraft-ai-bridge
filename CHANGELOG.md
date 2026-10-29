@@ -27,6 +27,9 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
 
 ### Fixed
 
+- `!follow` now rejects targets that are not plain Minecraft usernames (such as
+  `@a` selectors) and replies with an error, and follow mode never runs its
+  position read with an unvalidated target (#21).
 - `ControllerService` no longer keeps expired or fenced controller sessions
   in memory indefinitely. Opening a session drops older-generation entries
   (a late response for an already-fenced session never displaces a newer

@@ -24,7 +24,7 @@ import re
 from collections.abc import Callable, Collection
 from typing import TYPE_CHECKING
 
-from ..minecraft.actions import ActionType
+from ..minecraft.actions import ActionType, _sanitize_player_target
 from ..runtime import ActionService, McpqWorldAdapter
 
 if TYPE_CHECKING:
@@ -295,7 +295,11 @@ class ChatCommandHandler:
         if not args:
             await self._send(f"@{sender} Usage: !follow <player>")
             return
-        target = args.split()[0]
+        try:
+            target = _sanitize_player_target(args.split()[0])
+        except ValueError as exc:
+            await self._send(f"@{sender} Cannot follow: {exc}")
+            return
         orch = self._orch
         orch._follow_target = target
         orch._memory.remember_fact(f"Following player: {target}")
