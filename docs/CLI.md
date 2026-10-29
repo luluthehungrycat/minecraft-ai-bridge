@@ -151,6 +151,7 @@ minecraft-ai-bridge-mcp --transport http --port 8765
 | `--allowed-host` | loopback hosts | Host header value to accept (repeatable; `name:*` allows any port). Required with `--allow-remote` |
 | `--allowed-origin` | loopback origins | Browser Origin to accept (repeatable). For remote binds, omit it unless a browser client needs it |
 | `--outcome-store` | `data/action-outcomes.sqlite3` | Durable request-ID outcomes |
+| `--event-journal` | `bridge.event_journal_path` | SQLite event journal polled by `minecraft_get_events` |
 | `--max-edit-distance` | `6` | Farthest `break_block`/`place_block` target (with coordinates) from the bot |
 | `--max-move-distance` | `32` | Farthest `teleport`/`move_to`/`walk_to` destination from the bot (`walk_to` is also capped at its 50-block walking range); must be finite |
 | `--session-lease-seconds` | `300` | Controller session lease |
@@ -165,6 +166,15 @@ Tools: `minecraft_get_capabilities`, `minecraft_get_state`,
 and `minecraft_submit_action` (`session_id`, `generation`, `request_id`,
 `action`, `params`). Reuse a `request_id` only to retry the same action; the
 retry never runs it twice.
+
+`minecraft_get_events` (`limit`, `reset_expired`) returns this bot's next
+unacknowledged events with their cursors, and `minecraft_ack_events`
+(`cursor`) acknowledges everything up to that cursor; unacknowledged events
+are returned again on the next poll. Both need a credential with
+`events:read` for this Steve, but no session. Session opens and releases are
+recorded as `controller.changed` events. If retention dropped events you had
+not acknowledged, polling fails until you pass `reset_expired: true`, which
+resumes at the oldest retained event and returns `reset: true`.
 
 Example stdio client configuration:
 

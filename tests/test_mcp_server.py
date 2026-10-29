@@ -15,7 +15,7 @@ from mcp import Client  # noqa: E402
 from mcp.client.streamable_http import streamable_http_client  # noqa: E402
 
 from minecraft_ai_bridge.config import AppConfig  # noqa: E402
-from minecraft_ai_bridge.runtime import AuthzService, ControllerService  # noqa: E402
+from minecraft_ai_bridge.runtime import AuthzService, ControllerService, Event  # noqa: E402
 from minecraft_ai_bridge.runtime.world_adapter import McpqWorldAdapter  # noqa: E402
 from minecraft_ai_bridge.transport.mcp_main import (  # noqa: E402
     build_parser,
@@ -33,6 +33,8 @@ TOOLS = {
     "minecraft_renew_session",
     "minecraft_close_session",
     "minecraft_submit_action",
+    "minecraft_get_events",
+    "minecraft_ack_events",
 }
 BASE_URL = "http://127.0.0.1:8765"
 
@@ -45,6 +47,7 @@ class Env:
     second: str
     observer: str
     world_admin: str
+    events_reader: str
 
     def service(self) -> ControllerService:
         return ControllerService(
@@ -70,6 +73,7 @@ def env(tmp_path):
         second=credential("steve:control"),
         observer=credential("steve:observe:self"),
         world_admin=auth.grant_admin_credential(admin.token, "world-op", {"admin:world"}).token,
+        events_reader=credential("steve:control", "events:read"),
     )
     auth.close()
 
@@ -410,6 +414,14 @@ def _install_fakes(monkeypatch, stage: _Stage) -> None:
         def close(self):
             stage.events.append("store.close")
 
+    class FakeJournal:
+        def __init__(self, _path):
+            stage.check("journal")
+            stage.events.append("journal.open")
+
+        def close(self):
+            stage.events.append("journal.close")
+
     class FakeController:
         def __init__(self, *_args, **_kwargs):
             stage.check("controller")
@@ -431,11 +443,12 @@ def _install_fakes(monkeypatch, stage: _Stage) -> None:
     monkeypatch.setattr(mc_api, "McpqClient", FakeMc)
     monkeypatch.setattr(runtime, "AuthzService", FakeAuthz)
     monkeypatch.setattr(runtime, "SqliteActionOutcomeStore", FakeStore)
+    monkeypatch.setattr(runtime, "EventJournal", FakeJournal)
     monkeypatch.setattr(runtime, "ControllerService", FakeController)
     monkeypatch.setattr(mcp_server, "build_mcp_server", fake_build)
 
 
-OPENED = ["mc.open", "authz.open", "store.open", "controller.open"]
+OPENED = ["mc.open", "authz.open", "store.open", "journal.open", "controller.open"]
 
 
 @pytest.mark.parametrize(
@@ -444,11 +457,12 @@ OPENED = ["mc.open", "authz.open", "store.open", "controller.open"]
         ("connect", 0),
         ("authz", 1),
         ("store", 2),
-        ("controller", 3),
-        ("build", 4),
-        ("run", 4),
-        ("controller.aclose", 4),
-        (None, 4),
+        ("journal", 3),
+        ("controller", 4),
+        ("build", 5),
+        ("run", 5),
+        ("controller.aclose", 5),
+        (None, 5),
     ],
 )
 async def test_serve_closes_everything_it_opened(monkeypatch, tmp_path, fail_at, opened):
@@ -527,3 +541,55 @@ async def test_serve_cleans_up_a_connection_cancelled_mid_connect(monkeypatch, t
 
     assert len(created) == 1
     assert created[0].cleanups == 1
+
+
+# ── Events ───────────────────────────────────────────────────────────
+
+
+async def test_events_are_polled_and_acknowledged_through_mcp(env, tmp_path):
+    from minecraft_ai_bridge.runtime import EventJournal
+
+    reader = env.events_reader
+    journal = EventJournal(tmp_path / "events.sqlite3")
+    controller = ControllerService(
+        McpqWorldAdapter(env.world), env.auth, "AIBot", event_journal=journal
+    )
+    try:
+        async with Client(build_mcp_server(controller, stdio_token=reader)) as client:
+            session = await _open(client)
+            polled = (await client.call_tool("minecraft_get_events", {})).structured_content
+            again = (await client.call_tool("minecraft_get_events", {})).structured_content
+            cursor = polled["events"][0]["cursor"]
+            acked = await client.call_tool("minecraft_ack_events", {"cursor": cursor})
+            after = (await client.call_tool("minecraft_get_events", {})).structured_content
+            bad_ack = await client.call_tool("minecraft_ack_events", {"cursor": cursor + 99})
+
+            journal.append_many(
+                [
+                    Event(event_id=f"e{i}", type="t", severity="info", steve_id="AIBot")
+                    for i in range(3)
+                ]
+            )
+            journal.prune(keep=1)
+            expired = await client.call_tool("minecraft_get_events", {})
+            reset = await client.call_tool("minecraft_get_events", {"reset_expired": True})
+            await client.call_tool("minecraft_close_session", {"session_id": session["session_id"]})
+    finally:
+        journal.close()
+
+    event = polled["events"][0]["event"]
+    assert event["type"] == "controller.changed"
+    assert event["payload"]["change"] == "opened"
+    assert again == polled and not polled["reset"]
+    assert not acked.is_error
+    assert after == {"events": [], "reset": False}
+    assert "not been issued" in _error_text(bad_ack)
+    assert "reset_expired=true" in _error_text(expired)
+    assert reset.structured_content["reset"]
+    assert [e["event"]["event_id"] for e in reset.structured_content["events"]] == ["e2"]
+
+
+async def test_events_need_the_events_read_scope_through_mcp(env):
+    async with Client(build_mcp_server(env.service(), stdio_token=env.controller)) as client:
+        no_journal = await client.call_tool("minecraft_get_events", {})
+    assert "does not record events" in _error_text(no_journal)
