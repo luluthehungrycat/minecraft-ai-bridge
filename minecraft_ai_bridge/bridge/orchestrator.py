@@ -19,6 +19,7 @@ from ..llm.client import LLMClient, OpenCodeServerClient, create_llm_client
 from ..llm.models import LLMResponse, Message, Role
 from ..llm.prompts import SYSTEM_PROMPT, format_failure_hint, format_state
 from ..minecraft import ActionResult, ActionType, McpqClient, Observer, WorldState
+from ..minecraft.actions import _sanitize_player_target
 from ..runtime import (
     ActionPolicy,
     ActionService,
@@ -275,6 +276,14 @@ class Orchestrator:
             return False
 
         # ── Follow-mode support (N4) ─────────────────────────────
+        if self._follow_target:
+            # The target is embedded in a raw command below; never run it
+            # with a name that is not a plain username.
+            try:
+                _sanitize_player_target(self._follow_target)
+            except ValueError as exc:
+                logger.warning("Follow mode cancelled: %s", exc)
+                self._follow_target = None
         if self._follow_target:
             try:
                 my_pos = await world_adapter.get_player_pos()

@@ -31,7 +31,7 @@
 - `orchestrator.py` — `Orchestrator` class with `run()` and `_step()` think-act-observe loop. Auto-spawns the bot entity on connect, teleports to safe location.
 - `goal_manager.py` — `GoalNode` tree, LLM-based decomposition, fallback plans for common goals (build, mine, farm, workshop, explore, generic). Mining pattern uses `\bore\b` to avoid matching "Explore" via substring.
 - `memory.py` — `AgentMemory` with short-term (rolling deque) and long-term (facts set) memory
-- `chat_commands.py` — Incoming chat command parser (`!stop`, `!status`, `!follow`, `!goto`, `!come`, `!goal`) for live agent control; protected commands require an explicit allowlisted MCPQ player identity and online-mode assertion, and `!goto`/`!come` teleports route through ActionService as internal actions with strict username validation
+- `chat_commands.py` — Incoming chat command parser (`!stop`, `!status`, `!follow`, `!goto`, `!come`, `!goal`) for live agent control; protected commands require an explicit allowlisted MCPQ player identity and online-mode assertion, `!goto`/`!come` teleports route through ActionService as internal actions with strict username validation, and `!follow` targets get the same validation before the follow-mode position read
 - `inventory_manager.py` — Structured inventory slot tracking with NBT parsing
 
 ### CLI (`minecraft_ai_bridge/main.py`, `__main__.py`)
@@ -114,7 +114,7 @@ examples and the conventions block at the top.
 - **config.yaml volume mount**: Mounted read-only at `/app/config.yaml`. Changes require `docker compose restart bridge`.
 
 ### Code Quality
-- **Tests**: 814 tests collected in total — 800 deterministic unit tests plus 14 integration tests (12 agent-loop, 2 MCP end-to-end). The 54 MCP adapter unit tests and both MCP end-to-end tests need the `mcp` extra (included in `[dev]`) and skip without it. Unit tests use `MockMcpqClient` for deterministic MCPQ simulation. Integration tests use a real MCPQ server + real LLM (OpenRouter `openai/gpt-oss-20b`, or Requesty `runware/gpt-oss-120b` when only `REQUESTY_API_KEY` is set; override with `INTEGRATION_LLM_MODEL`) for end-to-end validation. The stack uses pinned Paper 26.2 build 123. Run with `pytest tests/`.
+- **Tests**: 821 tests collected in total — 807 deterministic unit tests plus 14 integration tests (12 agent-loop, 2 MCP end-to-end). The 54 MCP adapter unit tests and both MCP end-to-end tests need the `mcp` extra (included in `[dev]`) and skip without it. Unit tests use `MockMcpqClient` for deterministic MCPQ simulation. Integration tests use a real MCPQ server + real LLM (OpenRouter `openai/gpt-oss-20b`, or Requesty `runware/gpt-oss-120b` when only `REQUESTY_API_KEY` is set; override with `INTEGRATION_LLM_MODEL`) for end-to-end validation. The stack uses pinned Paper 26.2 build 123. Run with `pytest tests/`.
 - **Mypy**: runs in CI on every push and PR (`mypy minecraft_ai_bridge/ --ignore-missing-imports`) and must pass.
 - **gRPC stubs are synchronous**: MCPQ generated stubs block; dispatched via `asyncio.to_thread`. Not ideal but works.
 - **RCON client is unmaintained**: Since the MCPQ migration, `rcon.py` isn't tested. Consider removing or marking deprecated.
@@ -140,7 +140,7 @@ Some LLMs (especially smaller/local ones) can't reliably output structured JSON 
 
 ### P0: None (Testing Complete)
 The 0.5.0 release completed the testing milestone:
-- **Unit tests** (800): MockMcpqClient covers all 36 actions, observer parsing, memory, goal fallback plans, config, inventory manager, chat commands, pathfinding, the runtime action gate, the safety supervisor, the event journal, webhook delivery, and the local authorization service
+- **Unit tests** (807): MockMcpqClient covers all 36 actions, observer parsing, memory, goal fallback plans, config, inventory manager, chat commands, pathfinding, the runtime action gate, the safety supervisor, the event journal, webhook delivery, and the local authorization service
 - **Integration tests** (12): Full think-act-observe loop with real MCPQ server + real LLM inference (OpenRouter `openai/gpt-oss-20b`). Covers teleport, exploration, disconnect handling, fallback decomposition, failure counting, memory recording, chat command stop, and inventory creation.
 - **Goal-verification assertions**: Integration tests verify agent behavior via:
   - `action_taken(orch, *names) → bool` — checks if the agent performed a specific action (parses `MemoryEntry.raw`)
@@ -214,7 +214,7 @@ The 0.5.0 release completed the testing milestone:
 | `docker-compose.yml` | Paper server + bridge services |
 | `docs/*.md` | Full documentation set |
 | `tests/conftest.py` | MockMcpqClient, MockLLMClient, test fixtures |
-| `tests/test_*.py` | Unit + integration tests (814 total: 800 unit + 14 integration) |
+| `tests/test_*.py` | Unit + integration tests (821 total: 807 unit + 14 integration) |
 | `AGENTS.md` | This file |
 
 ## Environment Info
@@ -255,11 +255,11 @@ Helpers in `tests/test_integration.py`:
 | `tests/test_observer.py` | 43 | NBT parsing, inventory parsing, observation formatting |
 | `tests/test_memory.py` | 25 | Short/long-term memory, dedup, persistence |
 | `tests/test_goal_manager.py` | 39 | Goal decomposition, fallback plans patterns |
-| `tests/test_chat_commands.py` | 27 | Chat command parsing and dispatch |
+| `tests/test_chat_commands.py` | 32 | Chat command parsing and dispatch |
 | `tests/test_prompts.py` | 17 | Prompt and state formatting |
 | `tests/test_inventory_manager.py` | 12 | Inventory manager slot tracking |
 | `tests/test_pathfinding.py` | 10 | A* pathfinding |
-| `tests/test_orchestrator.py` | 6 | Orchestrator loop and wiring |
+| `tests/test_orchestrator.py` | 8 | Orchestrator loop and wiring |
 | `tests/test_mc_api.py` | 3 | McpqClient disconnect lifecycle |
 | `tests/test_llm_client.py` | 2 | LLM provider factory wiring |
 | `tests/test_main.py` | 2 | CLI exit codes |

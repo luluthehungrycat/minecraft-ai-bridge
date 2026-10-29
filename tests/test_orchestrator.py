@@ -161,3 +161,24 @@ async def test_done_failure_does_not_schedule_retry(mock_mc, monkeypatch):
     await _run_steps(orch, 1)
 
     assert orch._retry_pending is False
+
+
+async def test_follow_mode_never_reads_an_unvalidated_target(mock_mc, monkeypatch):
+    orch, _ = _make_orchestrator(mock_mc, monkeypatch, [("wait", {})])
+    # Set directly, bypassing !follow's own validation.
+    orch._follow_target = "@e[type=player]"
+
+    await _run_steps(orch, 1)
+
+    assert orch._follow_target is None
+    assert not any("data get entity" in command for command in mock_mc.commands_ran)
+
+
+async def test_follow_mode_reads_a_valid_target(mock_mc, monkeypatch):
+    orch, _ = _make_orchestrator(mock_mc, monkeypatch, [("wait", {})])
+    orch._follow_target = "Player2"
+
+    await _run_steps(orch, 1)
+
+    assert orch._follow_target == "Player2"
+    assert "data get entity Player2 Pos" in mock_mc.commands_ran
