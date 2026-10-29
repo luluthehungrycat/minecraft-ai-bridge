@@ -11,8 +11,8 @@ not here. The adapter only decides which bearer token a call carries:
 - stdio: the single controller token configured for the server process
   (the harness that launches the process supplies it in the environment).
 
-The adapter does not run the safety supervisor or manage tasks; those are
-separate RFC-0001 slices.
+The adapter does not run the safety supervisor (``minecraft-ai-bridge-mcp``
+starts it beside the adapter) or manage tasks.
 """
 
 from __future__ import annotations
@@ -41,7 +41,8 @@ INSTRUCTIONS = (
     "a session; movement, block edits, items, and combat need world delegation granted "
     "by the server's operator. Poll minecraft_get_events for what happened to the bot "
     "(needs events:read) and acknowledge processed events with minecraft_ack_events; "
-    "unacknowledged events are returned again."
+    "unacknowledged events are returned again. The bot's safety reflexes can preempt "
+    "an action (reason_code SAFETY_PREEMPTED); retry it with a new request_id."
 )
 
 

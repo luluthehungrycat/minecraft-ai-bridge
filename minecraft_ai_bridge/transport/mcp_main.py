@@ -11,7 +11,9 @@ Usage::
 The Steve, MCPQ connection, and Authz database come from ``config.yaml``
 (``authz.steve_id``, ``mc_api.*``, ``authz.database_path``). The operator's
 world-admin token is read only from ``AUTHZ_WORLD_ADMIN_TOKEN``. The bot
-entity must already exist in the world; this server does not summon it.
+entity must already exist in the world; this server does not summon it. The
+bot's safety reflexes (attack, eat, heal) run for as long as the server does
+and preempt controller actions while they act.
 """
 
 from __future__ import annotations
@@ -156,6 +158,7 @@ def check_bind_address(host: str, *, allow_remote: bool) -> None:
 
 async def serve(args: argparse.Namespace, config: AppConfig) -> None:
     """Connect the runtime services and serve until the transport stops."""
+    from ..bridge.controller_safety import ControllerSafety
     from ..minecraft.mc_api import McpqClient
     from ..runtime import AuthzService, ControllerService, EventJournal, SqliteActionOutcomeStore
     from ..runtime.controller_service import ReachLimits
@@ -187,6 +190,7 @@ async def serve(args: argparse.Namespace, config: AppConfig) -> None:
         stack.callback(store.close)
         journal = EventJournal(args.event_journal or config.bridge.event_journal_path)
         stack.callback(journal.close)
+        safety_authority = object()
         controller = ControllerService(
             McpqWorldAdapter(mc),
             authz,
@@ -196,8 +200,14 @@ async def serve(args: argparse.Namespace, config: AppConfig) -> None:
             outcome_store=store,
             reach_limits=reach,
             event_journal=journal,
+            safety_authority=safety_authority,
         )
         stack.push_async_callback(controller.aclose)
+        safety = ControllerSafety(controller, safety_authority, event_sink=journal.append)
+        # Stops (and flushes its events) before the controller and journal
+        # close.
+        stack.push_async_callback(safety.aclose)
+        safety.start()
         # Over HTTP each request authenticates with its own header; the
         # process token is only for stdio.
         server = build_mcp_server(

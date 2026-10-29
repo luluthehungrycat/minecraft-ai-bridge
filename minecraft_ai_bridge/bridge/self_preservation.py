@@ -115,8 +115,8 @@ class SelfPreservationLayer:
     def __init__(
         self,
         mc: WorldAdapter,
-        goal_manager: GoalManager,
-        memory: AgentMemory,
+        goal_manager: GoalManager | None,
+        memory: AgentMemory | None,
         config: PreservationConfig | None = None,
         action_service: ActionService | None = None,
         safety_authority: object | None = None,
@@ -135,9 +135,16 @@ class SelfPreservationLayer:
         # the service.
         self._action_service = action_service
         self._safety_authority = safety_authority
+        # Without a goal manager (an external controller drives the bot),
+        # flee and find-food sub-goals are not injected; without memory,
+        # facts for the LLM are dropped. Reflexes still run.
         # Last seen health — used to detect sudden drops. None means
         # the first observation hasn't happened yet.
         self._previous_health: float | None = None
+
+    def _remember(self, fact: str) -> None:
+        if self._memory is not None:
+            self._memory.remember_fact(fact)
 
     async def _dispatch(
         self,
@@ -210,7 +217,7 @@ class SelfPreservationLayer:
 
         # Memory hint for the LLM context window.
         if world.health is not None and world.health < self._config.health_critical_threshold:
-            self._memory.remember_fact(f"Health critical: {world.health}/20 — find safety or heal")
+            self._remember(f"Health critical: {world.health}/20 — find safety or heal")
 
         # Track health for next-turn drop detection. We do this after
         # the reflex logic so the drop is measured against the previous
@@ -360,9 +367,7 @@ class SelfPreservationLayer:
             },
         )
         if attack.success:
-            self._memory.remember_fact(
-                f"Reflexive attack on {target} after health drop of {drop:.1f} HP"
-            )
+            self._remember(f"Reflexive attack on {target} after health drop of {drop:.1f} HP")
             logger.info("Reflex attack on %s (health dropped %.1f HP)", target, drop)
         return attack
 
@@ -401,7 +406,7 @@ class SelfPreservationLayer:
             # back to a fight so we at least do *something* hostile.
             return await self._attack_nearest(world, mobs, drop)
 
-        self._memory.remember_fact(
+        self._remember(
             f"Threat too high ({len(mobs)} hostiles, health "
             f"{world.health}/20) — injected URGENT flee-to-safety sub-goal"
         )
@@ -422,7 +427,7 @@ class SelfPreservationLayer:
         next turn — the original task is naturally suspended and
         resumes when this sub-goal completes (that's the regroup).
         """
-        root = self._goals._root
+        root = self._goals._root if self._goals is not None else None
         if root is None:
             return False
 
@@ -462,7 +467,7 @@ class SelfPreservationLayer:
         if world.hunger is None or world.hunger >= self._config.hunger_critical_threshold:
             return
 
-        root = self._goals._root
+        root = self._goals._root if self._goals is not None else None
         if root is None:
             return
 
@@ -478,9 +483,7 @@ class SelfPreservationLayer:
         )
         new_goal._parent_ref = root
         root.sub_goals.insert(0, new_goal)
-        self._memory.remember_fact(
-            f"Hunger critical: {world.hunger}/20 — injected find-food sub-goal"
-        )
+        self._remember(f"Hunger critical: {world.hunger}/20 — injected find-food sub-goal")
         logger.info("Injected URGENT find-food sub-goal (hunger=%d)", world.hunger)
 
     # ── Auto-consume ──────────────────────────────────────────────
@@ -519,7 +522,7 @@ class SelfPreservationLayer:
             {"food_item": item, "slot": slot},
         )
         if eat.success:
-            self._memory.remember_fact(f"Auto-consumed {item} (hunger was {world.hunger}/20)")
+            self._remember(f"Auto-consumed {item} (hunger was {world.hunger}/20)")
             logger.info("Auto-consumed %s (hunger was %d/20)", item, world.hunger)
         return eat
 
@@ -576,7 +579,7 @@ class SelfPreservationLayer:
             {"heal_item": item, "slot": slot},
         )
         if heal.success:
-            self._memory.remember_fact(f"Auto-healed with {item} (health was {world.health}/20)")
+            self._remember(f"Auto-healed with {item} (health was {world.health}/20)")
             logger.info("Auto-healed with %s (health was %.1f/20)", item, world.health)
         return heal
 
@@ -627,7 +630,7 @@ class SelfPreservationLayer:
 
         # Minecraft day cycle: 0 = dawn, ~6000 = noon, ~13000 = dusk, ~18000 = midnight
         if 13000 <= ticks < 24000:
-            self._memory.remember_fact(
+            self._remember(
                 f"It's night-time (in-game time {ticks}). "
                 "Night is dangerous — hostile mobs spawn in the dark. "
                 "Consider staying in shelter until dawn."
