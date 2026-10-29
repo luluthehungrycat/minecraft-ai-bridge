@@ -30,6 +30,12 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
 - `!follow` now rejects targets that are not plain Minecraft usernames (such as
   `@a` selectors) and replies with an error, and follow mode never runs its
   position read with an unvalidated target (#21).
+- `ControllerService` no longer keeps expired or fenced controller sessions
+  in memory indefinitely. Opening a session drops older-generation entries
+  (a late response for an already-fenced session never displaces a newer
+  one), expired leases are swept on each action request, and a session is
+  dropped once a rejected request or failed renewal is confirmed to be
+  caused by the session no longer being valid (#26).
 - `McpqClient.connect` now cleans up the MCPQ client created by each failed
   attempt instead of leaving it to garbage collection.
 - `McpqClient.disconnect` now shuts down the MCPQ client explicitly. It
