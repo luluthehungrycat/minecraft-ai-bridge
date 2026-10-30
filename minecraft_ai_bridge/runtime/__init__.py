@@ -96,6 +96,7 @@ __all__ = [
     "SessionStatus",
     "SafetySupervisor",
     "SteveIdentity",
+    "SqliteTaskStore",
     "Task",
     "TaskStatus",
     "WorldAdapter",
@@ -106,3 +107,5 @@ __all__ = [
     "WebhookService",
     "WebhookSubscription",
 ]
+
+from .tasks import SqliteTaskStore

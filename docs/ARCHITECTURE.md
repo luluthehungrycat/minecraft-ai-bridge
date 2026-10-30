@@ -377,15 +377,49 @@ reflex is acknowledged; multi-step movement stops between steps and reports
 find-food subgoals are unavailable; overwhelming threats fall back to attack.
 Shutdown stops polling and flushes safety events before closing the action
 outcome store or journal. This is in-process safety, not a backend watchdog.
-There is no task service yet.
+
+With a `task_store` (`SqliteTaskStore`, which also requires the durable
+outcome store and event journal), `create_task`/`get_task`/`pause_task`/
+`resume_task`/`cancel_task` run caller-supplied plans of up to 100 steps
+(64 KiB) in a service-owned worker, independent of the MCP request. Steps
+are limited to single-dispatch actions: chat, done, WAIT up to 30 seconds,
+the position/health/hunger/inventory/time/weather/player checks, and
+`teleport`/`move_to`/`break_block`/`place_block` with explicit finite
+coordinates. Each step runs through `submit_action`'s gate under the
+creating session (allowlist, delegation, reach limits, safety preemption),
+with a fresh request ID per attempt. One unfinished task per Steve; while
+its worker runs, other strategic actions are refused. Management calls need
+`steve:control`, the task's own credential, and a current session; `get_task`
+needs no session. Bearer tokens are never stored.
+
+The store checkpoints before and after every step (`next_step`,
+`active_step`, `revision` compare-and-set) and holds an OS file lock, so a
+second runtime on the same file fails closed. Pause and cancel are
+cooperative: they are latched immediately, refuse a queued step before it
+reaches the backend (also re-checked after the awaited reach read), interrupt
+WAIT, and otherwise take effect when the running step finishes; completed
+effects are not undone. A safety intervention between or during steps pauses
+the task (`SAFETY_PREEMPTED`). A failed step fails the task; a refused one
+pauses it with the refusal's reason. On restart, unfinished tasks become
+`paused`: `RESTARTED` when no step was in flight, which can be resumed under
+a new session of the same credential, or `OUTCOME_UNKNOWN` when a step may
+have reached the backend, which can never be resumed (reconcile, cancel, and
+create a new plan). Lifecycle events (`task.created`, `task.started`,
+`task.progress`, `task.interrupted`, `task.completed`, `task.failed`,
+`task.cancelled`, ...) are written to an outbox in the same transaction as
+each checkpoint and published to the journal with deterministic event IDs,
+carrying only status, step index, revision, and reason code. Completion means
+every step reported success, not that the caller's goal holds in the world.
 
 ### MCP transport (Phase B slice)
 
 `minecraft_ai_bridge.transport.mcp_server.build_mcp_server` exposes one
-`ControllerService` to MCP clients through eight tools:
+`ControllerService` to MCP clients through thirteen tools:
 `minecraft_get_capabilities`, `minecraft_get_state`, `minecraft_open_session`,
 `minecraft_renew_session`, `minecraft_close_session`,
-`minecraft_submit_action`, `minecraft_get_events`, and `minecraft_ack_events`. Each tool makes exactly one `ControllerService`
+`minecraft_submit_action`, `minecraft_get_events`, `minecraft_ack_events`,
+`minecraft_create_task`, `minecraft_get_task`, `minecraft_pause_task`,
+`minecraft_resume_task`, and `minecraft_cancel_task`. Each tool makes exactly one `ControllerService`
 call, so authentication, session fencing, delegation scopes, the exposed-action
 allowlist, parameter validation, and idempotency are enforced there and nowhere
 else. The adapter only decides which bearer token a call carries:
