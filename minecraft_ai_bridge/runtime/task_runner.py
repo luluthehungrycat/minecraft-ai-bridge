@@ -323,9 +323,13 @@ class TaskRunner:
                     await dispatch
 
     async def close(self) -> None:
-        self._stopping = True
-        if self._worker is not None:
-            await asyncio.shield(self._worker)
+        # Taking the admission lock waits for an in-progress create or resume,
+        # whose worker is then joined; later admissions see _stopping.
+        async with self._lock:
+            self._stopping = True
+            worker = self._worker
+        if worker is not None:
+            await asyncio.shield(worker)
         self._stop.set()
         if self._pump is not None:
             await asyncio.shield(self._pump)

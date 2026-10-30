@@ -343,3 +343,82 @@ async def test_task_lifecycle_events_reach_the_journal(runtime, setup, tmp_path)
             await asyncio.sleep(0.05)
     assert types[0] == "task.created"
     assert "task.progress" in types
+
+
+def test_a_full_outbox_refuses_new_tasks_but_never_blocks_recovery(tmp_path):
+    path = tmp_path / "tasks.sqlite3"
+    store = SqliteTaskStore(path)
+    task = store.create("AIBot", "cred", "full", "test", [TaskStep(action="wait", params={})])
+    task = store.update(task, "task.started", status=TaskStatus.RUNNING)
+    with store._db:
+        store._db.executemany(
+            "INSERT INTO task_events VALUES (?, ?)",
+            ((f"filler-{i}", "{}") for i in range(100_000)),
+        )
+    store.close()
+
+    store = SqliteTaskStore(path)
+    try:
+        assert store.get(task.task_id).status is TaskStatus.PAUSED
+        with pytest.raises(ValueError, match="outbox is at capacity"):
+            store.create("Other", "cred", "next", "test", [TaskStep(action="wait", params={})])
+    finally:
+        store.close()
+
+
+def test_a_cancel_requested_before_a_restart_stays_cancelled(tmp_path):
+    path = tmp_path / "tasks.sqlite3"
+    store = SqliteTaskStore(path)
+    task = store.create("AIBot", "cred", "c", "test", [TaskStep(action="wait", params={})])
+    task = store.update(
+        task, "task.operation_requested", status=TaskStatus.RUNNING, requested_operation="cancel"
+    )
+    store.close()
+
+    store = SqliteTaskStore(path)
+    try:
+        recovered = store.get(task.task_id)
+        assert recovered.status is TaskStatus.CANCELLED
+        assert recovered.reason_code is None
+    finally:
+        store.close()
+
+
+async def test_close_waits_for_an_admission_in_progress(runtime, setup, monkeypatch):
+    import threading
+
+    session = await runtime.open_session(setup.controller)
+    store = runtime._tasks.store
+    committed = threading.Event()
+    resume = threading.Event()
+    create = store.create
+
+    def slow_create(*args, **kwargs):
+        task = create(*args, **kwargs)
+        committed.set()
+        assert resume.wait(10)
+        return task
+
+    monkeypatch.setattr(store, "create", slow_create)
+    creating = asyncio.create_task(
+        runtime.create_task(
+            setup.controller,
+            session.session_id,
+            session.generation,
+            "late",
+            "test",
+            [{"action": "wait", "params": {"seconds": 30}}],
+        )
+    )
+    assert await asyncio.to_thread(committed.wait, 5)
+    closing = asyncio.create_task(runtime.stop_tasks())
+    await asyncio.sleep(0.05)
+    assert not closing.done()  # waits for the admission, not just the old worker
+    resume.set()
+    task = await creating
+    async with asyncio.timeout(5):
+        await closing
+    assert runtime._tasks._worker is not None and runtime._tasks._worker.done()
+    stopped = await runtime.get_task(setup.controller, task.task_id)
+    assert stopped.status is TaskStatus.PAUSED
+    assert stopped.reason_code == "SHUTDOWN"

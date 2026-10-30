@@ -55,13 +55,26 @@ class SqliteTaskStore:
                 records = self._db.execute("SELECT record FROM tasks").fetchall()
                 for (raw,) in records:
                     task = Task.model_validate_json(raw)
-                    if task.status in {TaskStatus.PENDING, TaskStatus.RUNNING}:
+                    if task.status not in {TaskStatus.PENDING, TaskStatus.RUNNING}:
+                        continue
+                    unknown = "OUTCOME_UNKNOWN" if task.active_step else None
+                    if task.requested_operation == "cancel":
+                        # The caller already asked to cancel; never make it
+                        # resumable again.
+                        self.update(
+                            task,
+                            "task.cancelled",
+                            status=TaskStatus.CANCELLED,
+                            requested_operation=None,
+                            reason_code=unknown,
+                        )
+                    else:
                         self.update(
                             task,
                             "task.interrupted",
                             status=TaskStatus.PAUSED,
                             requested_operation=None,
-                            reason_code="OUTCOME_UNKNOWN" if task.active_step else "RESTARTED",
+                            reason_code=unknown or "RESTARTED",
                         )
         except BaseException:
             if hasattr(self, "_db"):
@@ -106,6 +119,11 @@ class SqliteTaskStore:
                 return Task.model_validate_json(existing[1])
             if self._db.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] >= 10000:
                 raise ValueError("task database is at capacity")
+            # Only admission is limited by the outbox: checkpoints and
+            # restart recovery of admitted tasks must always be recordable,
+            # and each admitted plan adds a bounded number of events.
+            if self._db.execute("SELECT COUNT(*) FROM task_events").fetchone()[0] >= 100000:
+                raise ValueError("task event outbox is at capacity; is the event journal failing?")
             for (raw,) in self._db.execute(
                 "SELECT record FROM tasks WHERE steve_id=?", (steve_id,)
             ):
@@ -158,8 +176,6 @@ class SqliteTaskStore:
             return updated
 
     def _event(self, task: Task, event_type: str) -> None:
-        if self._db.execute("SELECT COUNT(*) FROM task_events").fetchone()[0] >= 100000:
-            raise ValueError("task event outbox is at capacity")
         event = Event(
             event_id=f"{task.task_id}-{task.revision}",
             type=event_type,

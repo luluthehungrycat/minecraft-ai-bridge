@@ -404,7 +404,10 @@ pauses it with the refusal's reason. On restart, unfinished tasks become
 `paused`: `RESTARTED` when no step was in flight, which can be resumed under
 a new session of the same credential, or `OUTCOME_UNKNOWN` when a step may
 have reached the backend, which can never be resumed (reconcile, cancel, and
-create a new plan). Lifecycle events (`task.created`, `task.started`,
+create a new plan). A cancel requested before the restart becomes
+`cancelled`. Shutdown waits for an in-progress create or resume before
+joining the worker. A full event outbox (100,000 unpublished events) refuses
+new tasks but never blocks checkpoints or restart recovery. Lifecycle events (`task.created`, `task.started`,
 `task.progress`, `task.interrupted`, `task.completed`, `task.failed`,
 `task.cancelled`, ...) are written to an outbox in the same transaction as
 each checkpoint and published to the journal with deterministic event IDs,
@@ -450,7 +453,8 @@ MCP tool errors (`unauthorized: ...`, `invalid request: ...`); controller-level
 rejections are returned as `rejected` results with their `reason_code`.
 
 Limitations: the bot entity must already exist (the server does not summon
-it); safety cannot undo already-dispatched backend work, and there is no task API.
+it); safety cannot undo already-dispatched backend work; tasks run only bounded
+single-dispatch steps.
 
 ### Durable event journal (Phase C slice)
 
