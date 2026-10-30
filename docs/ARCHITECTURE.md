@@ -472,9 +472,10 @@ consumer is marked expired and polling/acknowledgment fails until
 `reset_consumer()` resumes at the oldest retained event. Reset can skip expired
 history and is an explicit recovery choice. There is no authentication/ACL
 layer in the journal itself; `ControllerService` adds per-credential polling
-for one Steve's events (and the MCP tools over it). There is no SSE delivery
-or task lifecycle service. Producers are the built-in `SafetySupervisor` and
-`ControllerService` (`controller.changed`). For the supervisor: each ordinary
+for one Steve's events (and the MCP tools over it). There is no SSE delivery.
+Producers are the built-in `SafetySupervisor`, `ControllerService`
+(`controller.changed`), and the task runner, which publishes `task.*` events
+from its durable outbox. For the supervisor: each ordinary
 `safety.intervened` event contains the action name and success flag, using HIGH
 for successful interventions and CRITICAL for failed or denied interventions.
 Writes run off the event loop and are drained during orderly shutdown. Other

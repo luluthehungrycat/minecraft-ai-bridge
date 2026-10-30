@@ -422,3 +422,19 @@ async def test_close_waits_for_an_admission_in_progress(runtime, setup, monkeypa
     stopped = await runtime.get_task(setup.controller, task.task_id)
     assert stopped.status is TaskStatus.PAUSED
     assert stopped.reason_code == "SHUTDOWN"
+
+
+async def test_a_returned_task_is_detached_from_the_running_plan(runtime, setup):
+    session = await runtime.open_session(setup.controller)
+    task = await runtime.create_task(
+        setup.controller,
+        session.session_id,
+        session.generation,
+        "detached",
+        "test",
+        [{"action": "chat", "params": {"message": "kept"}}],
+    )
+    task.steps.clear()
+    done = await finished(runtime, setup.controller, task.task_id, TaskStatus.SUCCEEDED)
+    assert done.next_step == 1
+    assert setup.world.chat_messages_sent == ["kept"]

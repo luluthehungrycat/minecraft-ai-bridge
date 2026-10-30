@@ -110,7 +110,8 @@ class TaskRunner:
             if task.status is TaskStatus.PENDING:
                 self._launch(task, session)
         self.start()
-        return task
+        # Detached: the worker keeps its own copy of the plan.
+        return task.model_copy(deep=True)
 
     async def manage(
         self, token: str, session_id: str, generation: int, task_id: str, operation: str
@@ -161,7 +162,8 @@ class TaskRunner:
                         requested_operation=None,
                     )
         self.start()
-        return task
+        # Detached: the worker keeps its own copy of the plan.
+        return task.model_copy(deep=True)
 
     def _launch(self, task: Task, session: ControllerSession) -> None:
         if self._worker is not None and not self._worker.done():
