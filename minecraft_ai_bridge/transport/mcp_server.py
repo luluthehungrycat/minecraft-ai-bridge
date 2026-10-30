@@ -12,7 +12,7 @@ not here. The adapter only decides which bearer token a call carries:
   (the harness that launches the process supplies it in the environment).
 
 The adapter does not run the safety supervisor (``minecraft-ai-bridge-mcp``
-starts it beside the adapter) or manage tasks.
+starts it beside the adapter). Durable task state belongs to the controller runtime.
 """
 
 from __future__ import annotations
@@ -42,7 +42,11 @@ INSTRUCTIONS = (
     "by the server's operator. Poll minecraft_get_events for what happened to the bot "
     "(needs events:read) and acknowledge processed events with minecraft_ack_events; "
     "unacknowledged events are returned again. The bot's safety reflexes can preempt "
-    "an action (reason_code SAFETY_PREEMPTED); retry it with a new request_id."
+    "an action (reason_code SAFETY_PREEMPTED); inspect state before retrying it with a "
+    "new request_id. "
+    "For bounded action plans use minecraft_create_task, then get/pause/resume/cancel_task. "
+    "Tasks pause on safety or restart; OUTCOME_UNKNOWN requires external reconciliation, "
+    "cancelling the old task, and a new plan. Completion means all supplied steps succeeded."
 )
 
 
@@ -191,6 +195,66 @@ def build_mcp_server(controller: ControllerService, *, stdio_token: str | None =
         except (PermissionError, ValueError, EventCursorExpiredError) as exc:
             raise _refusal(exc) from None
         return {"status": "acknowledged", "cursor": cursor}
+
+    @server.tool(name="minecraft_create_task")
+    async def create_task(
+        session_id: str,
+        generation: int,
+        request_id: str,
+        title: str,
+        steps: list[dict[str, Any]],
+        ctx: Context,
+    ) -> dict[str, Any]:
+        """Run a durable bounded sequential plan independently of this connection."""
+        try:
+            task = await controller.create_task(
+                token_for(ctx), session_id, generation, request_id, title, steps
+            )
+        except (PermissionError, ValueError) as exc:
+            raise _refusal(exc) from None
+        return task.model_dump(mode="json")
+
+    @server.tool(name="minecraft_get_task")
+    async def get_task(task_id: str, ctx: Context) -> dict[str, Any]:
+        """Read your task's durable state, progress and interruption reason."""
+        try:
+            task = await controller.get_task(token_for(ctx), task_id)
+        except (PermissionError, ValueError) as exc:
+            raise _refusal(exc) from None
+        return task.model_dump(mode="json")
+
+    @server.tool(name="minecraft_pause_task")
+    async def pause_task(
+        session_id: str, generation: int, task_id: str, ctx: Context
+    ) -> dict[str, Any]:
+        """Request pause; an active action finishes before the task becomes paused."""
+        try:
+            task = await controller.pause_task(token_for(ctx), session_id, generation, task_id)
+        except (PermissionError, ValueError) as exc:
+            raise _refusal(exc) from None
+        return task.model_dump(mode="json")
+
+    @server.tool(name="minecraft_resume_task")
+    async def resume_task(
+        session_id: str, generation: int, task_id: str, ctx: Context
+    ) -> dict[str, Any]:
+        """Resume known-safe remaining steps under your current controller session."""
+        try:
+            task = await controller.resume_task(token_for(ctx), session_id, generation, task_id)
+        except (PermissionError, ValueError) as exc:
+            raise _refusal(exc) from None
+        return task.model_dump(mode="json")
+
+    @server.tool(name="minecraft_cancel_task")
+    async def cancel_task(
+        session_id: str, generation: int, task_id: str, ctx: Context
+    ) -> dict[str, Any]:
+        """Request cancellation; completed world effects are not undone."""
+        try:
+            task = await controller.cancel_task(token_for(ctx), session_id, generation, task_id)
+        except (PermissionError, ValueError) as exc:
+            raise _refusal(exc) from None
+        return task.model_dump(mode="json")
 
     return server
 

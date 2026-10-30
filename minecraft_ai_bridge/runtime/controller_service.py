@@ -23,7 +23,10 @@ events repeat until acknowledged), and opening or releasing a session records
 a ``controller.changed`` event. Only events attributed to this Steve are
 delivered; unattributed events and other Steves' events are skipped.
 
-This is not a transport or task service. It does not run the safety
+With a ``task_store``, ``create_task`` and friends run bounded step plans
+through the same gate in a ``TaskRunner`` worker (see ``task_runner.py``).
+
+This is not a transport. It does not run the safety
 supervisor itself; ``bridge.controller_safety.ControllerSafety`` does, sharing
 this service's ActionService.
 """
@@ -39,7 +42,7 @@ from collections.abc import Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4, uuid5
 
 from pydantic import ValidationError
@@ -67,6 +70,7 @@ from .contracts import (
     Event,
     EventSeverity,
     SessionStatus,
+    Task,
 )
 from .event_journal import (
     MAX_EVENTS_PER_FETCH,
@@ -75,6 +79,10 @@ from .event_journal import (
     EventJournalError,
     EventRecord,
 )
+from .tasks import SqliteTaskStore
+
+if TYPE_CHECKING:
+    from .task_runner import TaskRunner
 
 logger = logging.getLogger(__name__)
 
@@ -190,6 +198,7 @@ class ControllerService:
         outcome_store: SqliteActionOutcomeStore | None = None,
         reach_limits: ReachLimits | None = None,
         event_journal: EventJournal | None = None,
+        task_store: SqliteTaskStore | None = None,
     ) -> None:
         if session_lease_seconds <= 0:
             raise ValueError("controller session lease must be positive")
@@ -220,9 +229,26 @@ class ControllerService:
             dispatch_guard=self._reach_guard,
         )
         self._observer = Observer(world)
+        from .task_runner import TaskRunner
+
+        if task_store is not None and (outcome_store is None or event_journal is None):
+            raise ValueError("executable tasks require durable outcomes and an event journal")
+        self._tasks = TaskRunner(self, task_store) if task_store is not None else None
+
+    def start_tasks(self) -> None:
+        """Start durable event publication after safety is running."""
+        if self._tasks is not None:
+            self._tasks.start()
+
+    async def stop_tasks(self) -> None:
+        """Stop task admission and workers before safety/runtime shutdown."""
+        if self._tasks is not None:
+            await self._tasks.close()
 
     async def aclose(self) -> None:
         """Wait for pending durable outcome writes; call before shutdown."""
+        if self._tasks is not None:
+            await self._tasks.close()
         await self._action_service.flush()
 
     @property
@@ -365,14 +391,18 @@ class ControllerService:
         a ``reason_code``.
         """
         credential = await asyncio.to_thread(self._authz.authenticate, token)
+        return await self._submit_authenticated(credential.credential_id, request)
+
+    async def _submit_authenticated(
+        self, credential_id: str, request: ActionRequestSchema
+    ) -> ActionResultSchema:
+        """Internal task entry: caller identity comes from a trusted Authz session."""
         request = self._revalidate(request)
         session = self._sessions.get(request.controller_session_id)
         self._drop_expired()
-        rejection = self._envelope_rejection(credential.credential_id, request, session)
+        rejection = self._envelope_rejection(credential_id, request, session)
         if rejection is not None:
-            return self._result(
-                credential.credential_id, request, ActionStatus.REJECTED, *rejection
-            )
+            return self._result(credential_id, request, ActionStatus.REJECTED, *rejection)
         assert session is not None
 
         correlation_id = str(uuid4())
@@ -409,7 +439,39 @@ class ControllerService:
             }.get(status)
             if reason_code == "POLICY_REJECTED":
                 await self._forget_if_invalid(session)
-        return self._result(credential.credential_id, request, status, reason_code, result.message)
+        return self._result(credential_id, request, status, reason_code, result.message)
+
+    # ── Tasks ────────────────────────────────────────────────────────
+
+    def _task_runner(self) -> TaskRunner:
+        if self._tasks is None:
+            raise ValueError("this service does not support tasks")
+        return self._tasks
+
+    async def create_task(
+        self,
+        token: str,
+        session_id: str,
+        generation: int,
+        request_id: str,
+        title: str,
+        steps: list[dict[str, Any]],
+    ) -> Task:
+        return await self._task_runner().create(
+            token, session_id, generation, request_id, title, steps
+        )
+
+    async def get_task(self, token: str, task_id: str) -> Task:
+        return await self._task_runner().get(token, task_id)
+
+    async def pause_task(self, token: str, session_id: str, generation: int, task_id: str) -> Task:
+        return await self._task_runner().manage(token, session_id, generation, task_id, "pause")
+
+    async def resume_task(self, token: str, session_id: str, generation: int, task_id: str) -> Task:
+        return await self._task_runner().manage(token, session_id, generation, task_id, "resume")
+
+    async def cancel_task(self, token: str, session_id: str, generation: int, task_id: str) -> Task:
+        return await self._task_runner().manage(token, session_id, generation, task_id, "cancel")
 
     # ── Helpers ──────────────────────────────────────────────────────
 
@@ -423,7 +485,12 @@ class ControllerService:
         so the requesting session is still the one bound in ``_current``. A
         storage error still fails closed through ActionService.
         """
-        return await asyncio.to_thread(self._authz_policy, request)
+        decision = await asyncio.to_thread(self._authz_policy, request)
+        if decision.allowed and self._tasks is not None:
+            refusal = self._tasks.guard(request)
+            if refusal is not None:
+                return refusal
+        return decision
 
     async def _reach_guard(self, request: ActionRequest) -> GuardRefusal | None:
         """ActionService dispatch guard: refuse targets out of reach.
@@ -440,7 +507,13 @@ class ControllerService:
             # Fail closed: handlers coerce some values this parser rejects
             # (e.g. int(True)), so an unparsed target must never pass.
             return GuardRefusal("INVALID_TARGET", f"target coordinates are not valid: {exc}")
-        return None if message is None else GuardRefusal("OUT_OF_REACH", message)
+        if message is not None:
+            return GuardRefusal("OUT_OF_REACH", message)
+        # Revalidate after the awaited reach read, adjacent to backend dispatch.
+        decision = await self._policy(request)
+        if not decision.allowed:
+            return GuardRefusal("AUTHORITY_OR_TASK_CHANGED", decision.reason)
+        return None
 
     async def _reach_violation(self, action: ActionType, params: Mapping[str, Any]) -> str | None:
         """Return why a targeted action is out of reach, or None if it is in reach.

@@ -152,6 +152,7 @@ minecraft-ai-bridge-mcp --transport http --port 8765
 | `--allowed-origin` | loopback origins | Browser Origin to accept (repeatable). For remote binds, omit it unless a browser client needs it |
 | `--outcome-store` | `data/action-outcomes.sqlite3` | Durable request-ID outcomes |
 | `--event-journal` | `bridge.event_journal_path` | SQLite event journal polled by `minecraft_get_events` |
+| `--task-store` | `data/tasks.sqlite3` | Durable task plans and checkpoints; one server process per file |
 | `--max-edit-distance` | `6` | Farthest `break_block`/`place_block` target (with coordinates) from the bot |
 | `--max-move-distance` | `32` | Farthest `teleport`/`move_to`/`walk_to` destination from the bot (`walk_to` is also capped at its 50-block walking range); must be finite |
 | `--session-lease-seconds` | `300` | Controller session lease |
@@ -182,6 +183,21 @@ no controller session. `safety.intervened` events carry this Steve's ID.
 state and use a new request ID to try again. `SAFETY_INTERRUPTED` means a
 multi-step action stopped after partial progress; inspect state before
 planning the next action. Reflexes stop when the server exits.
+
+Tasks run a plan of up to 100 steps without holding the MCP request open:
+`minecraft_create_task` (`session_id`, `generation`, `request_id`, `title`,
+`steps` as `[{"action": ..., "params": {...}}]`), then `minecraft_get_task`
+(`task_id`) to follow `status`, `next_step`, and `reason_code`. Steps may be
+`chat`, `done`, `wait` (up to 30 seconds), the `check_*`/`list_players`
+observations, or `teleport`/`move_to`/`break_block`/`place_block` with explicit
+`x`, `y`, `z`; each step passes the same checks as `minecraft_submit_action`.
+`minecraft_pause_task`, `minecraft_resume_task`, and `minecraft_cancel_task`
+take the session and `task_id`; a running step finishes first, and cancelling
+does not undo completed steps. While a task runs, other actions are refused.
+Tasks pause on a safety intervention or a server restart; resume them with a
+current session. A task paused with `OUTCOME_UNKNOWN` cannot resume: check the
+world, cancel it, and create a new plan. Task progress is also published as
+`task.*` events.
 
 Example stdio client configuration:
 

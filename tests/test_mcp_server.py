@@ -35,6 +35,11 @@ TOOLS = {
     "minecraft_submit_action",
     "minecraft_get_events",
     "minecraft_ack_events",
+    "minecraft_create_task",
+    "minecraft_get_task",
+    "minecraft_pause_task",
+    "minecraft_resume_task",
+    "minecraft_cancel_task",
 }
 BASE_URL = "http://127.0.0.1:8765"
 
@@ -426,6 +431,14 @@ def _install_fakes(monkeypatch, stage: _Stage) -> None:
         def close(self):
             stage.events.append("journal.close")
 
+    class FakeTasks:
+        def __init__(self, _path):
+            stage.check("tasks")
+            stage.events.append("tasks.open")
+
+        def close(self):
+            stage.events.append("tasks.close")
+
     class FakeSafety:
         def __init__(self, *_args, **_kwargs):
             stage.check("safety")
@@ -438,6 +451,14 @@ def _install_fakes(monkeypatch, stage: _Stage) -> None:
             stage.events.append("safety.close")
 
     class FakeController:
+        def start_tasks(self):
+            # stop_tasks is registered before the start, so it always runs.
+            stage.events.append("workers.open")
+            stage.check("workers")
+
+        async def stop_tasks(self):
+            stage.events.append("workers.close")
+
         def __init__(self, *_args, **_kwargs):
             stage.check("controller")
             stage.events.append("controller.open")
@@ -459,6 +480,7 @@ def _install_fakes(monkeypatch, stage: _Stage) -> None:
     monkeypatch.setattr(runtime, "AuthzService", FakeAuthz)
     monkeypatch.setattr(runtime, "SqliteActionOutcomeStore", FakeStore)
     monkeypatch.setattr(runtime, "EventJournal", FakeJournal)
+    monkeypatch.setattr(runtime, "SqliteTaskStore", FakeTasks)
     monkeypatch.setattr(controller_safety, "ControllerSafety", FakeSafety)
     monkeypatch.setattr(runtime, "ControllerService", FakeController)
     monkeypatch.setattr(mcp_server, "build_mcp_server", fake_build)
@@ -469,8 +491,10 @@ OPENED = [
     "authz.open",
     "store.open",
     "journal.open",
+    "tasks.open",
     "controller.open",
     "safety.open",
+    "workers.open",
 ]
 
 
@@ -481,12 +505,14 @@ OPENED = [
         ("authz", 1),
         ("store", 2),
         ("journal", 3),
-        ("controller", 4),
-        ("safety", 5),
-        ("build", 6),
-        ("run", 6),
-        ("controller.aclose", 6),
-        (None, 6),
+        ("tasks", 4),
+        ("controller", 5),
+        ("safety", 6),
+        ("workers", 8),
+        ("build", 8),
+        ("run", 8),
+        ("controller.aclose", 8),
+        (None, 8),
     ],
 )
 async def test_serve_closes_everything_it_opened(monkeypatch, tmp_path, fail_at, opened):
@@ -617,3 +643,66 @@ async def test_events_need_the_events_read_scope_through_mcp(env):
     async with Client(build_mcp_server(env.service(), stdio_token=env.controller)) as client:
         no_journal = await client.call_tool("minecraft_get_events", {})
     assert "does not record events" in _error_text(no_journal)
+
+
+# ── Tasks ────────────────────────────────────────────────────────────
+
+
+async def test_tasks_run_through_mcp(env, tmp_path):
+    import asyncio
+
+    from minecraft_ai_bridge.runtime import EventJournal, SqliteActionOutcomeStore, SqliteTaskStore
+
+    journal = EventJournal(tmp_path / "events.sqlite3")
+    outcomes = SqliteActionOutcomeStore(tmp_path / "outcomes.sqlite3")
+    tasks = SqliteTaskStore(tmp_path / "tasks.sqlite3")
+    controller = ControllerService(
+        McpqWorldAdapter(env.world),
+        env.auth,
+        "AIBot",
+        event_journal=journal,
+        outcome_store=outcomes,
+        task_store=tasks,
+    )
+    try:
+        async with Client(build_mcp_server(controller, stdio_token=env.controller)) as client:
+            session = await _open(client)
+            created = await client.call_tool(
+                "minecraft_create_task",
+                {
+                    "session_id": session["session_id"],
+                    "generation": session["generation"],
+                    "request_id": "plan-1",
+                    "title": "greet",
+                    "steps": [{"action": "chat", "params": {"message": "from a task"}}],
+                },
+            )
+            assert not created.is_error, created.content
+            task_id = created.structured_content["task_id"]
+            async with asyncio.timeout(3):
+                while True:
+                    task = (
+                        await client.call_tool("minecraft_get_task", {"task_id": task_id})
+                    ).structured_content
+                    if task["status"] == "succeeded":
+                        break
+                    await asyncio.sleep(0.02)
+            refused = await client.call_tool(
+                "minecraft_create_task",
+                {
+                    "session_id": session["session_id"],
+                    "generation": session["generation"],
+                    "request_id": "plan-2",
+                    "title": "craft",
+                    "steps": [{"action": "craft_item", "params": {}}],
+                },
+            )
+    finally:
+        await controller.aclose()
+        tasks.close()
+        outcomes.close()
+        journal.close()
+
+    assert env.world.chat_messages_sent == ["from a task"]
+    assert task["next_step"] == 1
+    assert "not supported in bounded tasks" in _error_text(refused)

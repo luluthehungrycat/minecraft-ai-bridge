@@ -2,9 +2,9 @@
 
 Contracts defines the RFC-0001 Phase A Pydantic schemas. This package also
 provides the action gate, local SQLite authorization and controller fencing,
-durable event journal, local webhook sender, and a transport-independent
-controller API. There is no transport/MCP wiring, task persistence, or
-backend watchdog safety yet.
+durable event journal, local webhook sender, a transport-independent
+controller API, and durable controller tasks. Transports live in
+``minecraft_ai_bridge.transport``. There is no backend watchdog safety yet.
 """
 
 from .action_outcomes import SqliteActionOutcomeStore, StoredActionOutcome
@@ -96,6 +96,7 @@ __all__ = [
     "SessionStatus",
     "SafetySupervisor",
     "SteveIdentity",
+    "SqliteTaskStore",
     "Task",
     "TaskStatus",
     "WorldAdapter",
@@ -106,3 +107,5 @@ __all__ = [
     "WebhookService",
     "WebhookSubscription",
 ]
+
+from .tasks import SqliteTaskStore

@@ -33,6 +33,7 @@ from pydantic import (
     ConfigDict,
     Field,
     StringConstraints,
+    model_validator,
 )
 
 from ..minecraft.actions import ActionType
@@ -334,12 +335,63 @@ class ActionResultSchema(ContractModel):
     completed_at: AwareDatetime | None = None
 
 
-class Task(ContractModel):
-    """Durable task record shape (RFC-0001 section 9).
+class TaskStep(ContractModel):
+    """A bounded, single-dispatch action in an external controller's plan."""
 
-    Schema only: no task service, persistence, or state machine exists in
-    this slice. Goal trees/steps, checkpoints, spatial reservations, and
-    the event cursor are omitted until later phases define them.
+    action: ActionType
+    params: JsonPayload = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def bounded_action(self) -> TaskStep:
+        allowed = {
+            ActionType.CHAT,
+            ActionType.WAIT,
+            ActionType.DONE,
+            ActionType.CHECK_POSITION,
+            ActionType.CHECK_HEALTH,
+            ActionType.CHECK_HUNGER,
+            ActionType.CHECK_INVENTORY,
+            ActionType.CHECK_TIME,
+            ActionType.CHECK_WEATHER,
+            ActionType.LIST_PLAYERS,
+            ActionType.TELEPORT,
+            ActionType.MOVE_TO,
+            ActionType.BREAK_BLOCK,
+            ActionType.PLACE_BLOCK,
+        }
+        if self.action not in allowed:
+            raise ValueError("action is not supported in bounded tasks")
+        if self.action is ActionType.WAIT:
+            seconds = self.params.get("seconds", 2.0)
+            if (
+                isinstance(seconds, bool)
+                or not isinstance(seconds, (int, float))
+                or not isfinite(seconds)
+                or not 0 <= seconds <= 30
+            ):
+                raise ValueError("task WAIT seconds must be finite and between 0 and 30")
+        if self.action in {
+            ActionType.TELEPORT,
+            ActionType.MOVE_TO,
+            ActionType.BREAK_BLOCK,
+            ActionType.PLACE_BLOCK,
+        }:
+            for axis in ("x", "y", "z"):
+                value = self.params.get(axis)
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not isfinite(value)
+                ):
+                    raise ValueError("task targets require explicit finite numeric coordinates")
+        return self
+
+
+class Task(ContractModel):
+    """Durable sequential action plan and conservative execution checkpoint.
+
+    An active step without a completed checkpoint has an unknown outcome
+    after restart and cannot be resumed automatically or explicitly.
     """
 
     task_id: EntityId
@@ -349,6 +401,12 @@ class Task(ContractModel):
     owner_controller_id: EntityId | None = None
     created_at: AwareDatetime = Field(default_factory=_utcnow)
     updated_at: AwareDatetime = Field(default_factory=_utcnow)
+    steps: list[TaskStep] = Field(default_factory=list, max_length=100)
+    next_step: int = Field(default=0, ge=0)
+    active_step: bool = False
+    revision: int = Field(default=0, ge=0)
+    requested_operation: str | None = None
+    reason_code: str | None = None
 
 
 class Event(ContractModel):

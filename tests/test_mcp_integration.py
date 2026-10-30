@@ -83,6 +83,8 @@ async def stack(tmp_path):
         str(tmp_path / "outcomes.sqlite3"),
         "--event-journal",
         str(tmp_path / "events.sqlite3"),
+        "--task-store",
+        str(tmp_path / "tasks.sqlite3"),
     ]
     return {"env": env, "args": args, "token": controller}
 
@@ -124,15 +126,50 @@ async def _exercise(client: Client) -> None:
     assert far["reason_code"] == "OUT_OF_REACH", far
     assert internal["reason_code"] == "ACTION_NOT_EXPOSED"
 
+    created = await client.call_tool(
+        "minecraft_create_task",
+        {
+            "session_id": session["session_id"],
+            "generation": session["generation"],
+            "request_id": "task-1",
+            "title": "live task",
+            "steps": [
+                {"action": "check_position", "params": {}},
+                {"action": "chat", "params": {"message": "minecraft-ai-bridge task step"}},
+            ],
+        },
+    )
+    assert not created.is_error, created.content
+    task_id = created.structured_content["task_id"]
+    async with asyncio.timeout(30):
+        while True:
+            task = await client.call_tool("minecraft_get_task", {"task_id": task_id})
+            assert not task.is_error, task.content
+            if task.structured_content["status"] in {"succeeded", "failed", "paused"}:
+                break
+            await asyncio.sleep(0.2)
+    assert task.structured_content["status"] == "succeeded", task.structured_content
+
     closed = await client.call_tool(
         "minecraft_close_session", {"session_id": session["session_id"]}
     )
     assert not closed.is_error
 
-    polled = await client.call_tool("minecraft_get_events", {})
-    assert not polled.is_error, polled.content
-    events = polled.structured_content["events"]
-    changes = [record["event"]["payload"]["change"] for record in events]
+    # Task events are published from a durable outbox a moment after the
+    # task finishes.
+    async with asyncio.timeout(10):
+        while True:
+            polled = await client.call_tool("minecraft_get_events", {})
+            assert not polled.is_error, polled.content
+            events = polled.structured_content["events"]
+            if any(record["event"]["type"] == "task.completed" for record in events):
+                break
+            await asyncio.sleep(0.2)
+    changes = [
+        record["event"]["payload"]["change"]
+        for record in events
+        if record["event"]["type"] == "controller.changed"
+    ]
     assert changes[-2:] == ["opened", "released"], events
     acked = await client.call_tool("minecraft_ack_events", {"cursor": events[-1]["cursor"]})
     assert not acked.is_error
