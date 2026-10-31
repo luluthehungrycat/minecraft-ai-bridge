@@ -244,10 +244,21 @@ class ControllerService:
         return self._contract(renewed)
 
     async def close_session(self, token: str, session_id: str) -> None:
-        """Release the session so another controller can take over."""
+        """Release the session so another controller can take over.
+
+        The entry is forgotten only once Authz has released it. A release that
+        fails because a concurrent renewal replaced the lease keeps the renewed
+        entry, so retrying the close succeeds (#36).
+        """
         session = await self._owned_session(token, session_id)
+        try:
+            await asyncio.to_thread(self._authz.release_session, session)
+        except PermissionError:
+            await self._forget_if_invalid(session)
+            raise
+        # Session IDs are never reused, so any entry under this ID is the
+        # released session, possibly with a lease renewed meanwhile.
         self._sessions.pop(session_id, None)
-        await asyncio.to_thread(self._authz.release_session, session)
 
     # ── Observation ──────────────────────────────────────────────────
 
