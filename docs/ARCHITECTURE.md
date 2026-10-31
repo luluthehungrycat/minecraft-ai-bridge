@@ -261,7 +261,10 @@ requests into its calls. It composes the pieces above:
   using the old lease pruned meanwhile, but never displaces a newer session.
   Expired leases are swept on each `submit_action`, and a session is dropped
   once a policy rejection or failed renewal is confirmed by Authz to mean the
-  session itself is invalid.
+  session itself is invalid. `close_session` forgets the entry only after
+  Authz releases the session; a close that loses to a concurrent renewal
+  fails with the stale lease and keeps the renewed entry, so retrying it
+  succeeds (#36).
   Requests from other credentials cannot evict it. A dropped session ID then
   reads as unknown (`SESSION_UNKNOWN`).
 - `get_capabilities` and `get_state` need `steve:observe:self` or

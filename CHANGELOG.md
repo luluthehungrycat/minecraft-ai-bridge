@@ -51,6 +51,13 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
   `controller.changed` event. `--event-journal` selects the journal file
   (default `bridge.event_journal_path`) (#18).
 
+### Changed
+
+- A strategic action that was already queued when a safety reflex started is
+  now refused even if the reflex was acknowledged before the action reached
+  the dispatch lock; the safety check runs after the dispatch guard, right
+  before backend dispatch. This applies to the built-in agent too (#18).
+
 ### Fixed
 
 - `!follow` now rejects targets that are not plain Minecraft usernames (such as
@@ -62,6 +69,10 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
   one), expired leases are swept on each action request, and a session is
   dropped once a rejected request or failed renewal is confirmed to be
   caused by the session no longer being valid (#26).
+- `ControllerService.close_session` no longer forgets a session whose
+  release failed. A close that raced with a renewal used to drop the renewed
+  session from the cache while Authz still held it, leaving the controller
+  unable to use, renew, or close it until the lease expired (#36).
 - `McpqClient.connect` now cleans up the MCPQ client created by each failed
   attempt instead of leaving it to garbage collection.
 - `McpqClient.disconnect` now shuts down the MCPQ client explicitly. It
