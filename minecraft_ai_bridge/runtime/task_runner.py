@@ -99,6 +99,10 @@ class TaskRunner:
         async with self._lock:
             if self._stopping:
                 raise ValueError("task runtime is stopping")
+            # While a worker is still returning from its last checkpoint, only
+            # an idempotent retry is answered; inserting a new task now would
+            # leave it pending with no worker to run it.
+            idle = self._worker is None or self._worker.done()
             task = await asyncio.to_thread(
                 self.store.create,
                 self.controller.steve_id,
@@ -106,6 +110,7 @@ class TaskRunner:
                 request_id,
                 title,
                 validated,
+                admit_new=idle,
             )
             if task.status is TaskStatus.PENDING:
                 self._launch(task, session)

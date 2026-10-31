@@ -36,7 +36,10 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
   is checkpointed in `--task-store` (default `data/tasks.sqlite3`) and
   published as `task.*` events; unfinished tasks pause on safety
   interventions and restarts, and a step whose outcome is unknown is never
-  replayed (#18).
+  replayed. A Steve runs one task at a time and each credential may hold one
+  unfinished task, so another controller's paused task never blocks yours.
+  Finished tasks are pruned after 7 days or beyond the newest 10,000; their
+  request IDs stay reserved for 365 days (#18).
 
 - MCP-controlled Steves now run independent attack/eat/heal safety reflexes,
   journal attributed interventions, and refuse stale queued actions with

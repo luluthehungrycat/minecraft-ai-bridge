@@ -194,6 +194,8 @@ observations, or `teleport`/`move_to`/`break_block`/`place_block` with explicit
 `minecraft_pause_task`, `minecraft_resume_task`, and `minecraft_cancel_task`
 take the session and `task_id`; a running step finishes first, and cancelling
 does not undo completed steps. While a task runs, other actions are refused.
+Cancel your own paused task before creating another; other controllers' paused
+tasks do not block you. Finished tasks can be read for 7 days.
 Tasks pause on a safety intervention or a server restart; resume them with a
 current session. A task paused with `OUTCOME_UNKNOWN` cannot resume: check the
 world, cancel it, and create a new plan. Task progress is also published as

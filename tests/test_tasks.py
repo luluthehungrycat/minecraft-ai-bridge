@@ -438,3 +438,155 @@ async def test_a_returned_task_is_detached_from_the_running_plan(runtime, setup)
     done = await finished(runtime, setup.controller, task.task_id, TaskStatus.SUCCEEDED)
     assert done.next_step == 1
     assert setup.world.chat_messages_sent == ["kept"]
+
+
+def _finish(store, task, status=TaskStatus.SUCCEEDED):
+    return store.update(task, "task.completed", status=status)
+
+
+def test_a_paused_task_blocks_only_its_own_credential(tmp_path):
+    store = SqliteTaskStore(tmp_path / "tasks.sqlite3")
+    try:
+        step = [TaskStep(action="chat", params={"message": "hi"})]
+        a = store.create("AIBot", "cred-a", "a1", "test", step)
+        with pytest.raises(ValueError, match="running task"):
+            store.create("AIBot", "cred-b", "b1", "test", step)
+        a = store.update(a, "task.interrupted", status=TaskStatus.PAUSED, reason_code="X")
+        # Another credential is not locked out by A's paused task ...
+        b = store.create("AIBot", "cred-b", "b1", "test", step)
+        _finish(store, b)
+        # ... but A must cancel its own unfinished task before starting another.
+        with pytest.raises(ValueError, match="cancel it first"):
+            store.create("AIBot", "cred-a", "a2", "test", step)
+        _finish(store, a, TaskStatus.CANCELLED)
+        assert store.create("AIBot", "cred-a", "a2", "test", step).status is TaskStatus.PENDING
+    finally:
+        store.close()
+
+
+def test_admit_new_false_answers_only_an_idempotent_retry(tmp_path):
+    store = SqliteTaskStore(tmp_path / "tasks.sqlite3")
+    try:
+        step = [TaskStep(action="chat", params={"message": "hi"})]
+        first = _finish(store, store.create("AIBot", "cred", "r1", "test", step))
+        again = store.create("AIBot", "cred", "r1", "test", step, admit_new=False)
+        assert again.task_id == first.task_id
+        with pytest.raises(ValueError, match="running task"):
+            store.create("AIBot", "cred", "r2", "test", step, admit_new=False)
+    finally:
+        store.close()
+
+
+def test_finished_tasks_are_pruned_to_tombstones_that_keep_the_request_id(tmp_path):
+    from datetime import UTC, datetime, timedelta
+
+    now = [datetime(2026, 1, 1, tzinfo=UTC)]
+    store = SqliteTaskStore(tmp_path / "tasks.sqlite3", max_finished=2, clock=lambda: now[0])
+    try:
+        step = [TaskStep(action="chat", params={"message": "hi"})]
+        ids = []
+        for key in ("r1", "r2", "r3"):
+            ids.append(_finish(store, store.create("AIBot", "cred", key, "test", step)).task_id)
+            now[0] += timedelta(seconds=1)
+        # Admission prunes beyond the newest two finished tasks.
+        store.create("AIBot", "cred", "r4", "test", step)
+        with pytest.raises(ValueError, match="unknown task"):
+            store.get(ids[0])
+        assert store.get(ids[1]).status is TaskStatus.SUCCEEDED
+        with pytest.raises(ValueError, match="already used"):
+            store.create("AIBot", "cred", "r1", "test", step)
+        with pytest.raises(ValueError, match="different plan"):
+            store.create("AIBot", "cred", "r1", "other", step)
+
+        # Age also prunes; the unfinished r4 task is never pruned.
+        now[0] += timedelta(days=8)
+        with pytest.raises(ValueError, match="running task"):
+            store.create("AIBot", "cred", "r5", "test", step)
+        with pytest.raises(ValueError, match="unknown task"):
+            store.get(ids[2])
+
+        # After the idempotency window the request ID is free again.
+        now[0] += timedelta(days=366)
+        store.update(
+            store.get(store.create("AIBot", "cred", "r4", "test", step).task_id),
+            "task.cancelled",
+            status=TaskStatus.CANCELLED,
+        )
+        assert store.create("AIBot", "cred", "r1", "test", step).status is TaskStatus.PENDING
+    finally:
+        store.close()
+
+
+def test_more_than_the_retained_number_of_tasks_can_be_created(tmp_path):
+    store = SqliteTaskStore(tmp_path / "tasks.sqlite3", max_finished=3)
+    try:
+        step = [TaskStep(action="chat", params={"message": "hi"})]
+        for i in range(10):
+            _finish(store, store.create("AIBot", "cred", f"r{i}", "test", step))
+        rows = store._db.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        assert rows <= 4
+    finally:
+        store.close()
+
+
+def test_a_database_without_status_columns_is_migrated(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "tasks.sqlite3"
+    store = SqliteTaskStore(path)
+    step = [TaskStep(action="chat", params={"message": "hi"})]
+    paused = store.update(
+        store.create("AIBot", "cred-a", "a1", "test", step),
+        "task.interrupted",
+        status=TaskStatus.PAUSED,
+    )
+    store.close()
+    db = sqlite3.connect(path)
+    db.executescript(
+        "CREATE TABLE old AS SELECT task_id, steve_id, owner, request_key, fingerprint, record "
+        "FROM tasks; DROP TABLE tasks; ALTER TABLE old RENAME TO tasks;"
+    )
+    db.close()
+    store = SqliteTaskStore(path)
+    try:
+        assert store.get(paused.task_id).status is TaskStatus.PAUSED
+        with pytest.raises(ValueError, match="cancel it first"):
+            store.create("AIBot", "cred-a", "a2", "test", step)
+        assert store.create("AIBot", "cred-b", "b1", "test", step).status is TaskStatus.PENDING
+    finally:
+        store.close()
+
+
+async def test_another_controller_can_run_tasks_after_a_paused_task_is_abandoned(runtime, setup):
+    session = await runtime.open_session(setup.controller)
+    abandoned = await runtime.create_task(
+        setup.controller,
+        session.session_id,
+        session.generation,
+        "abandoned",
+        "test",
+        [
+            {"action": "wait", "params": {"seconds": 30}},
+            {"action": "chat", "params": {"message": "never"}},
+        ],
+    )
+    await finished(runtime, setup.controller, abandoned.task_id, TaskStatus.RUNNING)
+    await runtime.pause_task(
+        setup.controller, session.session_id, session.generation, abandoned.task_id
+    )
+    await finished(runtime, setup.controller, abandoned.task_id, TaskStatus.PAUSED)
+    await runtime.close_session(setup.controller, session.session_id)
+
+    other = await runtime.open_session(setup.second_controller)
+    task = await runtime.create_task(
+        setup.second_controller,
+        other.session_id,
+        other.generation,
+        "next",
+        "test",
+        [{"action": "chat", "params": {"message": "hello"}}],
+    )
+    await finished(runtime, setup.second_controller, task.task_id, TaskStatus.SUCCEEDED)
+    assert setup.world.chat_messages_sent == ["hello"]
+    still = await runtime.get_task(setup.controller, abandoned.task_id)
+    assert still.status is TaskStatus.PAUSED

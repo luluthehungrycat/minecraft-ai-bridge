@@ -390,8 +390,10 @@ the position/health/hunger/inventory/time/weather/player checks, and
 `teleport`/`move_to`/`break_block`/`place_block` with explicit finite
 coordinates. Each step runs through `submit_action`'s gate under the
 creating session (allowlist, delegation, reach limits, safety preemption),
-with a fresh request ID per attempt. One unfinished task per Steve; while
-its worker runs, other strategic actions are refused. Management calls need
+with a fresh request ID per attempt. A Steve runs one task at a time, and
+each credential has at most one unfinished task: a paused task blocks only
+its own credential (which can cancel it), never other controllers. While a
+worker runs, other strategic actions are refused. Management calls need
 `steve:control`, the task's own credential, and a current session; `get_task`
 needs no session. Bearer tokens are never stored.
 
@@ -410,7 +412,10 @@ have reached the backend, which can never be resumed (reconcile, cancel, and
 create a new plan). A cancel requested before the restart becomes
 `cancelled`. Shutdown waits for an in-progress create or resume before
 joining the worker. A full event outbox (100,000 unpublished events) refuses
-new tasks but never blocks checkpoints or restart recovery. Lifecycle events (`task.created`, `task.started`,
+new tasks but never blocks checkpoints or restart recovery. Finished tasks
+are kept for 7 days and the newest 10,000, then pruned at admission to
+tombstones that keep only the request key and plan fingerprint until 365
+days, so a retried `request_id` never starts its plan again. Lifecycle events (`task.created`, `task.started`,
 `task.progress`, `task.interrupted`, `task.completed`, `task.failed`,
 `task.cancelled`, ...) are written to an outbox in the same transaction as
 each checkpoint and published to the journal with deterministic event IDs,
