@@ -355,16 +355,32 @@ is a `rejected` result with a `reason_code` (`STEVE_MISMATCH`,
 `SESSION_UNKNOWN`, `SESSION_NOT_OWNED`, `STALE_GENERATION`,
 `ACTION_NOT_EXPOSED`, `OUT_OF_REACH`, `INVALID_TARGET`, `POLICY_REJECTED`).
 
-There is no task service or event API yet, and the safety supervisor does not
-run for externally controlled Steves.
+With an `event_journal`, `get_events(token, limit=, reset_expired=)` and
+`ack_events(token, cursor)` give each credential its own durable journal
+consumer (`controller-<credential_id>`). They need `events:read` on a
+credential bound to this Steve (the scope alone is service level, so the
+binding check keeps other Steves' credentials out) and no session. Only
+events whose `steve_id` is this Steve are delivered; unattributed events and
+other Steves' events are skipped, and a run of skipped events with nothing
+pending before it is acknowledged on the caller's behalf (at most ten
+1,000-event journal pages per poll). Polls repeat events until they are
+acknowledged. If retention dropped events the caller had not acknowledged,
+polling raises `EventCursorExpiredError` unless `reset_expired` is set, which
+resumes at the oldest retained event and reports `reset=True`. Opening and
+releasing a session append a `controller.changed` event (`change`,
+`controller_id`, `generation`); a journal failure is logged and never fails
+the session call. Fencing by an administrator records no event yet.
+
+There is no task service yet, and the safety supervisor does not run for
+externally controlled Steves.
 
 ### MCP transport (Phase B slice)
 
 `minecraft_ai_bridge.transport.mcp_server.build_mcp_server` exposes one
-`ControllerService` to MCP clients through six tools:
+`ControllerService` to MCP clients through eight tools:
 `minecraft_get_capabilities`, `minecraft_get_state`, `minecraft_open_session`,
-`minecraft_renew_session`, `minecraft_close_session`, and
-`minecraft_submit_action`. Each tool makes exactly one `ControllerService`
+`minecraft_renew_session`, `minecraft_close_session`,
+`minecraft_submit_action`, `minecraft_get_events`, and `minecraft_ack_events`. Each tool makes exactly one `ControllerService`
 call, so authentication, session fencing, delegation scopes, the exposed-action
 allowlist, parameter validation, and idempotency are enforced there and nowhere
 else. The adapter only decides which bearer token a call carries:
@@ -378,7 +394,8 @@ else. The adapter only decides which bearer token a call carries:
   harness that launches the process.
 
 The `minecraft-ai-bridge-mcp` command (`transport/mcp_main.py`) connects MCPQ,
-`AuthzService`, and a `SqliteActionOutcomeStore`, then serves stdio or
+`AuthzService`, a `SqliteActionOutcomeStore`, and an `EventJournal`
+(`--event-journal`, defaulting to `bridge.event_journal_path`), then serves stdio or
 Streamable HTTP. HTTP binds to `127.0.0.1` by default; any non-loopback
 address requires `--allow-remote` plus at least one `--allowed-host`, and the
 server does not terminate TLS itself. Host and Origin validation against
@@ -412,8 +429,10 @@ restart (at-least-once). When retention removes an unacknowledged event, that
 consumer is marked expired and polling/acknowledgment fails until
 `reset_consumer()` resumes at the oldest retained event. Reset can skip expired
 history and is an explicit recovery choice. There is no authentication/ACL
-layer, MCP endpoint, SSE delivery, or task lifecycle service. The built-in
-`SafetySupervisor` is the sole producer in this slice: each ordinary
+layer in the journal itself; `ControllerService` adds per-credential polling
+for one Steve's events (and the MCP tools over it). There is no SSE delivery
+or task lifecycle service. Producers are the built-in `SafetySupervisor` and
+`ControllerService` (`controller.changed`). For the supervisor: each ordinary
 `safety.intervened` event contains the action name and success flag, using HIGH
 for successful interventions and CRITICAL for failed or denied interventions.
 Writes run off the event loop and are drained during orderly shutdown. Other

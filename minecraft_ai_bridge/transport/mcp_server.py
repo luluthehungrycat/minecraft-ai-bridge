@@ -11,8 +11,8 @@ not here. The adapter only decides which bearer token a call carries:
 - stdio: the single controller token configured for the server process
   (the harness that launches the process supplies it in the environment).
 
-The adapter does not run the safety supervisor, publish events, or manage
-tasks; those are separate RFC-0001 slices.
+The adapter does not run the safety supervisor or manage tasks; those are
+separate RFC-0001 slices.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from ..minecraft.actions import ActionType
 from ..runtime.contracts import ActionRequestSchema
 from ..runtime.controller_service import _EXPOSED_ACTIONS, ControllerService
+from ..runtime.event_journal import EventCursorExpiredError
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +39,9 @@ INSTRUCTIONS = (
     "Retrying with the same request_id never repeats the action. Renew the session "
     "before it expires and close it when done. Observation, chat, and wait need only "
     "a session; movement, block edits, items, and combat need world delegation granted "
-    "by the server's operator."
+    "by the server's operator. Poll minecraft_get_events for what happened to the bot "
+    "(needs events:read) and acknowledge processed events with minecraft_ack_events; "
+    "unacknowledged events are returned again."
 )
 
 
@@ -64,6 +67,11 @@ class TokenSource:
 def _refusal(exc: Exception) -> ToolError:
     if isinstance(exc, PermissionError):
         return ToolError(f"unauthorized: {exc}")
+    if isinstance(exc, EventCursorExpiredError):
+        return ToolError(
+            "cursor expired: events you had not acknowledged were dropped by retention; "
+            "call minecraft_get_events with reset_expired=true to resume"
+        )
     return ToolError(f"invalid request: {exc}")
 
 
@@ -150,6 +158,38 @@ def build_mcp_server(controller: ControllerService, *, stdio_token: str | None =
         except (PermissionError, ValueError) as exc:
             raise _refusal(exc) from None
         return result.model_dump(mode="json")
+
+    @server.tool(name="minecraft_get_events")
+    async def get_events(
+        ctx: Context, limit: int = 100, reset_expired: bool = False
+    ) -> dict[str, Any]:
+        """Return the next unacknowledged events for this bot, oldest first.
+
+        Events repeat until acknowledged with minecraft_ack_events. reset is
+        true when retention dropped unacknowledged events before this poll.
+        """
+        try:
+            page = await controller.get_events(
+                token_for(ctx), limit=limit, reset_expired=reset_expired
+            )
+        except (PermissionError, ValueError, EventCursorExpiredError) as exc:
+            raise _refusal(exc) from None
+        return {
+            "events": [
+                {"cursor": record.cursor, "event": record.event.model_dump(mode="json")}
+                for record in page.events
+            ],
+            "reset": page.reset,
+        }
+
+    @server.tool(name="minecraft_ack_events")
+    async def ack_events(cursor: int, ctx: Context) -> dict[str, Any]:
+        """Acknowledge every event up to and including cursor."""
+        try:
+            await controller.ack_events(token_for(ctx), cursor)
+        except (PermissionError, ValueError, EventCursorExpiredError) as exc:
+            raise _refusal(exc) from None
+        return {"status": "acknowledged", "cursor": cursor}
 
     return server
 

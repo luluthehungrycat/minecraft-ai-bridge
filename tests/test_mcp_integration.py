@@ -60,7 +60,7 @@ async def stack(tmp_path):
     controller = auth.create_credential(
         PLAYER,
         "owner",
-        {"steve:control", "steve:observe:self", *WORLD_SCOPES},
+        {"steve:control", "steve:observe:self", "events:read", *WORLD_SCOPES},
         admin_token=admin.token,
     ).token
     world_admin = auth.grant_admin_credential(admin.token, "world-op", {"admin:world"}).token
@@ -76,7 +76,14 @@ async def stack(tmp_path):
         "MAB_CONTROLLER_TOKEN": controller,
         "AUTHZ_WORLD_ADMIN_TOKEN": world_admin,
     }
-    args = ["--config", str(config), "--outcome-store", str(tmp_path / "outcomes.sqlite3")]
+    args = [
+        "--config",
+        str(config),
+        "--outcome-store",
+        str(tmp_path / "outcomes.sqlite3"),
+        "--event-journal",
+        str(tmp_path / "events.sqlite3"),
+    ]
     return {"env": env, "args": args, "token": controller}
 
 
@@ -121,6 +128,16 @@ async def _exercise(client: Client) -> None:
         "minecraft_close_session", {"session_id": session["session_id"]}
     )
     assert not closed.is_error
+
+    polled = await client.call_tool("minecraft_get_events", {})
+    assert not polled.is_error, polled.content
+    events = polled.structured_content["events"]
+    changes = [record["event"]["payload"]["change"] for record in events]
+    assert changes[-2:] == ["opened", "released"], events
+    acked = await client.call_tool("minecraft_ack_events", {"cursor": events[-1]["cursor"]})
+    assert not acked.is_error
+    after = await client.call_tool("minecraft_get_events", {})
+    assert after.structured_content["events"] == []
 
 
 async def test_stdio_server_against_live_mcpq(stack):
