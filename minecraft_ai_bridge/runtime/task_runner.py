@@ -7,6 +7,7 @@ import contextlib
 import contextvars
 import logging
 import sqlite3
+from collections.abc import Coroutine
 from typing import TYPE_CHECKING, Any
 
 from .action_service import ActionRequest, PolicyDecision
@@ -32,6 +33,8 @@ class TaskRunner:
         self._stopping = False
         self._stop = asyncio.Event()
         self._pump: asyncio.Task[None] | None = None
+        # Admission and management writes in flight, kept alive while shielded.
+        self._handoffs: set[asyncio.Task[Task]] = set()
         self._context: contextvars.ContextVar[str | None] = contextvars.ContextVar(
             f"task_worker_{id(self)}", default=None
         )
@@ -81,6 +84,19 @@ class TaskRunner:
 
         return await asyncio.to_thread(read)
 
+    async def _shielded(self, write: Coroutine[Any, Any, Task]) -> Task:
+        """Finish a locked store write and its in-memory handoff.
+
+        Cancelling the caller cannot stop the SQLite write in its thread, so
+        the write and the worker or checkpoint update that must follow it run
+        in their own task; otherwise a committed pending task could be left
+        without a worker, or the worker could keep a stale revision.
+        """
+        handoff = asyncio.ensure_future(write)
+        self._handoffs.add(handoff)
+        handoff.add_done_callback(self._handoffs.discard)
+        return await asyncio.shield(handoff)
+
     async def get(self, token: str, task_id: str) -> Task:
         self.start()
         return await self._owned(token, task_id)
@@ -96,6 +112,14 @@ class TaskRunner:
     ) -> Task:
         session = await self._session(token, session_id, generation)
         validated = [TaskStep.model_validate(step) for step in steps]
+        task = await self._shielded(self._admit(session, request_id, title, validated))
+        self.start()
+        # Detached: the worker keeps its own copy of the plan.
+        return task.model_copy(deep=True)
+
+    async def _admit(
+        self, session: ControllerSession, request_id: str, title: str, steps: list[TaskStep]
+    ) -> Task:
         async with self._lock:
             if self._stopping:
                 raise ValueError("task runtime is stopping")
@@ -109,19 +133,25 @@ class TaskRunner:
                 session.credential_id,
                 request_id,
                 title,
-                validated,
+                steps,
                 admit_new=idle,
             )
             if task.status is TaskStatus.PENDING:
                 self._launch(task, session)
-        self.start()
-        # Detached: the worker keeps its own copy of the plan.
-        return task.model_copy(deep=True)
+            return task
 
     async def manage(
         self, token: str, session_id: str, generation: int, task_id: str, operation: str
     ) -> Task:
         session = await self._session(token, session_id, generation)
+        task = await self._shielded(self._manage(token, session, task_id, operation))
+        self.start()
+        # Detached: the worker keeps its own copy of the plan.
+        return task.model_copy(deep=True)
+
+    async def _manage(
+        self, token: str, session: ControllerSession, task_id: str, operation: str
+    ) -> Task:
         async with self._lock:
             task = await self._owned(token, task_id)
             if task.status in TERMINAL:
@@ -166,9 +196,7 @@ class TaskRunner:
                         status=TaskStatus.CANCELLED if operation == "cancel" else TaskStatus.PAUSED,
                         requested_operation=None,
                     )
-        self.start()
-        # Detached: the worker keeps its own copy of the plan.
-        return task.model_copy(deep=True)
+            return task
 
     def _launch(self, task: Task, session: ControllerSession) -> None:
         if self._worker is not None and not self._worker.done():

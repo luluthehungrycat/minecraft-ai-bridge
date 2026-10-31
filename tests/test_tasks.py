@@ -590,3 +590,91 @@ async def test_another_controller_can_run_tasks_after_a_paused_task_is_abandoned
     assert setup.world.chat_messages_sent == ["hello"]
     still = await runtime.get_task(setup.controller, abandoned.task_id)
     assert still.status is TaskStatus.PAUSED
+
+
+async def _cancel_after_commit(runtime, monkeypatch, method, call):
+    """Cancel ``call`` after the store ``method`` commits but before it returns."""
+    import threading
+
+    store = runtime._tasks.store
+    committed = threading.Event()
+    release = threading.Event()
+    original = getattr(store, method)
+
+    def slow(*args, **kwargs):
+        result = original(*args, **kwargs)
+        committed.set()
+        assert release.wait(10)
+        return result
+
+    monkeypatch.setattr(store, method, slow)
+    pending = asyncio.create_task(call)
+    assert await asyncio.to_thread(committed.wait, 5)
+    pending.cancel()
+    await asyncio.sleep(0)
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+    monkeypatch.setattr(store, method, original)
+
+
+async def test_a_cancelled_create_still_runs_the_committed_task(runtime, setup, monkeypatch):
+    session = await runtime.open_session(setup.controller)
+    await _cancel_after_commit(
+        runtime,
+        monkeypatch,
+        "create",
+        runtime.create_task(
+            setup.controller,
+            session.session_id,
+            session.generation,
+            "cancelled-caller",
+            "test",
+            [{"action": "chat", "params": {"message": "ran"}}],
+        ),
+    )
+    async with asyncio.timeout(3):
+        while setup.world.chat_messages_sent != ["ran"]:
+            await asyncio.sleep(0.01)
+    # Nothing is left pending: the next task is admitted and runs.
+    task = await runtime.create_task(
+        setup.controller,
+        session.session_id,
+        session.generation,
+        "next",
+        "test",
+        [{"action": "chat", "params": {"message": "next"}}],
+    )
+    await finished(runtime, setup.controller, task.task_id, TaskStatus.SUCCEEDED)
+
+
+async def test_a_cancelled_resume_still_launches_the_worker(runtime, setup, monkeypatch):
+    session = await runtime.open_session(setup.controller)
+    task = await runtime.create_task(
+        setup.controller,
+        session.session_id,
+        session.generation,
+        "resume",
+        "test",
+        [
+            {"action": "wait", "params": {"seconds": 30}},
+            {"action": "chat", "params": {"message": "never"}},
+        ],
+    )
+    await finished(runtime, setup.controller, task.task_id, TaskStatus.RUNNING)
+    await runtime.pause_task(setup.controller, session.session_id, session.generation, task.task_id)
+    await finished(runtime, setup.controller, task.task_id, TaskStatus.PAUSED)
+    await _cancel_after_commit(
+        runtime,
+        monkeypatch,
+        "update",
+        runtime.resume_task(setup.controller, session.session_id, session.generation, task.task_id),
+    )
+    await finished(runtime, setup.controller, task.task_id, TaskStatus.RUNNING)
+    worker = runtime._tasks._worker
+    assert worker is not None and not worker.done()
+    await runtime.cancel_task(
+        setup.controller, session.session_id, session.generation, task.task_id
+    )
+    await finished(runtime, setup.controller, task.task_id, TaskStatus.CANCELLED)
+    assert setup.world.chat_messages_sent == []
