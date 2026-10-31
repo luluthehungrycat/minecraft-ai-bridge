@@ -46,6 +46,10 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
   one), expired leases are swept on each action request, and a session is
   dropped once a rejected request or failed renewal is confirmed to be
   caused by the session no longer being valid (#26).
+- `ControllerService.close_session` no longer forgets a session whose
+  release failed. A close that raced with a renewal used to drop the renewed
+  session from the cache while Authz still held it, leaving the controller
+  unable to use, renew, or close it until the lease expired (#36).
 - `McpqClient.connect` now cleans up the MCPQ client created by each failed
   attempt instead of leaving it to garbage collection.
 - `McpqClient.disconnect` now shuts down the MCPQ client explicitly. It

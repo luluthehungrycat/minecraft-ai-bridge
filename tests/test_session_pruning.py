@@ -290,3 +290,67 @@ async def test_pruning_during_a_renewal_does_not_lose_the_renewed_session(setup,
     finally:
         resume.set()
         await asyncio.gather(pending, return_exceptions=True)
+
+
+async def test_a_close_that_loses_to_a_renewal_keeps_the_renewed_session(setup, monkeypatch):
+    # #36: the close looked the session up with the old lease, then a renewal
+    # committed before its release ran, so Authz refuses the stale release.
+    auth, world, _, token, _ = setup
+    service = _service(auth, world)
+    opened = await service.open_session(token)
+    looked_up = threading.Event()
+    resume = threading.Event()
+    release = auth.release_session
+
+    def delayed_release(session):
+        looked_up.set()
+        assert resume.wait(10)
+        return release(session)
+
+    monkeypatch.setattr(auth, "release_session", delayed_release)
+    closing = asyncio.create_task(service.close_session(token, opened.session_id))
+    try:
+        assert await asyncio.to_thread(looked_up.wait, 5)
+        await service.renew_session(token, opened.session_id)
+        resume.set()
+        with pytest.raises(PermissionError, match="stale"):
+            await closing
+
+        result = await service.submit_action(token, _chat(opened, "after"))
+        assert result.status is ActionStatus.SUCCEEDED, result
+        # Retrying the close uses the renewed lease.
+        monkeypatch.setattr(auth, "release_session", release)
+        await service.close_session(token, opened.session_id)
+        assert service._sessions == {}
+        await service.open_session(token)
+    finally:
+        resume.set()
+        await asyncio.gather(closing, return_exceptions=True)
+
+
+async def test_a_close_of_a_fenced_session_forgets_it(setup):
+    auth, world, admin, token, _ = setup
+    service = _service(auth, world)
+    session = await service.open_session(token)
+    _fence(auth, admin)
+
+    with pytest.raises(PermissionError):
+        await service.close_session(token, session.session_id)
+    assert service._sessions == {}
+
+
+async def test_an_unverifiable_close_keeps_the_session(setup, monkeypatch):
+    auth, world, _, token, _ = setup
+    service = _service(auth, world)
+    session = await service.open_session(token)
+
+    def broken(_session):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(auth, "release_session", broken)
+    with pytest.raises(sqlite3.OperationalError):
+        await service.close_session(token, session.session_id)
+    # Authz still holds the session, so the controller can still use it.
+    assert list(service._sessions) == [session.session_id]
+    result = await service.submit_action(token, _chat(session))
+    assert result.status is ActionStatus.SUCCEEDED, result
