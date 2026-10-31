@@ -445,6 +445,7 @@ class ActionService:
         what is dispatched, or what the fingerprint covers.
         """
 
+        preemption_generation = self._preemption_generation
         if preemptive and self._safety_preemption_enabled:
             self._preemption_generation += 1
 
@@ -466,6 +467,7 @@ class ActionService:
                     request,
                     request_id=None,
                     preemptible=preemptible,
+                    preemption_generation=preemption_generation,
                 )
             else:
                 async with self._dispatch_lock:
@@ -473,6 +475,7 @@ class ActionService:
                         request,
                         request_id=None,
                         preemptible=preemptible,
+                        preemption_generation=preemption_generation,
                     )
             return outcome.result
 
@@ -571,6 +574,7 @@ class ActionService:
                     request,
                     request_id=request_id,
                     preemptible=preemptible,
+                    preemption_generation=preemption_generation,
                     expected_identity_scope=identity_scope,
                     durable_owner=durable_owner,
                 )
@@ -580,6 +584,7 @@ class ActionService:
                         request,
                         request_id=request_id,
                         preemptible=preemptible,
+                        preemption_generation=preemption_generation,
                         expected_identity_scope=identity_scope,
                         durable_owner=durable_owner,
                     )
@@ -956,6 +961,7 @@ class ActionService:
         *,
         request_id: str | None,
         preemptible: bool,
+        preemption_generation: int,
         expected_identity_scope: tuple[str, ...] | None = None,
         durable_owner: str | None = None,
     ) -> ActionOutcome:
@@ -996,26 +1002,6 @@ class ActionService:
             )
 
         if (
-            preemptible
-            and request.action is not ActionType.WAIT
-            and self._safety_preemption_enabled
-            and self._preemption_generation != self._acknowledged_preemption_generation
-        ):
-            reason = "Action preempted by safety intervention before backend dispatch"
-            result = ActionResult(success=False, action=request.action, message=reason)
-            result.data["correlation_id"] = request.correlation_id
-            if request_id is not None:
-                result.data["request_id"] = request_id
-            self._record(
-                request,
-                allowed=False,
-                succeeded=False,
-                reason=reason,
-                request_id=request_id,
-            )
-            return ActionOutcome(result=result, status="preempted", allowed=False)
-
-        if (
             self._dispatch_guard is not None
             and not request.trusted_internal
             and not request.trusted_safety
@@ -1034,6 +1020,30 @@ class ActionService:
                     status="rejected",
                     reason_code=refusal.reason_code,
                 )
+
+        if (
+            preemptible
+            and request.action is not ActionType.WAIT
+            and self._safety_preemption_enabled
+            and (
+                self._preemption_generation != self._acknowledged_preemption_generation
+                or self._preemption_generation != preemption_generation
+            )
+        ):
+            reason = "Action preempted by safety intervention before backend dispatch"
+            result = ActionResult(success=False, action=request.action, message=reason)
+            result.data["correlation_id"] = request.correlation_id
+            result.data["reason_code"] = "SAFETY_PREEMPTED"
+            if request_id is not None:
+                result.data["request_id"] = request_id
+            self._record(
+                request,
+                allowed=False,
+                succeeded=False,
+                reason=reason,
+                request_id=request_id,
+            )
+            return ActionOutcome(result=result, status="preempted", allowed=False)
 
         if request_id is not None:
             # Mark the dispatch boundary before the backend call. Cancellation

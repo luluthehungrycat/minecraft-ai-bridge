@@ -52,7 +52,7 @@
 - `action_outcomes.py` — `SqliteActionOutcomeStore`: durable request-ID outcomes for ActionService. Per-request `reserved` → `dispatching` → terminal state machine with owner compare-and-set, so instances sharing a database dispatch a request ID at most once; writes run off the event loop in tracked tasks (`ActionService.flush()`); a row left `dispatching` reads as `unknown` and never re-dispatches. Full outcomes kept 7 days / 10,000 records, then tombstones until 365 days (the idempotency window). At-most-once dispatch, not exactly-once execution.
 - `event_journal.py` — SQLite append-only Event persistence with monotonic cursors, event-ID idempotency, per-consumer at-least-once polling/acknowledgment, and bounded payload retention.
 - `webhooks.py` — administrator-configured local webhook delivery over EventJournal, with isolated per-subscription consumers, strict journal-head ordering, ack-cursor reconciliation, durable retries/dead letters, HMAC signatures, bounded size/rate/retries, and HTTPS exact-host allowlisting. The default HTTPX pinned transport connects directly to checked public IPs while preserving TLS SNI and HTTP Host, with environment proxies and redirects disabled; callers may inject a compatible transport. No subscription-management endpoint or external controller authorization/admin config integration. This is not full Phase C.
-- `transport/mcp_server.py` + `transport/mcp_main.py` — MCP adapter over ControllerService (optional `[mcp]` extra, `mcp>=2.3,<3`). Eight tools (including `minecraft_get_events`/`minecraft_ack_events`); each makes one ControllerService call. HTTP calls authenticate with their own `Authorization: Bearer` header (no fallback); stdio uses `MAB_CONTROLLER_TOKEN`. `minecraft-ai-bridge-mcp` serves stdio or Streamable HTTP (stateless, loopback unless `--allow-remote`, which requires `--allowed-host`; Host/Origin always validated explicitly; startup cleanup via `AsyncExitStack`). `--max-edit-distance`/`--max-move-distance` set the reach limits; `--event-journal` (default `bridge.event_journal_path`) the event journal. Does not summon the bot, run the safety supervisor, or provide tasks.
+- `transport/mcp_server.py` + `transport/mcp_main.py` — MCP adapter over ControllerService (optional `[mcp]` extra, `mcp>=2.3,<3`). Eight tools (including `minecraft_get_events`/`minecraft_ack_events`); each makes one ControllerService call. HTTP calls authenticate with their own `Authorization: Bearer` header (no fallback); stdio uses `MAB_CONTROLLER_TOKEN`. `minecraft-ai-bridge-mcp` serves stdio or Streamable HTTP (stateless, loopback unless `--allow-remote`, which requires `--allowed-host`; Host/Origin always validated explicitly; startup cleanup via `AsyncExitStack`). `--max-edit-distance`/`--max-move-distance` set the reach limits; `--event-journal` (default `bridge.event_journal_path`) the event journal. Runs ControllerSafety attack/eat/heal reflexes through the shared action gate; attributed safety events are pollable. Does not summon the bot or provide tasks.
 - `contracts.py` — RFC-0001 Phase A contract schemas (Pydantic v2): SteveIdentity, ControllerSession, Capabilities, Task, Event, and the ActionRequestSchema/ActionResultSchema action envelope. Schema definitions only: strict IDs/statuses, timezone-aware timestamps; no authorization, persistence, event journal, task service, or MCP wiring (later phases). The Schema suffix avoids collision with the unchanged runtime ActionRequest/ActionResult dataclasses.
 
 ### Infrastructure
@@ -114,7 +114,7 @@ examples and the conventions block at the top.
 - **config.yaml volume mount**: Mounted read-only at `/app/config.yaml`. Changes require `docker compose restart bridge`.
 
 ### Code Quality
-- **Tests**: 852 tests collected in total — 838 deterministic unit tests plus 14 integration tests (12 agent-loop, 2 MCP end-to-end). The 57 MCP adapter unit tests and both MCP end-to-end tests need the `mcp` extra (included in `[dev]`) and skip without it. Unit tests use `MockMcpqClient` for deterministic MCPQ simulation. Integration tests use a real MCPQ server + real LLM (OpenRouter `openai/gpt-oss-20b`, or Requesty `runware/gpt-oss-120b` when only `REQUESTY_API_KEY` is set; override with `INTEGRATION_LLM_MODEL`) for end-to-end validation. The stack uses pinned Paper 26.2 build 123. Run with `pytest tests/`.
+- **Tests**: 859 tests collected in total — 845 deterministic unit tests plus 14 integration tests (12 agent-loop, 2 MCP end-to-end). The 58 MCP adapter unit tests and both MCP end-to-end tests need the `mcp` extra (included in `[dev]`) and skip without it. Unit tests use `MockMcpqClient` for deterministic MCPQ simulation. Integration tests use a real MCPQ server + real LLM (OpenRouter `openai/gpt-oss-20b`, or Requesty `runware/gpt-oss-120b` when only `REQUESTY_API_KEY` is set; override with `INTEGRATION_LLM_MODEL`) for end-to-end validation. The stack uses pinned Paper 26.2 build 123. Run with `pytest tests/`.
 - **Mypy**: runs in CI on every push and PR (`mypy minecraft_ai_bridge/ --ignore-missing-imports`) and must pass.
 - **gRPC stubs are synchronous**: MCPQ generated stubs block; dispatched via `asyncio.to_thread`. Not ideal but works.
 - **RCON client is unmaintained**: Since the MCPQ migration, `rcon.py` isn't tested. Consider removing or marking deprecated.
@@ -140,7 +140,7 @@ Some LLMs (especially smaller/local ones) can't reliably output structured JSON 
 
 ### P0: None (Testing Complete)
 The 0.5.0 release completed the testing milestone:
-- **Unit tests** (838): MockMcpqClient covers all 36 actions, observer parsing, memory, goal fallback plans, config, inventory manager, chat commands, pathfinding, the runtime action gate, the safety supervisor, the event journal, webhook delivery, and the local authorization service
+- **Unit tests** (845): MockMcpqClient covers all 36 actions, observer parsing, memory, goal fallback plans, config, inventory manager, chat commands, pathfinding, the runtime action gate, the safety supervisor, the event journal, webhook delivery, and the local authorization service
 - **Integration tests** (12): Full think-act-observe loop with real MCPQ server + real LLM inference (OpenRouter `openai/gpt-oss-20b`). Covers teleport, exploration, disconnect handling, fallback decomposition, failure counting, memory recording, chat command stop, and inventory creation.
 - **Goal-verification assertions**: Integration tests verify agent behavior via:
   - `action_taken(orch, *names) → bool` — checks if the agent performed a specific action (parses `MemoryEntry.raw`)
@@ -214,7 +214,7 @@ The 0.5.0 release completed the testing milestone:
 | `docker-compose.yml` | Paper server + bridge services |
 | `docs/*.md` | Full documentation set |
 | `tests/conftest.py` | MockMcpqClient, MockLLMClient, test fixtures |
-| `tests/test_*.py` | Unit + integration tests (852 total: 838 unit + 14 integration) |
+| `tests/test_*.py` | Unit + integration tests (859 total: 845 unit + 14 integration) |
 | `AGENTS.md` | This file |
 
 ## Environment Info
@@ -275,6 +275,7 @@ Helpers in `tests/test_integration.py`:
 | `tests/test_event_journal.py` | 8 | Durable event journal |
 | `tests/test_action_outcomes.py` | 25 | Durable request-ID outcomes: restarts, retention, cross-instance claims, async persistence, corrupt records |
 | `tests/test_runtime_action_gate.py` | 25 | Action gate, policy, and idempotency |
+| `tests/test_controller_safety.py` | 6 | MCP safety reflex authority, preemption, attribution and cleanup |
 | `tests/test_runtime_safety.py` | 17 | Independently scheduled preservation |
 | `tests/test_safety_events.py` | 16 | Durable safety intervention events |
 | `tests/test_webhooks.py` | 28 | Webhook delivery, retries, and endpoint checks |

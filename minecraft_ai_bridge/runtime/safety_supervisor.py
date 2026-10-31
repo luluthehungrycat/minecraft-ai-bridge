@@ -40,6 +40,7 @@ class SafetySupervisor:
         interval: float = 0.25,
         on_intervention_consumed: Callable[[], None] | None = None,
         event_sink: Callable[[Event], int | Awaitable[int]] | None = None,
+        steve_id: str | None = None,
     ) -> None:
         if interval <= 0:
             raise ValueError("safety supervisor interval must be positive")
@@ -48,6 +49,10 @@ class SafetySupervisor:
         self._interval = interval
         self._on_intervention_consumed = on_intervention_consumed
         self._event_sink = event_sink
+        # Attributes events to the Steve, so per-Steve readers (such as
+        # ControllerService.get_events) receive them; None leaves them
+        # unattributed.
+        self._steve_id = steve_id
         self._event_writes: set[asyncio.Task[None]] = set()
         self._coalesced_event: Event | None = None
         self._coalesced_total = 0
@@ -101,6 +106,7 @@ class SafetySupervisor:
             event_id=f"evt-{uuid4()}",
             type=_SAFETY_EVENT_TYPE,
             severity=severity,
+            steve_id=self._steve_id,
             source=_SAFETY_EVENT_SOURCE,
             payload=payload,
         )

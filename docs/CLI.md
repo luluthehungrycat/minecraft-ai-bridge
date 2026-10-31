@@ -176,6 +176,13 @@ recorded as `controller.changed` events. If retention dropped events you had
 not acknowledged, polling fails until you pass `reset_expired: true`, which
 resumes at the oldest retained event and returns `reset: true`.
 
+Safety reflexes run continuously beside the MCP transport, including with
+no controller session. `safety.intervened` events carry this Steve's ID.
+`SAFETY_PREEMPTED` means the action never reached the backend: inspect fresh
+state and use a new request ID to try again. `SAFETY_INTERRUPTED` means a
+multi-step action stopped after partial progress; inspect state before
+planning the next action. Reflexes stop when the server exits.
+
 Example stdio client configuration:
 
 ```json

@@ -381,6 +381,7 @@ class _Stage:
 
 def _install_fakes(monkeypatch, stage: _Stage) -> None:
     from minecraft_ai_bridge import runtime
+    from minecraft_ai_bridge.bridge import controller_safety
     from minecraft_ai_bridge.minecraft import mc_api
     from minecraft_ai_bridge.transport import mcp_server
 
@@ -415,12 +416,26 @@ def _install_fakes(monkeypatch, stage: _Stage) -> None:
             stage.events.append("store.close")
 
     class FakeJournal:
+        def append(self, event):
+            return 1
+
         def __init__(self, _path):
             stage.check("journal")
             stage.events.append("journal.open")
 
         def close(self):
             stage.events.append("journal.close")
+
+    class FakeSafety:
+        def __init__(self, *_args, **_kwargs):
+            stage.check("safety")
+            stage.events.append("safety.open")
+
+        def start(self):
+            pass
+
+        async def aclose(self):
+            stage.events.append("safety.close")
 
     class FakeController:
         def __init__(self, *_args, **_kwargs):
@@ -444,11 +459,19 @@ def _install_fakes(monkeypatch, stage: _Stage) -> None:
     monkeypatch.setattr(runtime, "AuthzService", FakeAuthz)
     monkeypatch.setattr(runtime, "SqliteActionOutcomeStore", FakeStore)
     monkeypatch.setattr(runtime, "EventJournal", FakeJournal)
+    monkeypatch.setattr(controller_safety, "ControllerSafety", FakeSafety)
     monkeypatch.setattr(runtime, "ControllerService", FakeController)
     monkeypatch.setattr(mcp_server, "build_mcp_server", fake_build)
 
 
-OPENED = ["mc.open", "authz.open", "store.open", "journal.open", "controller.open"]
+OPENED = [
+    "mc.open",
+    "authz.open",
+    "store.open",
+    "journal.open",
+    "controller.open",
+    "safety.open",
+]
 
 
 @pytest.mark.parametrize(
@@ -459,10 +482,11 @@ OPENED = ["mc.open", "authz.open", "store.open", "journal.open", "controller.ope
         ("store", 2),
         ("journal", 3),
         ("controller", 4),
-        ("build", 5),
-        ("run", 5),
-        ("controller.aclose", 5),
-        (None, 5),
+        ("safety", 5),
+        ("build", 6),
+        ("run", 6),
+        ("controller.aclose", 6),
+        (None, 6),
     ],
 )
 async def test_serve_closes_everything_it_opened(monkeypatch, tmp_path, fail_at, opened):

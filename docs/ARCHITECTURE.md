@@ -371,8 +371,16 @@ releasing a session append a `controller.changed` event (`change`,
 `controller_id`, `generation`); a journal failure is logged and never fails
 the session call. Fencing by an administrator records no event yet.
 
-There is no task service yet, and the safety supervisor does not run for
-externally controlled Steves.
+`ControllerSafety` runs preservation reflexes beside the MCP transport using
+its ControllerService's ActionService and a process-local safety authority.
+Attack/eat/heal do not require an external controller session. Reflexes
+invalidate queued controller actions (`SAFETY_PREEMPTED`), even after the
+reflex is acknowledged; multi-step movement stops between steps and reports
+`SAFETY_INTERRUPTED`. Events carry the Steve ID. With no goal tree, flee and
+find-food subgoals are unavailable; overwhelming threats fall back to attack.
+Shutdown stops polling and flushes safety events before closing the action
+outcome store or journal. This is in-process safety, not a backend watchdog.
+There is no task service yet.
 
 ### MCP transport (Phase B slice)
 
@@ -411,8 +419,7 @@ MCP tool errors (`unauthorized: ...`, `invalid request: ...`); controller-level
 rejections are returned as `rejected` results with their `reason_code`.
 
 Limitations: the bot entity must already exist (the server does not summon
-it); externally controlled Steves have no safety supervisor; there is no event
-polling or task API.
+it); safety cannot undo already-dispatched backend work, and there is no task API.
 
 ### Durable event journal (Phase C slice)
 
