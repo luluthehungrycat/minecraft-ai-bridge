@@ -27,6 +27,20 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
 
 ### Added
 
+- `minecraft-ai-bridge-mcp` runs durable tasks: `minecraft_create_task`
+  starts a plan of up to 100 bounded steps (chat, waits, observations, and
+  targeted moves and block edits) that runs independently of the MCP
+  request, through the same authorization, reach, and safety checks as single
+  actions. `minecraft_get_task`, `minecraft_pause_task`,
+  `minecraft_resume_task`, and `minecraft_cancel_task` manage it. Progress
+  is checkpointed in `--task-store` (default `data/tasks.sqlite3`) and
+  published as `task.*` events; unfinished tasks pause on safety
+  interventions and restarts, and a step whose outcome is unknown is never
+  replayed. A Steve runs one task at a time and each credential may hold one
+  unfinished task, so another controller's paused task never blocks yours.
+  Finished tasks are pruned after 7 days or beyond the newest 10,000; their
+  request IDs stay reserved for 365 days (#18).
+
 - MCP-controlled Steves now run independent attack/eat/heal safety reflexes,
   journal attributed interventions, and refuse stale queued actions with
   `SAFETY_PREEMPTED`. Partially executed movement reports `SAFETY_INTERRUPTED`

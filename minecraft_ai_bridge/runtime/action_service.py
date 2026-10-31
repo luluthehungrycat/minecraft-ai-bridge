@@ -698,6 +698,11 @@ class ActionService:
     def _safety_intervention_pending(self) -> bool:
         return self._preemption_generation != self._acknowledged_preemption_generation
 
+    @property
+    def safety_generation(self) -> int:
+        """Monotonic intervention epoch, retained after acknowledgment."""
+        return self._preemption_generation
+
     def acknowledge_safety_intervention(self) -> None:
         """Allow new strategic actions after the pending reflex is consumed."""
         self._acknowledged_preemption_generation = self._preemption_generation

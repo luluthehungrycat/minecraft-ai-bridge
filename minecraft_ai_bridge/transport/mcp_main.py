@@ -74,6 +74,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="data/action-outcomes.sqlite3",
         help="SQLite file for durable request-ID outcomes",
     )
+    parser.add_argument("--task-store", default="data/tasks.sqlite3", help="Durable task database")
     parser.add_argument(
         "--event-journal",
         default=None,
@@ -160,7 +161,13 @@ async def serve(args: argparse.Namespace, config: AppConfig) -> None:
     """Connect the runtime services and serve until the transport stops."""
     from ..bridge.controller_safety import ControllerSafety
     from ..minecraft.mc_api import McpqClient
-    from ..runtime import AuthzService, ControllerService, EventJournal, SqliteActionOutcomeStore
+    from ..runtime import (
+        AuthzService,
+        ControllerService,
+        EventJournal,
+        SqliteActionOutcomeStore,
+        SqliteTaskStore,
+    )
     from ..runtime.controller_service import ReachLimits
     from ..runtime.world_adapter import McpqWorldAdapter
     from .mcp_server import build_mcp_server
@@ -190,6 +197,8 @@ async def serve(args: argparse.Namespace, config: AppConfig) -> None:
         stack.callback(store.close)
         journal = EventJournal(args.event_journal or config.bridge.event_journal_path)
         stack.callback(journal.close)
+        tasks = SqliteTaskStore(args.task_store)
+        stack.callback(tasks.close)
         safety_authority = object()
         controller = ControllerService(
             McpqWorldAdapter(mc),
@@ -201,6 +210,7 @@ async def serve(args: argparse.Namespace, config: AppConfig) -> None:
             reach_limits=reach,
             event_journal=journal,
             safety_authority=safety_authority,
+            task_store=tasks,
         )
         stack.push_async_callback(controller.aclose)
         safety = ControllerSafety(controller, safety_authority, event_sink=journal.append)
@@ -208,6 +218,8 @@ async def serve(args: argparse.Namespace, config: AppConfig) -> None:
         # close.
         stack.push_async_callback(safety.aclose)
         safety.start()
+        stack.push_async_callback(controller.stop_tasks)
+        controller.start_tasks()
         # Over HTTP each request authenticates with its own header; the
         # process token is only for stdio.
         server = build_mcp_server(
