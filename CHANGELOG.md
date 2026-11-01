@@ -63,6 +63,10 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
 
 ### Fixed
 
+- A malformed LLM goal decomposition (for example a list of numbers, or
+  sub-goals without a description) no longer crashes the agent at startup
+  with `AttributeError`; it is rejected and the built-in fallback plan is
+  used instead.
 - The Paper server healthcheck now uses the image's `mc-health` probe. Under
   `compose.podman.yml`, podman-compose 1.3.0 mangled the previous
   multi-argument `bash` probe, so the server never became healthy and the

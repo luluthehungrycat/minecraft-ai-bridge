@@ -10,7 +10,7 @@ This document outlines the development priorities, completed work, and future pl
 ## 🎯 Current Status
 
 **Version**: 0.5.1 released 2026-07-11; 0.6.0 unreleased on `master`
-**Test Coverage**: 870 deterministic tests plus 14 live integration tests (Paper 26.2 build 123/MCPQ, an LLM provider for the agent loop)
+**Test Coverage**: 878 deterministic tests plus 14 live integration tests (Paper 26.2 build 123/MCPQ, an LLM provider for the agent loop)
 **Overall Health**: ✅ Built-in agent stable; RFC-0001 runtime and MCP controller surface landed through Phase B and most of Phase C
 
 ---
@@ -62,7 +62,7 @@ This document outlines the development priorities, completed work, and future pl
 - [x] Durable bounded task plans with pause/resume/cancel and restart recovery (#40)
 
 ### Testing
-- [x] 870 deterministic tests passing (MockMcpqClient-based, no server needed)
+- [x] 878 deterministic tests passing (MockMcpqClient-based, no server needed)
 - [x] Integration tests require Docker-provisioned pinned Paper 26.2 build 123/MCPQ and an LLM provider
 - [x] Goal-verification helpers (`actions_taken()`, `position_reached()`)
 
@@ -226,7 +226,7 @@ This document outlines the development priorities, completed work, and future pl
 
 ## 🧪 Testing Strategy
 
-### Unit Tests (870 deterministic tests)
+### Unit Tests (878 deterministic tests)
 - **Run in CI**: ✅ Yes (on all pushes/PRs)
 - **Dependencies**: None (MockMcpqClient)
 - **Coverage**: Action handlers, NBT parsing, memory, goals, config, inventory, chat commands, pathfinding, orchestrator recovery, runtime gate, authorization, sessions, safety, events, tasks, webhooks, and the MCP adapter
@@ -268,7 +268,7 @@ This document outlines the development priorities, completed work, and future pl
 
 | Metric | Current | Target (v1.0) |
 |--------|---------|---------------|
-| Unit Test Coverage | 870 tests | Keep growing with features |
+| Unit Test Coverage | 878 tests | Keep growing with features |
 | Integration Tests | 14 tests | 30+ tests |
 | Bug Count | ~5 minor | 0 critical |
 | Documentation | 90% complete | 100% complete |
