@@ -1,7 +1,7 @@
 # Project Roadmap
 
 > **Minecraft AI Bridge** - Development Roadmap and Priority Tracking
-> Last Updated: 2026-08-26
+> Last Updated: 2026-11-01
 
 This document outlines the development priorities, completed work, and future plans for the Minecraft AI Bridge project.
 
@@ -9,9 +9,9 @@ This document outlines the development priorities, completed work, and future pl
 
 ## 🎯 Current Status
 
-**Version**: 0.5.1 (unreleased)
-**Test Coverage**: 333 deterministic tests passing; integration tests require pinned Paper 26.2 build 123/MCPQ and an LLM provider
-**Overall Health**: ✅ Core behavior stable; CI and release hardening in progress
+**Version**: 0.5.1 released 2026-07-11; 0.6.0 unreleased on `master`
+**Test Coverage**: 870 deterministic tests plus 14 live integration tests (Paper 26.2 build 123/MCPQ, an LLM provider for the agent loop)
+**Overall Health**: ✅ Built-in agent stable; RFC-0001 runtime and MCP controller surface landed through Phase B and most of Phase C
 
 ---
 
@@ -52,8 +52,17 @@ This document outlines the development priorities, completed work, and future pl
 - [x] I27: Structured inventory manager (`has_item()`, `count_item()`, `get_summary()`)
 - [x] I28: Structure respect rules (prompt guidance to not build over existing builds)
 
+### RFC-0001 Runtime and MCP Controllers (umbrella issue #18)
+- [x] Phase A: contract schemas, `WorldAdapter`, shared `ActionService` gate with audit and request-ID idempotency (durable via `SqliteActionOutcomeStore`)
+- [x] Phase B: local credentials and scopes, one exclusive fenced controller session per Steve, `ControllerService`, `minecraft-ai-bridge-mcp` over stdio and Streamable HTTP
+- [x] Per-credential world delegation scopes (#24) and reach limits (#25)
+- [x] Session pruning and close/renew races (#26, #36); `!follow` target validation (#21)
+- [x] Independent safety supervisor for the built-in agent and MCP-controlled Steves; stale queued actions refused with `SAFETY_PREEMPTED`
+- [x] Durable event journal, MCP event polling/ack, signed webhook sender
+- [x] Durable bounded task plans with pause/resume/cancel and restart recovery (#40)
+
 ### Testing
-- [x] 333 deterministic tests passing (MockMcpqClient-based, no server needed)
+- [x] 870 deterministic tests passing (MockMcpqClient-based, no server needed)
 - [x] Integration tests require Docker-provisioned pinned Paper 26.2 build 123/MCPQ and an LLM provider
 - [x] Goal-verification helpers (`actions_taken()`, `position_reached()`)
 
@@ -77,7 +86,7 @@ This document outlines the development priorities, completed work, and future pl
 - [x] Gate live integration tests on `RUN_LIVE_INTEGRATION=true` plus the provider secret
 - [x] Run Ruff linting and formatting checks
 - [x] Provision Paper 26.2 build 123/MCPQ/bot-plugin infrastructure for live CI integration tests
-- [ ] Re-enable mypy after reconciling strict SDK types
+- [x] Re-enable mypy in CI (#2)
 - [x] **Test matrix** for Python versions (3.11, 3.12, 3.13)
 
 #### Code Improvements
@@ -86,7 +95,16 @@ This document outlines the development priorities, completed work, and future pl
 - [x] Add fallback plans for Nether portal construction, End portal activation,
   redstone circuits, animal farming, and villager trading
 
-### P2: Medium Priority (Next Month)
+### P1: Finish RFC-0001 Phase C (Next)
+- [ ] Event producers beyond `safety.intervened`, `controller.changed`, and `task.*`: damage/attack received, creeper damage, health and hunger warnings, unexpected world changes
+- [ ] Wire webhook subscriptions into admin config and run the sender from `minecraft-ai-bridge-mcp`
+- [ ] Live test for the Phase C gate: emergency response without an LLM answer, continuing across an MCP client disconnect; no duplicate mutations from replays across restarts
+
+### P1: RFC-0001 Phase D — Mineflayer Backend
+- [ ] Design spike: backend capability parity matrix, sidecar protocol, `steve_id` to in-game identity mapping, Mineflayer version support vs Paper 26.2
+- [ ] Optional Node.js sidecar behind `WorldAdapter`; observe/move/dig/place/stop through the same `ActionService`
+
+### P2: Medium Priority
 
 #### Movement System
 - [ ] **WASD-style movement** (Phase 4 feature)
@@ -163,7 +181,7 @@ This document outlines the development priorities, completed work, and future pl
 - All critical bugs fixed
 - Phase 4 features complete (chat commands, inventory manager, persistent memory)
 
-### v0.5.1 (Current, unreleased)
+### v0.5.1 (Released 2026-07-11)
 **Focus**: Observer hardening and prompt recovery
 
 - [x] Robust inventory, health, and biome observation
@@ -171,19 +189,22 @@ This document outlines the development priorities, completed work, and future pl
 - [x] Failure hints and one guarded next-turn retry
 
 ### v0.6.0 (Next Minor Release)
-**Target**: 2-4 weeks
-**Focus**: CI/CD matrix and remaining survival basics
+**Focus**: CI/CD matrix, survival reflexes, and the RFC-0001 runtime with MCP controllers
 
 - [x] GitHub Actions CI with deterministic unit tests
 - [x] Configure the opt-in `OPENROUTER_API_KEY` repository secret for integration tests
 - [x] Add Python 3.11, 3.12, and 3.13 test matrix
 - [x] Health and hunger management
 - [x] Mob detection and reflex combat
-- [ ] Weapon selection, armor management, and proper crafting/smelting
+- [x] Shared action gate, authorization, controller sessions, and `minecraft-ai-bridge-mcp`
+- [x] Independent safety supervisor, durable events, and durable tasks
+- [ ] Live integration run against the Podman stack before tagging
 
 ### v0.7.0
-**Target**: 1-2 months
-**Focus**: Movement, pathfinding, and planning improvements
+**Focus**: Phase C completion, movement, pathfinding, and survival crafting
+
+- [ ] Remaining Phase C event producers and webhook wiring
+- [ ] Weapon selection, armor management, and proper crafting/smelting
 
 - [ ] WASD-style movement
 - [ ] 3D pathfinding
@@ -205,10 +226,10 @@ This document outlines the development priorities, completed work, and future pl
 
 ## 🧪 Testing Strategy
 
-### Unit Tests (319 deterministic tests)
+### Unit Tests (870 deterministic tests)
 - **Run in CI**: ✅ Yes (on all pushes/PRs)
 - **Dependencies**: None (MockMcpqClient)
-- **Coverage**: Action handlers, NBT parsing, memory, goals, config, inventory, chat commands, pathfinding, and orchestrator recovery
+- **Coverage**: Action handlers, NBT parsing, memory, goals, config, inventory, chat commands, pathfinding, orchestrator recovery, runtime gate, authorization, sessions, safety, events, tasks, webhooks, and the MCP adapter
 
 ### Integration Tests
 - **Run in CI**: ⚠️ Only when `RUN_LIVE_INTEGRATION=true`
@@ -247,11 +268,11 @@ This document outlines the development priorities, completed work, and future pl
 
 | Metric | Current | Target (v1.0) |
 |--------|---------|---------------|
-| Unit Test Coverage | 190 tests | 200+ tests |
-| Integration Tests | 22 tests | 30+ tests |
+| Unit Test Coverage | 870 tests | Keep growing with features |
+| Integration Tests | 14 tests | 30+ tests |
 | Bug Count | ~5 minor | 0 critical |
 | Documentation | 90% complete | 100% complete |
-| CI Status | ⚠️ Partial | ✅ Full |
+| CI Status | ✅ Lint, mypy, unit matrix; live tests opt-in | ✅ Full |
 | PyPI Package | ❌ Not published | ✅ Published |
 
 ---

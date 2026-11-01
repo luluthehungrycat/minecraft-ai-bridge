@@ -53,9 +53,11 @@ The key difference from traditional RCON-based bridges: **MCPQ gives the agent d
 
 | Layer | Package | Responsibility |
 |-------|---------|----------------|
-| **Minecraft Interface** | `minecraft_ai_bridge.minecraft` | MCPQ client wrapper, 24 action handlers, world observation (position, blocks, inventory, time, weather, health) |
+| **Minecraft Interface** | `minecraft_ai_bridge.minecraft` | MCPQ client wrapper, 36 action handlers, A* pathfinding, world observation (position, blocks, inventory, time, weather, health) |
 | **LLM Abstraction** | `minecraft_ai_bridge.llm` | Unified interface for 5 LLM providers, tool-calling schema, system prompts |
 | **Bridge Orchestration** | `minecraft_ai_bridge.bridge` | Think-act-observe loop, goal decomposition & tracking, short+long-term memory, chat commands, inventory manager |
+| **Runtime** | `minecraft_ai_bridge.runtime` | Shared action gate, authorization and controller sessions, safety supervisor, durable event journal, durable tasks, webhooks |
+| **Transport** | `minecraft_ai_bridge.transport` | `minecraft-ai-bridge-mcp` MCP server for external harnesses (optional `[mcp]` extra) |
 
 ## Quick Start
 
@@ -157,6 +159,17 @@ minecraft-ai-bridge --list-providers
 ```
 
 Shows all 5 supported providers, their required env vars, and model naming conventions.
+
+### MCP Server for External Harnesses
+
+`minecraft-ai-bridge-mcp` lets an external agent harness (Claude Code, Codex, OpenCode, Hermes Agent and others) control the bot over MCP instead of the built-in LLM loop. It serves stdio or Streamable HTTP (loopback only by default) and needs the `[mcp]` extra:
+
+```bash
+pip install -e ".[mcp]"
+MAB_CONTROLLER_TOKEN=... minecraft-ai-bridge-mcp --transport stdio
+```
+
+Every call goes through the same action gate as the built-in agent: scoped credentials, one exclusive controller session per bot, reach limits, and independent attack/eat/heal safety reflexes. Its tools cover observation, single actions, event polling and acknowledgement, and durable step plans (`minecraft_create_task` and friends). See [docs/CLI.md](docs/CLI.md#mcp-server-minecraft-ai-bridge-mcp) for credentials, flags, and the tool list.
 
 ## LLM Providers
 
@@ -322,34 +335,44 @@ minecraft-ai-bridge/
 │   ├── config.py                   # Pydantic config (YAML + env vars)
 │   ├── minecraft/
 │   │   ├── mc_api.py               # McpqClient async gRPC wrapper
-│   │   ├── actions.py              # 24 action handlers + dispatcher
+│   │   ├── actions.py              # 36 action handlers + dispatcher
+│   │   ├── pathfinding.py          # A* pathfinder
 │   │   ├── observer.py             # World state observation
 │   │   └── rcon.py                 # Async RCON client (optional fallback)
 │   ├── llm/
 │   │   ├── client.py               # LLM abstraction (5 providers)
 │   │   ├── prompts.py              # System prompts & state formatting
 │   │   └── models.py               # Pydantic data models
-│   └── bridge/
-│       ├── orchestrator.py         # Main agent loop
-│       ├── goal_manager.py         # Goal decomposition & tracking
-│       ├── memory.py               # Short + long-term memory
-│       ├── chat_commands.py        # Incoming chat command parser
-│       └── inventory_manager.py    # Structured inventory tracking
+│   ├── bridge/
+│   │   ├── orchestrator.py         # Main agent loop
+│   │   ├── goal_manager.py         # Goal decomposition & tracking
+│   │   ├── memory.py               # Short + long-term memory
+│   │   ├── chat_commands.py        # Incoming chat command parser
+│   │   └── inventory_manager.py    # Structured inventory tracking
+│   ├── runtime/
+│   │   ├── action_service.py       # Shared action gate, audit, idempotency
+│   │   ├── authz.py                # Credentials, scopes, controller sessions
+│   │   ├── controller_service.py   # Controller API for one bot
+│   │   ├── safety_supervisor.py    # Independent safety reflexes
+│   │   ├── event_journal.py        # Durable event journal
+│   │   ├── tasks.py, task_runner.py # Durable bounded task plans
+│   │   └── webhooks.py             # Signed webhook delivery
+│   └── transport/
+│       ├── mcp_server.py           # MCP tools over ControllerService
+│       └── mcp_main.py             # minecraft-ai-bridge-mcp entry point
 ├── tests/
-│   ├── conftest.py                 # MockMcpqClient, fixtures (328 lines)
-│   ├── test_actions.py             # 24 action handler unit tests
-│   ├── test_observer.py            # NBT parsing, inventory parsing
-│   ├── test_memory.py              # Short/long-term memory tests
-│   ├── test_goal_manager.py        # Goal decomposition & fallback plans
-│   ├── test_chat_commands.py       # Chat command parsing tests
-│   ├── test_inventory_manager.py   # Inventory manager tests
-│   └── test_integration.py         # Full agent loop (real MCPQ + real LLM)
+│   ├── conftest.py                 # MockMcpqClient, MockLLMClient, fixtures
+│   ├── test_actions.py             # All 36 action handlers
+│   ├── test_*.py                   # Observer, memory, goals, runtime, MCP, ... (see AGENTS.md)
+│   ├── test_integration.py         # Full agent loop (real MCPQ + real LLM)
+│   └── test_mcp_integration.py     # MCP server end to end against live MCPQ
 ├── docs/
 │   ├── ARCHITECTURE.md             # Deep architecture dive
 │   ├── SETUP.md                    # Detailed installation guide
 │   ├── CLI.md                      # CLI reference
 │   ├── AGENT.md                    # Agent internals
-│   └── EXTENDING.md                # How to extend the bridge
+│   ├── EXTENDING.md                # How to extend the bridge
+│   └── rfcs/                       # RFC-0001..0003 architecture proposals
 ├── examples/
 │   └── goals.yaml                  # Example goals with sub-goals
 └── AGENTS.md                       # AI handoff notes
@@ -400,12 +423,12 @@ pip install -e "."
 
 ## Testing
 
-The project has **333 deterministic tests** plus provider-backed integration tests organized in two tiers:
+The project has **870 deterministic tests** plus 14 live integration tests organized in two tiers:
 
 | Tier | Count | Description | Dependencies |
 |------|-------|-------------|--------------|
-| **Deterministic** | 333 | Action handlers, NBT parsing, memory, goal fallbacks, config, chat commands, inventory manager, observer, and orchestrator behavior | `MockMcpqClient` / `MockLLMClient` |
-| **Integration** | Provider-backed | Full think-act-observe loop and real MCPQ + real LLM | Paper 26.2 build 123 + MCPQ v2.2 + bot plugin + OpenRouter API key |
+| **Deterministic** | 870 | Action handlers, NBT parsing, memory, goal fallbacks, config, chat commands, inventory manager, observer, orchestrator, runtime (action gate, authorization, sessions, safety, events, tasks, webhooks), and MCP adapter | `MockMcpqClient` / `MockLLMClient`; MCP tests need the `[mcp]` extra (in `[dev]`) |
+| **Integration** | 14 | Full think-act-observe loop with real MCPQ + real LLM (12), and `minecraft-ai-bridge-mcp` over stdio and HTTP (2) | Paper 26.2 build 123 + MCPQ v2.2 + bot plugin + OpenRouter API key |
 
 ### Test Infrastructure
 
