@@ -42,6 +42,35 @@ class TestGoalDecomposition:
         root = await gm.set_goal("Mine for diamonds")
         assert len(root.sub_goals) > 0
 
+    @pytest.mark.parametrize(
+        "malformed",
+        [
+            [0.5],
+            ["Gather wood"],
+            [{"step": 1}],
+            [{"description": ""}],
+            [{"description": 3}],
+            [{"description": "Gather wood"}, None],
+            {"description": "Gather wood"},
+        ],
+    )
+    async def test_malformed_llm_decomposition_uses_fallback(self, gm, mock_llm, malformed):
+        mock_llm.set_decompose_return(malformed)
+        fallback = await GoalManager(llm_client=None).set_goal("Explore")
+
+        root = await gm.set_goal("Explore")
+
+        assert [sg.description for sg in root.sub_goals] == [
+            sg.description for sg in fallback.sub_goals
+        ]
+        assert gm.current_goal == root.sub_goals[0].description
+
+    async def test_desc_alias_and_missing_step(self, gm, mock_llm):
+        mock_llm.set_decompose_return([{"desc": "Gather wood"}, {"description": "Craft planks"}])
+        root = await gm.set_goal("Build a house")
+        assert [sg.description for sg in root.sub_goals] == ["Gather wood", "Craft planks"]
+        assert [sg.priority for sg in root.sub_goals] == [1, 2]
+
     async def test_set_from_subgoals(self, gm):
         root = gm.set_goal_from_subgoals(
             "Test",

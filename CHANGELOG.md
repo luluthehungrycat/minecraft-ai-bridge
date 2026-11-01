@@ -63,6 +63,10 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
 
 ### Fixed
 
+- A malformed LLM goal decomposition (for example a list of numbers, or
+  sub-goals without a description) no longer crashes the agent at startup
+  with `AttributeError`; it is rejected and the built-in fallback plan is
+  used instead.
 - `!follow` now rejects targets that are not plain Minecraft usernames (such as
   `@a` selectors) and replies with an error, and follow mode never runs its
   position read with an unvalidated target (#21).
