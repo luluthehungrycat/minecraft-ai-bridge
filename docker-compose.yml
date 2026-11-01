@@ -34,9 +34,11 @@ services:
       - ./mcpq-config/config.yml:/data/plugins/mcpq/config.yml
       - mc-world:/data
     healthcheck:
-      # Check Paper's actual Minecraft port (25565) as a reliable
-      # indicator the server + all plugins are up.
-      test: ["CMD", "bash", "-c", "echo -n > /dev/tcp/localhost/25565"]
+      # mc-health ships with the itzg image and pings the Minecraft port
+      # (25565), a reliable indicator the server and plugins are up. Keep it
+      # a single argument: podman-compose 1.3.0 joins multi-argument CMD
+      # healthchecks into one broken shell word.
+      test: ["CMD", "mc-health"]
       interval: 20s
       timeout: 5s
       retries: 15
