@@ -63,6 +63,10 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
 
 ### Fixed
 
+- The Paper server healthcheck now uses the image's `mc-health` probe. Under
+  `compose.podman.yml`, podman-compose 1.3.0 mangled the previous
+  multi-argument `bash` probe, so the server never became healthy and the
+  `bridge` service never started. Docker Compose was not affected.
 - `!follow` now rejects targets that are not plain Minecraft usernames (such as
   `@a` selectors) and replies with an error, and follow mode never runs its
   position read with an unvalidated target (#21).
