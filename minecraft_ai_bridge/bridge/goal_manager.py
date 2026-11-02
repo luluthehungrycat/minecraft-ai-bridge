@@ -320,13 +320,20 @@ class GoalManager:
 
         if self._llm:
             logger.info("Decomposing goal: %s", description)
-            subgoals = await self._llm.decompose_goal(description)
+            raw_subgoals = await self._llm.decompose_goal(description)
+            subgoals = self._well_formed_subgoals(raw_subgoals)
+            if subgoals is None:
+                logger.warning(
+                    "LLM decomposition is malformed (expected a list of objects with a "
+                    "description); trying fallback decomposition."
+                )
+                subgoals = []
             if subgoals and not self._looks_hallucinated(description, subgoals):
-                for sg_data in subgoals:
-                    desc = sg_data.get("description", sg_data.get("desc", "Unknown sub-goal"))
+                for i, sg_data in enumerate(subgoals):
+                    step = sg_data.get("step")
                     sg = AgentGoal(
-                        description=desc,
-                        priority=sg_data.get("step", 0),
+                        description=self._subgoal_description(sg_data),
+                        priority=step if type(step) is int else i + 1,
                         depth=1,
                         parent_goal=description,
                     )
@@ -352,6 +359,31 @@ class GoalManager:
 
         self._current = self._root.active_sub_goal or self._root
         return self._root
+
+    @staticmethod
+    def _subgoal_description(sg_data: dict[str, Any]) -> str:
+        """Return a sub-goal's description, accepting the ``desc`` alias."""
+        desc = sg_data.get("description")
+        if isinstance(desc, str) and desc.strip():
+            return desc
+        alias = sg_data.get("desc")
+        return alias if isinstance(alias, str) else ""
+
+    @classmethod
+    def _well_formed_subgoals(cls, subgoals: object) -> list[dict[str, Any]] | None:
+        """Return LLM sub-goals if every item is usable, otherwise ``None``.
+
+        Providers pass the parsed JSON through unchecked, so a model can
+        return any JSON value here (for example ``[0.5]``). One malformed item
+        makes the whole decomposition suspect, so it is rejected rather than
+        partially used.
+        """
+        if not isinstance(subgoals, list):
+            return None
+        for sg_data in subgoals:
+            if not isinstance(sg_data, dict) or not cls._subgoal_description(sg_data).strip():
+                return None
+        return subgoals
 
     def _fallback_decompose(self, description: str) -> None:
         """Match the goal description against hardcoded plans.

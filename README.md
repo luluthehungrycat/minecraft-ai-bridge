@@ -423,11 +423,11 @@ pip install -e "."
 
 ## Testing
 
-The project has **870 deterministic tests** plus 14 live integration tests organized in two tiers:
+The project has **878 deterministic tests** plus 14 live integration tests organized in two tiers:
 
 | Tier | Count | Description | Dependencies |
 |------|-------|-------------|--------------|
-| **Deterministic** | 870 | Action handlers, NBT parsing, memory, goal fallbacks, config, chat commands, inventory manager, observer, orchestrator, runtime (action gate, authorization, sessions, safety, events, tasks, webhooks), and MCP adapter | `MockMcpqClient` / `MockLLMClient`; MCP tests need the `[mcp]` extra (in `[dev]`) |
+| **Deterministic** | 878 | Action handlers, NBT parsing, memory, goal fallbacks, config, chat commands, inventory manager, observer, orchestrator, runtime (action gate, authorization, sessions, safety, events, tasks, webhooks), and MCP adapter | `MockMcpqClient` / `MockLLMClient`; MCP tests need the `[mcp]` extra (in `[dev]`) |
 | **Integration** | 14 | Full think-act-observe loop with real MCPQ + real LLM (12), and `minecraft-ai-bridge-mcp` over stdio and HTTP (2) | Paper 26.2 build 123 + MCPQ v2.2 + bot plugin + OpenRouter API key |
 
 ### Test Infrastructure

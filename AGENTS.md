@@ -114,7 +114,7 @@ examples and the conventions block at the top.
 - **config.yaml volume mount**: Mounted read-only at `/app/config.yaml`. Changes require `docker compose restart bridge`.
 
 ### Code Quality
-- **Tests**: 884 tests collected in total — 870 deterministic unit tests plus 14 integration tests (12 agent-loop, 2 MCP end-to-end). The 61 MCP adapter unit tests and both MCP end-to-end tests need the `mcp` extra (included in `[dev]`) and skip without it. Unit tests use `MockMcpqClient` for deterministic MCPQ simulation. Integration tests use a real MCPQ server + real LLM (OpenRouter `openai/gpt-oss-20b`, or Requesty `runware/gpt-oss-120b` when only `REQUESTY_API_KEY` is set; override with `INTEGRATION_LLM_MODEL`) for end-to-end validation. The stack uses pinned Paper 26.2 build 123. Run with `pytest tests/`.
+- **Tests**: 892 tests collected in total — 878 deterministic unit tests plus 14 integration tests (12 agent-loop, 2 MCP end-to-end). The 61 MCP adapter unit tests and both MCP end-to-end tests need the `mcp` extra (included in `[dev]`) and skip without it. Unit tests use `MockMcpqClient` for deterministic MCPQ simulation. Integration tests use a real MCPQ server + real LLM (OpenRouter `openai/gpt-oss-20b`, or Requesty `runware/gpt-oss-120b` when only `REQUESTY_API_KEY` is set; override with `INTEGRATION_LLM_MODEL`) for end-to-end validation. The stack uses pinned Paper 26.2 build 123. Run with `pytest tests/`.
 - **Mypy**: runs in CI on every push and PR (`mypy minecraft_ai_bridge/ --ignore-missing-imports`) and must pass.
 - **gRPC stubs are synchronous**: MCPQ generated stubs block; dispatched via `asyncio.to_thread`. Not ideal but works.
 - **RCON client is unmaintained**: Since the MCPQ migration, `rcon.py` isn't tested. Consider removing or marking deprecated.
@@ -140,7 +140,7 @@ Some LLMs (especially smaller/local ones) can't reliably output structured JSON 
 
 ### P0: None (Testing Complete)
 The 0.5.0 release completed the testing milestone:
-- **Unit tests** (870): MockMcpqClient covers all 36 actions, observer parsing, memory, goal fallback plans, config, inventory manager, chat commands, pathfinding, the runtime action gate, the safety supervisor, the event journal, webhook delivery, and the local authorization service
+- **Unit tests** (878): MockMcpqClient covers all 36 actions, observer parsing, memory, goal fallback plans, config, inventory manager, chat commands, pathfinding, the runtime action gate, the safety supervisor, the event journal, webhook delivery, and the local authorization service
 - **Integration tests** (12): Full think-act-observe loop with real MCPQ server + real LLM inference (OpenRouter `openai/gpt-oss-20b`). Covers teleport, exploration, disconnect handling, fallback decomposition, failure counting, memory recording, chat command stop, and inventory creation.
 - **Goal-verification assertions**: Integration tests verify agent behavior via:
   - `action_taken(orch, *names) → bool` — checks if the agent performed a specific action (parses `MemoryEntry.raw`)
@@ -216,7 +216,7 @@ The 0.5.0 release completed the testing milestone:
 | `docker-compose.yml` | Paper server + bridge services |
 | `docs/*.md` | Full documentation set |
 | `tests/conftest.py` | MockMcpqClient, MockLLMClient, test fixtures |
-| `tests/test_*.py` | Unit + integration tests (884 total: 870 unit + 14 integration) |
+| `tests/test_*.py` | Unit + integration tests (892 total: 878 unit + 14 integration) |
 | `AGENTS.md` | This file |
 
 ## Environment Info
@@ -256,7 +256,7 @@ Helpers in `tests/test_integration.py`:
 | `tests/test_self_preservation.py` | 61 | Self-preservation reflex heuristics and dispatch |
 | `tests/test_observer.py` | 43 | NBT parsing, inventory parsing, observation formatting |
 | `tests/test_memory.py` | 25 | Short/long-term memory, dedup, persistence |
-| `tests/test_goal_manager.py` | 39 | Goal decomposition, fallback plans patterns |
+| `tests/test_goal_manager.py` | 47 | Goal decomposition, malformed LLM decompositions, fallback plans patterns |
 | `tests/test_chat_commands.py` | 32 | Chat command parsing and dispatch |
 | `tests/test_prompts.py` | 17 | Prompt and state formatting |
 | `tests/test_inventory_manager.py` | 12 | Inventory manager slot tracking |
