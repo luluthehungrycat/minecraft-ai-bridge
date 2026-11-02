@@ -25,6 +25,8 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-11-02
+
 ### Added
 
 - `minecraft-ai-bridge-mcp` runs durable tasks: `minecraft_create_task`
