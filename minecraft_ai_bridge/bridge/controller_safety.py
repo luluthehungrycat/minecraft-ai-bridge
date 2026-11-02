@@ -13,6 +13,9 @@ consumes each intervention itself:
   returns, so controller actions are blocked only while a reflex runs.
 - Each intervention is journaled as a ``safety.intervened`` event attributed
   to the Steve, which the controller can poll.
+- Health and hunger changes seen by the same polling are journaled as
+  ``steve.damaged``, ``steve.health_low``, and ``steve.hunger_low`` events
+  (see ``runtime.condition_events``).
 
 Flee and find-food advice needs a goal tree, so it is not given; a threat
 too large to fight falls back to the reflex attack. This is in-process
@@ -27,6 +30,7 @@ from collections.abc import Callable
 
 from ..minecraft.actions import ActionResult
 from ..minecraft.observer import Observer, WorldState
+from ..runtime.condition_events import ConditionEventDetector
 from ..runtime.contracts import Event
 from ..runtime.controller_service import ControllerService
 from ..runtime.safety_supervisor import SafetySupervisor
@@ -69,6 +73,10 @@ class ControllerSafety:
             interval=interval,
             event_sink=event_sink,
             steve_id=controller.steve_id,
+            condition_events=ConditionEventDetector(
+                self._preservation.config.condition_event_config(),
+                steve_id=controller.steve_id,
+            ),
         )
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None

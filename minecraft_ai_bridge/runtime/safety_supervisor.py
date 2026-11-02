@@ -6,11 +6,13 @@ import asyncio
 import contextlib
 import inspect
 import logging
+from collections import deque
 from collections.abc import Awaitable, Callable
 from uuid import uuid4
 
 from ..minecraft.actions import ActionResult, ActionType
 from ..minecraft.observer import WorldState
+from .condition_events import ConditionEventDetector
 from .contracts import Event, EventSeverity
 
 logger = logging.getLogger(__name__)
@@ -20,6 +22,9 @@ _SAFETY_EVENT_SOURCE = "builtin_safety_supervisor"
 _SAFETY_EVENT_ACTIONS = frozenset(
     {ActionType.ATTACK.value, ActionType.EAT.value, ActionType.HEAL.value}
 )
+# Condition events are rate-limited at the source (edge triggers and a damage
+# cooldown), so this only fills if the journal stalls for minutes.
+_MAX_PENDING_CONDITION_EVENTS = 64
 
 
 class SafetySupervisor:
@@ -41,6 +46,7 @@ class SafetySupervisor:
         on_intervention_consumed: Callable[[], None] | None = None,
         event_sink: Callable[[Event], int | Awaitable[int]] | None = None,
         steve_id: str | None = None,
+        condition_events: ConditionEventDetector | None = None,
     ) -> None:
         if interval <= 0:
             raise ValueError("safety supervisor interval must be positive")
@@ -60,6 +66,12 @@ class SafetySupervisor:
         self._coalesced_failed_action: str | None = None
         self._pending: ActionResult | None = None
         self._intervention_ready = asyncio.Event()
+        # Health/hunger condition events from each observation, written by
+        # one detached task in order. Only used with an event sink.
+        self._conditions = condition_events if event_sink is not None else None
+        self._condition_queue: deque[Event] = deque()
+        self._condition_writer: asyncio.Task[None] | None = None
+        self._condition_dropped = 0
 
     async def run(self, stop_event: asyncio.Event) -> None:
         """Poll independently until asked to stop; isolate per-tick failures."""
@@ -67,6 +79,7 @@ class SafetySupervisor:
         while not stop_event.is_set():
             try:
                 world = await self._observe()
+                self._record_condition_events(world)
                 if stop_event.is_set():
                     break
                 result = await self._evaluate(world)
@@ -131,6 +144,34 @@ class SafetySupervisor:
         write_task = asyncio.create_task(self._write_events(event))
         self._event_writes.add(write_task)
         write_task.add_done_callback(self._event_writes.discard)
+
+    def _record_condition_events(self, world: WorldState) -> None:
+        """Queue this observation's condition events without awaiting the journal."""
+
+        if self._conditions is None:
+            return
+        try:
+            events = self._conditions.observe(world, asyncio.get_running_loop().time())
+        except Exception:
+            logger.exception("Condition event detection failed")
+            return
+        for event in events:
+            if len(self._condition_queue) >= _MAX_PENDING_CONDITION_EVENTS:
+                self._condition_queue.popleft()
+                self._condition_dropped += 1
+                logger.warning(
+                    "Event journal is not keeping up; dropped %d condition event(s) so far",
+                    self._condition_dropped,
+                )
+            self._condition_queue.append(event)
+        if self._condition_queue and (
+            self._condition_writer is None or self._condition_writer.done()
+        ):
+            self._condition_writer = asyncio.create_task(self._write_condition_events())
+
+    async def _write_condition_events(self) -> None:
+        while self._condition_queue:
+            await self._append_event(self._condition_queue.popleft())
 
     async def _write_events(self, event: Event) -> None:
         current: Event | None = event
@@ -198,13 +239,15 @@ class SafetySupervisor:
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("Failed to record safety intervention event in journal")
+            logger.exception("Failed to record %s event in journal", event.type)
 
     async def close(self) -> None:
         """Wait for outstanding event writes without blocking the safety path."""
 
         if self._event_writes:
             await asyncio.gather(*list(self._event_writes))
+        if self._condition_writer is not None:
+            await self._condition_writer
 
     def take_nowait(self) -> ActionResult | None:
         """Return and clear the pending intervention, if one is available."""

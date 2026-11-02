@@ -1,8 +1,7 @@
 """Deterministic tests for durable safety intervention event publication.
 
-Scope note: this slice covers the `safety.intervened` producer only.
-Other RFC-0001 event producers (attacked, starvation, death, backend
-disconnect, task lifecycle, ...) remain unimplemented.
+Scope note: this file covers the `safety.intervened` producer. Condition
+events (`steve.damaged`, `steve.*_low`) are tested in test_condition_events.py.
 """
 
 from __future__ import annotations
@@ -466,9 +465,11 @@ async def test_orchestrator_uses_configured_journal_path_and_closes_it(
     assert journal_path.exists()
     reopened = EventJournal(journal_path)
     records = reopened.get_events("consumer-a")
-    assert len(records) == 1
-    event = records[0].event
-    assert event.type == "safety.intervened"
+    safety_records = [r for r in records if r.event.type == "safety.intervened"]
+    assert len(safety_records) == 1
+    # Critical health is also journaled as a condition event.
+    assert "steve.health_low" in {r.event.type for r in records}
+    event = safety_records[0].event
     assert event.severity is EventSeverity.HIGH
     assert event.payload == {"action": "heal", "success": True}
     reopened.close()
