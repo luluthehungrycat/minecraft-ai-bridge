@@ -1,7 +1,7 @@
 # Project Roadmap
 
 > **Minecraft AI Bridge** - Development Roadmap and Priority Tracking
-> Last Updated: 2026-11-01
+> Last Updated: 2026-11-02
 
 This document outlines the development priorities, completed work, and future plans for the Minecraft AI Bridge project.
 
@@ -9,7 +9,7 @@ This document outlines the development priorities, completed work, and future pl
 
 ## 🎯 Current Status
 
-**Version**: 0.5.1 released 2026-07-11; 0.6.0 unreleased on `master`
+**Version**: 0.6.0 released 2026-11-02
 **Test Coverage**: 878 deterministic tests plus 14 live integration tests (Paper 26.2 build 123/MCPQ, an LLM provider for the agent loop)
 **Overall Health**: ✅ Built-in agent stable; RFC-0001 runtime and MCP controller surface landed through Phase B and most of Phase C
 
@@ -188,7 +188,7 @@ This document outlines the development priorities, completed work, and future pl
 - [x] Bounded prompt context and notable facts
 - [x] Failure hints and one guarded next-turn retry
 
-### v0.6.0 (Next Minor Release)
+### v0.6.0 (Released 2026-11-02)
 **Focus**: CI/CD matrix, survival reflexes, and the RFC-0001 runtime with MCP controllers
 
 - [x] GitHub Actions CI with deterministic unit tests
@@ -198,9 +198,9 @@ This document outlines the development priorities, completed work, and future pl
 - [x] Mob detection and reflex combat
 - [x] Shared action gate, authorization, controller sessions, and `minecraft-ai-bridge-mcp`
 - [x] Independent safety supervisor, durable events, and durable tasks
-- [ ] Live integration run against the Podman stack before tagging
+- [x] Live integration run against the Podman stack before tagging
 
-### v0.7.0
+### v0.7.0 (Next Minor Release)
 **Focus**: Phase C completion, movement, pathfinding, and survival crafting
 
 - [ ] Remaining Phase C event producers and webhook wiring
