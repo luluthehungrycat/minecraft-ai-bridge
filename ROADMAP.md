@@ -10,7 +10,7 @@ This document outlines the development priorities, completed work, and future pl
 ## 🎯 Current Status
 
 **Version**: 0.6.0 released 2026-11-02
-**Test Coverage**: 901 deterministic tests plus 14 live integration tests (Paper 26.2 build 123/MCPQ, an LLM provider for the agent loop)
+**Test Coverage**: 927 deterministic tests plus 14 live integration tests (Paper 26.2 build 123/MCPQ, an LLM provider for the agent loop)
 **Overall Health**: ✅ Built-in agent stable; RFC-0001 runtime and MCP controller surface landed through Phase B and most of Phase C
 
 ---
@@ -62,7 +62,7 @@ This document outlines the development priorities, completed work, and future pl
 - [x] Durable bounded task plans with pause/resume/cancel and restart recovery (#40)
 
 ### Testing
-- [x] 901 deterministic tests passing (MockMcpqClient-based, no server needed)
+- [x] 927 deterministic tests passing (MockMcpqClient-based, no server needed)
 - [x] Integration tests require Docker-provisioned pinned Paper 26.2 build 123/MCPQ and an LLM provider
 - [x] Goal-verification helpers (`actions_taken()`, `position_reached()`)
 
@@ -98,7 +98,7 @@ This document outlines the development priorities, completed work, and future pl
 ### P1: Finish RFC-0001 Phase C (Next)
 - [x] Condition events: `steve.damaged`, `steve.health_low`, `steve.hunger_low`
 - [ ] Damage-source attribution (attacks, creeper damage), death, and unexpected world-change events
-- [ ] Wire webhook subscriptions into admin config and run the sender from `minecraft-ai-bridge-mcp`
+- [x] Wire webhook subscriptions into admin config and run the sender from `minecraft-ai-bridge-mcp`
 - [ ] Live test for the Phase C gate: emergency response without an LLM answer, continuing across an MCP client disconnect; no duplicate mutations from replays across restarts
 
 ### P1: RFC-0001 Phase D — Mineflayer Backend
@@ -204,7 +204,7 @@ This document outlines the development priorities, completed work, and future pl
 ### v0.7.0 (Next Minor Release)
 **Focus**: Phase C completion, movement, pathfinding, and survival crafting
 
-- [ ] Remaining Phase C event producers and webhook wiring
+- [ ] Remaining Phase C event producers
 - [ ] Weapon selection, armor management, and proper crafting/smelting
 
 - [ ] WASD-style movement
@@ -227,7 +227,7 @@ This document outlines the development priorities, completed work, and future pl
 
 ## 🧪 Testing Strategy
 
-### Unit Tests (901 deterministic tests)
+### Unit Tests (927 deterministic tests)
 - **Run in CI**: ✅ Yes (on all pushes/PRs)
 - **Dependencies**: None (MockMcpqClient)
 - **Coverage**: Action handlers, NBT parsing, memory, goals, config, inventory, chat commands, pathfinding, orchestrator recovery, runtime gate, authorization, sessions, safety, events, tasks, webhooks, and the MCP adapter
@@ -269,7 +269,7 @@ This document outlines the development priorities, completed work, and future pl
 
 | Metric | Current | Target (v1.0) |
 |--------|---------|---------------|
-| Unit Test Coverage | 901 tests | Keep growing with features |
+| Unit Test Coverage | 927 tests | Keep growing with features |
 | Integration Tests | 14 tests | 30+ tests |
 | Bug Count | ~5 minor | 0 critical |
 | Documentation | 90% complete | 100% complete |
