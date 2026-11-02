@@ -28,6 +28,7 @@ from .authz import (
 from .authz import (
     ControllerSession as AuthzControllerSession,
 )
+from .condition_events import ConditionEventConfig, ConditionEventDetector
 from .contracts import (
     ActionRequestSchema,
     ActionResultSchema,
@@ -62,6 +63,8 @@ __all__ = [
     "ActionAuditRecord",
     "SqliteActionOutcomeStore",
     "StoredActionOutcome",
+    "ConditionEventConfig",
+    "ConditionEventDetector",
     "ControllerService",
     "ActionClass",
     "ActionOutcome",

@@ -25,6 +25,17 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
 
 ## [Unreleased]
 
+### Added
+
+- The bot's condition is now journaled as events that controllers can poll
+  with `minecraft_get_events`: `steve.damaged` (health dropped by at least
+  1.5 HP; at most one every 2 s, with damage in between added to the next
+  event), `steve.health_low` (health below 4), and `steve.hunger_low` (hunger
+  below 6). The low events fire once per crossing and again after recovering
+  by 2 points. They come from the safety supervisor's existing polling, for
+  both the built-in agent and `minecraft-ai-bridge-mcp`, and use the
+  self-preservation thresholds (#18).
+
 ## [0.6.0] — 2026-11-02
 
 ### Added

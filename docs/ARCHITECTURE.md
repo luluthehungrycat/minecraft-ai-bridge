@@ -486,8 +486,15 @@ Producers are the built-in `SafetySupervisor`, `ControllerService`
 from its durable outbox. For the supervisor: each ordinary
 `safety.intervened` event contains the action name and success flag, using HIGH
 for successful interventions and CRITICAL for failed or denied interventions.
-Writes run off the event loop and are drained during orderly shutdown. Other
-RFC-0001 event producers remain unimplemented. The compact event-ID index
+Writes run off the event loop and are drained during orderly shutdown. The
+supervisor also passes each observation to a `ConditionEventDetector`
+(`runtime/condition_events.py`), which emits `steve.damaged` (rate-limited, with
+damage accumulated across the cooldown) and edge-triggered `steve.health_low` /
+`steve.hunger_low` events with hysteresis, using the preservation thresholds.
+They are written in order by one detached task from a queue capped at 64 events;
+if the journal stalls that long, the oldest are dropped and logged. Damage-source
+attribution (attacks, creepers), world-change, death, and backend events remain
+unimplemented. The compact event-ID index
 grows with unique IDs even though event payload retention is bounded.
 If the journal sink is slow, the safety producer keeps one write in flight and
 coalesces pending safety-event reporting into one bounded summary. The summary

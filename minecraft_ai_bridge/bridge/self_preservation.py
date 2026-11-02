@@ -49,6 +49,7 @@ from ..minecraft.actions import (
 )
 from ..minecraft.observer import InventorySlot, WorldState
 from ..runtime import ActionService, WorldAdapter
+from ..runtime.condition_events import ConditionEventConfig
 
 if TYPE_CHECKING:
     from .goal_manager import GoalManager
@@ -89,6 +90,14 @@ class PreservationConfig:
     enable_auto_consume: bool = True
     enable_auto_heal: bool = True
     enable_day_night_awareness: bool = True
+
+    def condition_event_config(self) -> ConditionEventConfig:
+        """Condition-event thresholds matching these reflex thresholds."""
+        return ConditionEventConfig(
+            min_damage=self.sudden_health_drop,
+            health_low_threshold=self.health_critical_threshold,
+            hunger_low_threshold=float(self.hunger_critical_threshold),
+        )
 
 
 # Result of a threat assessment.  Used to decide fight-vs-flee.
@@ -141,6 +150,11 @@ class SelfPreservationLayer:
         # Last seen health — used to detect sudden drops. None means
         # the first observation hasn't happened yet.
         self._previous_health: float | None = None
+
+    @property
+    def config(self) -> PreservationConfig:
+        """The thresholds and feature flags this layer runs with."""
+        return self._config
 
     def _remember(self, fact: str) -> None:
         if self._memory is not None:

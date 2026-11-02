@@ -179,6 +179,19 @@ resumes at the oldest retained event and returns `reset: true`.
 
 Safety reflexes run continuously beside the MCP transport, including with
 no controller session. `safety.intervened` events carry this Steve's ID.
+
+The same polling records the bot's condition, also attributed to this Steve:
+
+| Event | When | Payload |
+|-------|------|---------|
+| `steve.damaged` | Health dropped by at least 1.5 HP. During sustained damage, at most one event every 2 s; damage taken in between is added to the next event. | `health`, `previous_health`, `amount` (HP lost), `hits` |
+| `steve.health_low` | Health fell below 4 (HIGH). | `health`, `threshold` |
+| `steve.hunger_low` | Hunger fell below 6 (MEDIUM). | `hunger`, `threshold` |
+
+The two `_low` events fire once when the value crosses below the threshold and
+again only after it has recovered by 2 points. `steve.damaged` does not say what
+caused the damage. These events are informational: the reflexes do not wait for
+anyone to read them.
 `SAFETY_PREEMPTED` means the action never reached the backend: inspect fresh
 state and use a new request ID to try again. `SAFETY_INTERRUPTED` means a
 multi-step action stopped after partial progress; inspect state before

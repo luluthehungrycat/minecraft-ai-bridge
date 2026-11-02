@@ -25,6 +25,7 @@ from ..runtime import (
     ActionService,
     AuthzControllerSession,
     AuthzService,
+    ConditionEventDetector,
     EventJournal,
     McpqWorldAdapter,
     PolicyDecision,
@@ -125,6 +126,7 @@ class Orchestrator:
         # Self-preservation layer — reflex attack + find-food injection
         # Initialised lazily in _connect() once we have an MC client.
         self._preservation: SelfPreservationLayer | None = None
+        self._preservation_config = PreservationConfig()
         self._safety_supervisor: SafetySupervisor | None = None
         self._safety_stop_event: asyncio.Event | None = None
         self._safety_task: asyncio.Task[None] | None = None
@@ -869,6 +871,7 @@ class Orchestrator:
             return
         if self._action_service is not None:
             self._action_service.enable_safety_preemption()
+        steve_id = self._config.authz.steve_id.strip() or None
         self._safety_supervisor = SafetySupervisor(
             self._observe_for_safety,
             self._preservation.evaluate,
@@ -878,7 +881,10 @@ class Orchestrator:
                 else None
             ),
             event_sink=(self._event_journal.append if self._event_journal is not None else None),
-            steve_id=self._config.authz.steve_id.strip() or None,
+            steve_id=steve_id,
+            condition_events=ConditionEventDetector(
+                self._preservation_config.condition_event_config(), steve_id=steve_id
+            ),
         )
         self._safety_stop_event = asyncio.Event()
         self._safety_task = asyncio.create_task(
@@ -1137,7 +1143,7 @@ class Orchestrator:
             mc=self._world,
             goal_manager=self._goals,
             memory=self._memory,
-            config=PreservationConfig(),
+            config=self._preservation_config,
             action_service=self._action_service,
             safety_authority=self._safety_action_authority,
         )

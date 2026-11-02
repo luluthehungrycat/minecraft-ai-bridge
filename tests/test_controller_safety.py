@@ -132,10 +132,13 @@ async def test_polling_journals_attributed_intervention_and_stops(setup, tmp_pat
             "AIBot", "owner", {"events:read"}, admin_token=setup.admin
         ).token
         events = await service.get_events(token)
-        assert events.events
-        event = events.events[0].event
-        assert event.type == "safety.intervened" and event.steve_id == "AIBot"
+        by_type = {record.event.type: record.event for record in events.events}
+        event = by_type["safety.intervened"]
+        assert event.steve_id == "AIBot"
         assert event.payload["action"] == "eat"
+        # The same polling journals the condition that triggered the reflex.
+        hunger = by_type["steve.hunger_low"]
+        assert hunger.steve_id == "AIBot" and hunger.payload["hunger"] == 2
         assert not service.action_service._safety_preemption_enabled
         assert safety._task is None
     finally:
