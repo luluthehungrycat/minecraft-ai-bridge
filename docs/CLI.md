@@ -214,6 +214,43 @@ current session. A task paused with `OUTCOME_UNKNOWN` cannot resume: check the
 world, cancel it, and create a new plan. Task progress is also published as
 `task.*` events.
 
+### Webhooks
+
+`minecraft-ai-bridge-mcp` can also push every journaled event (safety,
+condition, controller, and task events) to HTTPS endpoints you configure. There
+is no tool or endpoint to add subscriptions; they come only from the
+`webhooks` section of `config.yaml`, and each signing secret comes from the
+environment variable its `secret_env` names, never from the file:
+
+```yaml
+webhooks:
+  database_path: data/webhooks.sqlite3   # delivery state, retries, dead letters
+  poll_interval: 1.0                     # seconds between checks when idle
+  subscriptions:
+    - id: ops
+      url: https://hooks.example.com/minecraft
+      secret_env: OPS_WEBHOOK_SECRET     # at least 32 bytes
+      event_types: [safety.intervened, steve.health_low]   # omit for all events
+      # allowed_hosts: [hooks.example.com]   # default: the URL's host
+      # events_per_minute: 60
+      # max_attempts: 8
+      # initial_retry_seconds: 1.0
+      # max_retry_seconds: 300.0
+```
+
+The whole list can also be set as JSON in `WEBHOOKS_SUBSCRIPTIONS`. A missing
+secret or an invalid URL stops the server at startup, before it connects.
+
+Each subscription receives events in journal order, one at a time, retried
+with doubling backoff until it answers 2xx or runs out of attempts (then the
+event is dead-lettered and the next one is sent). Delivery is at least once,
+and delivery state survives restarts: events journaled while the server was
+down are sent when it starts again. URLs must be HTTPS on port 443 and resolve
+to public addresses. Requests are signed: verify `X-Webhook-Signature`
+(`sha256=` + hex HMAC-SHA256 of `X-Webhook-Timestamp` + `.` + the raw body) and
+deduplicate on `X-Webhook-Delivery-Id`. See
+[ARCHITECTURE.md](ARCHITECTURE.md#outbound-webhook-delivery) for the details.
+
 Example stdio client configuration:
 
 ```json

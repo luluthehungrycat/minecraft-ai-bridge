@@ -13,7 +13,9 @@ The Steve, MCPQ connection, and Authz database come from ``config.yaml``
 world-admin token is read only from ``AUTHZ_WORLD_ADMIN_TOKEN``. The bot
 entity must already exist in the world; this server does not summon it. The
 bot's safety reflexes (attack, eat, heal) run for as long as the server does
-and preempt controller actions while they act.
+and preempt controller actions while they act. Webhook subscriptions in the
+config's ``webhooks`` section receive the event journal for as long as the
+server runs.
 """
 
 from __future__ import annotations
@@ -24,7 +26,7 @@ import ipaddress
 import logging
 import os
 import sys
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, suppress
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -167,6 +169,8 @@ async def serve(args: argparse.Namespace, config: AppConfig) -> None:
         EventJournal,
         SqliteActionOutcomeStore,
         SqliteTaskStore,
+        WebhookService,
+        webhook_subscriptions,
     )
     from ..runtime.controller_service import ReachLimits
     from ..runtime.world_adapter import McpqWorldAdapter
@@ -179,6 +183,9 @@ async def serve(args: argparse.Namespace, config: AppConfig) -> None:
     stdio_token = os.environ.get(STDIO_TOKEN_ENV, "").strip() or None
     if args.transport == "stdio" and stdio_token is None:
         raise ValueError(f"stdio transport requires the {STDIO_TOKEN_ENV} environment variable")
+    # Validated before anything opens: a missing secret or bad URL is a
+    # configuration error, not something to discover after connecting.
+    subscriptions = webhook_subscriptions(config.webhooks)
 
     # Each resource registers its cleanup as soon as it exists, so a failure
     # at any later step (or in another cleanup) still closes everything
@@ -197,6 +204,18 @@ async def serve(args: argparse.Namespace, config: AppConfig) -> None:
         stack.callback(store.close)
         journal = EventJournal(args.event_journal or config.bridge.event_journal_path)
         stack.callback(journal.close)
+        if subscriptions:
+            webhook_db = Path(config.webhooks.database_path)
+            webhook_db.parent.mkdir(parents=True, exist_ok=True)
+            webhooks = WebhookService(journal, str(webhook_db), subscriptions=subscriptions)
+            stack.callback(webhooks.close)
+            sender = asyncio.create_task(
+                webhooks.run(interval=config.webhooks.poll_interval), name="webhook-sender"
+            )
+            sender.add_done_callback(_report_sender_exit)
+            # Stops before the journal and its database close.
+            stack.push_async_callback(_stop_task, sender)
+            logger.info("Delivering events to %d webhook subscription(s)", len(subscriptions))
         tasks = SqliteTaskStore(args.task_store)
         stack.callback(tasks.close)
         safety_authority = object()
@@ -238,6 +257,23 @@ async def serve(args: argparse.Namespace, config: AppConfig) -> None:
                     args.host, args.allowed_host, args.allowed_origin
                 ),
             )
+
+
+def _report_sender_exit(task: asyncio.Task[None]) -> None:
+    if not task.cancelled() and task.exception() is not None:
+        logger.error(
+            "Webhook sender stopped; events stay journaled and are delivered after a restart",
+            exc_info=task.exception(),
+        )
+
+
+async def _stop_task(task: asyncio.Task[None]) -> None:
+    if task.done():
+        # Already finished; _report_sender_exit logged any failure.
+        return
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
 
 
 def main(argv: list[str] | None = None) -> None:

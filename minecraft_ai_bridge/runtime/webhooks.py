@@ -11,21 +11,28 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import logging
 import math
+import os
 import socket
 import sqlite3
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 from urllib.parse import urlsplit
 from uuid import UUID, uuid5
 
 import httpx
 
 from .event_journal import EventCursorExpiredError, EventJournal
+
+if TYPE_CHECKING:
+    from ..config import WebhooksConfig
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "WebhookDelivery",
@@ -34,12 +41,15 @@ __all__ = [
     "PinnedWebhookTransport",
     "WebhookService",
     "WebhookSubscription",
+    "webhook_subscriptions",
 ]
 
 _DELIVERY_NAMESPACE = UUID("a5870ad5-4dab-4a1a-9684-88da266770d3")
 _DNS_WORKER_LIMIT = 1
 _DNS_CAPACITY = threading.BoundedSemaphore(_DNS_WORKER_LIMIT)
 _MAX_PINNED_ADDRESSES = 16
+# Filtered-out journal events one delivery pass may skip per subscription.
+_MAX_SKIPPED_PER_PASS = 256
 _WEBHOOK_TIMEOUT_SECONDS = 10.0
 _HTTP_CAPACITY = threading.BoundedSemaphore(4)
 _ID_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
@@ -432,12 +442,15 @@ class WebhookService:
 
     def _ensure_pending(self, subscription: WebhookSubscription) -> None:
         consumer = f"webhook-{subscription.subscription_id}"
-        try:
-            records = self.journal.get_events(consumer, limit=1)
-        except EventCursorExpiredError:
-            self._reset_expired_consumer(subscription, consumer)
-            records = self.journal.get_events(consumer, limit=1)
-        for record in records:
+        for _ in range(_MAX_SKIPPED_PER_PASS):
+            try:
+                records = self.journal.get_events(consumer, limit=1)
+            except EventCursorExpiredError:
+                self._reset_expired_consumer(subscription, consumer)
+                records = self.journal.get_events(consumer, limit=1)
+            if not records:
+                return
+            record = records[0]
             if (
                 subscription.event_types is not None
                 and record.event.type not in subscription.event_types
@@ -445,7 +458,7 @@ class WebhookService:
                 # This is the journal head, so skipping it cannot cross an older
                 # pending delivery.
                 self._ack_cursor(subscription, consumer, record.cursor)
-                return
+                continue
             delivery_id = self._delivery_id(subscription.subscription_id, record.event.event_id)
             self._db.execute(
                 """INSERT OR IGNORE INTO webhook_deliveries
@@ -578,6 +591,25 @@ class WebhookService:
         """Serialize a delivery pass and return the number of HTTP attempts."""
         async with self._run_lock:
             return await self._run_once()
+
+    async def run(self, *, interval: float = 1.0) -> None:
+        """Deliver until cancelled.
+
+        Passes repeat immediately while they send something and otherwise
+        wait ``interval`` seconds, so a backlog drains at the subscriptions'
+        rate limits and an idle journal is polled once per interval. A
+        failing pass (for example a locked database) is logged and retried
+        after the interval; it never stops the sender.
+        """
+        if not _finite_positive_number(interval):
+            raise WebhookError("webhook poll interval must be finite and positive")
+        while True:
+            try:
+                attempts = await self.run_once()
+            except (sqlite3.Error, OSError):
+                logger.exception("Webhook delivery pass failed; retrying")
+                attempts = 0
+            await asyncio.sleep(0 if attempts else interval)
 
     async def _run_once(self) -> int:
         """Attempt due deliveries while this service owns its pass lock."""
@@ -718,3 +750,46 @@ class WebhookService:
                 delivery.delivery_id,
             ),
         )
+
+
+def webhook_subscriptions(
+    config: WebhooksConfig, environ: Mapping[str, str] | None = None
+) -> list[WebhookSubscription]:
+    """Build validated subscriptions from the ``webhooks`` config section.
+
+    Each subscription's signing secret is read from the environment variable
+    its ``secret_env`` names (UTF-8, at least 32 bytes). An empty
+    ``allowed_hosts`` allows only the URL's own host.
+    """
+    env = os.environ if environ is None else environ
+    subscriptions = []
+    for item in config.subscriptions:
+        secret = env.get(item.secret_env, "")
+        if not secret:
+            raise WebhookError(
+                f"webhook {item.id!r}: environment variable {item.secret_env} is not set"
+            )
+        try:
+            hostname = urlsplit(item.url).hostname
+        except ValueError:
+            hostname = None
+        allowed = item.allowed_hosts or ([hostname] if hostname else [])
+        try:
+            subscriptions.append(
+                WebhookSubscription(
+                    subscription_id=item.id,
+                    url=item.url,
+                    secret=secret.encode("utf-8"),
+                    allowed_hosts=frozenset(allowed),
+                    events_per_minute=item.events_per_minute,
+                    max_attempts=item.max_attempts,
+                    initial_retry_seconds=item.initial_retry_seconds,
+                    max_retry_seconds=item.max_retry_seconds,
+                    event_types=(
+                        frozenset(item.event_types) if item.event_types is not None else None
+                    ),
+                )
+            )
+        except WebhookError as exc:
+            raise WebhookError(f"webhook {item.id!r}: {exc}") from exc
+    return subscriptions

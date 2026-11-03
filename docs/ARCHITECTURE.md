@@ -503,7 +503,7 @@ summary at CRITICAL severity and is represented as a failed action, even when
 a later intervention succeeds. This bounds event backlog without erasing a
 critical failure behind a later success.
 
-### Outbound webhook delivery (local service slice)
+### Outbound webhook delivery
 
 `runtime.WebhookService` layers administrator-supplied
 `WebhookSubscription` values over the journal. There is no subscription
@@ -543,9 +543,19 @@ custom `PinnedWebhookTransport` remains a trusted security boundary; the
 service cannot inspect whether an injected implementation honors its contract.
 DNS and transport errors are recorded and retried under the configured policy
 without falling back to ordinary hostname resolution. Endpoint allowlisting is
-not authorization for who may configure subscriptions. External controller
-authorization and admin configuration integration remain absent; this bounded
-local service does not complete RFC-0001 Phase C.
+not authorization for who may configure subscriptions: only whoever controls
+the config file and environment can.
+
+`minecraft-ai-bridge-mcp` builds subscriptions from the `webhooks` config
+section (`webhook_subscriptions()`; each secret is read from the environment
+variable named by `secret_env`, and an omitted `allowed_hosts` means the URL's
+own host) and runs `WebhookService.run()` as a background task for the life of
+the server. A pass that sends something is followed immediately by another;
+otherwise the sender waits `poll_interval` seconds. A pass that fails with a
+database or OS error is logged and retried; any other crash is logged, events
+stay journaled, and delivery resumes after a restart. Within one pass a
+subscription skips up to 256 consecutive events its `event_types` filter
+excludes. The built-in agent does not run the sender.
 
 DNS lookup uses a single process-wide daemon worker with nonblocking admission,
 so saturation cannot accumulate queued resolver jobs or threads. At capacity a

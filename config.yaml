@@ -35,6 +35,15 @@ bridge:
 
 # Optional local AuthzService gate for the built-in controller. Keep the
 # bearer tokens in environment variables, never in this YAML file.
+# Outbound webhooks (minecraft-ai-bridge-mcp only). Each secret is read from
+# the environment variable named by secret_env. See docs/CLI.md.
+# webhooks:
+#   database_path: data/webhooks.sqlite3
+#   subscriptions:
+#     - id: ops
+#       url: https://hooks.example.com/minecraft
+#       secret_env: OPS_WEBHOOK_SECRET
+
 authz:
   enabled: false
   database_path: data/authz.sqlite3

@@ -35,6 +35,14 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
   by 2 points. They come from the safety supervisor's existing polling, for
   both the built-in agent and `minecraft-ai-bridge-mcp`, and use the
   self-preservation thresholds (#18).
+- `minecraft-ai-bridge-mcp` delivers journaled events to webhooks configured
+  in a new `webhooks` section of `config.yaml` (or `WEBHOOKS_SUBSCRIPTIONS`).
+  Each subscription names the environment variable holding its signing
+  secret; secrets in the file are rejected. Delivery runs for the life of the
+  server, is signed, retried with backoff, dead-lettered after
+  `max_attempts`, and resumes across restarts. A missing secret or invalid URL
+  fails at startup. An `event_types` filter now skips a run of non-matching
+  events in one pass instead of one per poll (#18).
 
 ## [0.6.0] — 2026-11-02
 

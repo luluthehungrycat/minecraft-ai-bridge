@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
 
@@ -470,6 +472,8 @@ def _install_fakes(monkeypatch, stage: _Stage) -> None:
     class FakeServer:
         async def run_streamable_http_async(self, **kwargs):
             stage.http_kwargs = kwargs
+            # Let background tasks (the webhook sender) start, as serving would.
+            await asyncio.sleep(0)
             stage.check("run")
 
     def fake_build(_controller, **_kwargs):
@@ -532,6 +536,112 @@ async def test_serve_closes_everything_it_opened(monkeypatch, tmp_path, fail_at,
 
     closes = [event.replace("open", "close") for event in reversed(OPENED[:opened])]
     assert stage.events == OPENED[:opened] + closes
+
+
+def _webhook_config(tmp_path) -> AppConfig:
+    from minecraft_ai_bridge.config import WebhookSubscriptionConfig
+
+    config = AppConfig()
+    config.authz.steve_id = "AIBot"
+    config.webhooks.database_path = str(tmp_path / "hooks" / "webhooks.sqlite3")
+    config.webhooks.subscriptions = [
+        WebhookSubscriptionConfig(
+            id="ops", url="https://hooks.example.test/mc", secret_env="OPS_HOOK_SECRET"
+        )
+    ]
+    return config
+
+
+async def test_serve_runs_configured_webhooks_until_shutdown(monkeypatch, tmp_path):
+    from minecraft_ai_bridge import runtime
+
+    stage = _Stage(None)
+    _install_fakes(monkeypatch, stage)
+    created = {}
+
+    class FakeWebhooks:
+        def __init__(self, journal, db_path, *, subscriptions):
+            created.update(journal=journal, db_path=db_path, subscriptions=subscriptions)
+            stage.events.append("webhooks.open")
+
+        async def run(self, *, interval):
+            created["interval"] = interval
+            stage.events.append("sender.open")
+            try:
+                await asyncio.Event().wait()
+            finally:
+                stage.events.append("sender.close")
+
+        def close(self):
+            stage.events.append("webhooks.close")
+
+    monkeypatch.setattr(runtime, "WebhookService", FakeWebhooks)
+    monkeypatch.setenv("OPS_HOOK_SECRET", "s" * 32)
+    args = build_parser().parse_args(
+        ["--transport", "http", "--outcome-store", str(tmp_path / "o.sqlite3")]
+    )
+    config = _webhook_config(tmp_path)
+
+    await serve(args, config)
+
+    assert [s.subscription_id for s in created["subscriptions"]] == ["ops"]
+    assert created["db_path"] == config.webhooks.database_path
+    assert Path(created["db_path"]).parent.is_dir()
+    assert created["interval"] == config.webhooks.poll_interval
+    # The sender starts after the journal opens and stops before it closes.
+    related = ("journal", "webhooks", "sender")
+    assert [e for e in stage.events if e.split(".")[0] in related] == [
+        "journal.open",
+        "webhooks.open",
+        "sender.open",
+        "sender.close",
+        "webhooks.close",
+        "journal.close",
+    ]
+
+
+async def test_serve_refuses_a_missing_webhook_secret_before_connecting(monkeypatch, tmp_path):
+    stage = _Stage(None)
+    _install_fakes(monkeypatch, stage)
+    monkeypatch.delenv("OPS_HOOK_SECRET", raising=False)
+    args = build_parser().parse_args(
+        ["--transport", "http", "--outcome-store", str(tmp_path / "o.sqlite3")]
+    )
+
+    with pytest.raises(ValueError, match="OPS_HOOK_SECRET"):
+        await serve(args, _webhook_config(tmp_path))
+    assert stage.events == []
+
+
+async def test_a_crashed_webhook_sender_is_logged_and_does_not_break_shutdown(
+    monkeypatch, tmp_path, caplog
+):
+    from minecraft_ai_bridge import runtime
+
+    stage = _Stage(None)
+    _install_fakes(monkeypatch, stage)
+
+    class CrashingWebhooks:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def run(self, *, interval):
+            raise RuntimeError("sender bug")
+
+        def close(self):
+            stage.events.append("webhooks.close")
+
+    monkeypatch.setattr(runtime, "WebhookService", CrashingWebhooks)
+    monkeypatch.setenv("OPS_HOOK_SECRET", "s" * 32)
+    args = build_parser().parse_args(
+        ["--transport", "http", "--outcome-store", str(tmp_path / "o.sqlite3")]
+    )
+
+    await serve(args, _webhook_config(tmp_path))
+    await asyncio.sleep(0)  # the done-callback that logs runs on the next loop pass
+
+    assert "Webhook sender stopped" in caplog.text
+    assert "webhooks.close" in stage.events and stage.events[-1] == "mc.close"
 
 
 async def test_serve_passes_explicit_transport_security(monkeypatch, tmp_path):

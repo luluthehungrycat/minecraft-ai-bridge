@@ -10,7 +10,7 @@ from typing import Literal, get_origin
 from uuid import UUID
 
 import yaml
-from pydantic import Field, SecretStr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -168,6 +168,52 @@ class ChatControlConfig(BaseSettings):
         return values
 
 
+class WebhookSubscriptionConfig(BaseModel):
+    """One administrator-configured webhook endpoint.
+
+    The HMAC signing secret is never stored in the config file: ``secret_env``
+    names the environment variable that holds it.
+    """
+
+    id: str
+    url: str
+    secret_env: str
+    # Hosts the URL may point at; empty means just the URL's own host.
+    allowed_hosts: list[str] = Field(default_factory=list)
+    # Deliver only these event types; omit to deliver every event.
+    event_types: list[str] | None = None
+    events_per_minute: int = 60
+    max_attempts: int = 8
+    initial_retry_seconds: float = 1.0
+    max_retry_seconds: float = 300.0
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("secret_env")
+    @classmethod
+    def validate_secret_env(cls, value: str) -> str:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
+            raise ValueError("webhook secret_env must be an environment variable name")
+        return value
+
+
+class WebhooksConfig(BaseSettings):
+    """Outbound webhook delivery of journal events (``minecraft-ai-bridge-mcp``)."""
+
+    database_path: str = "data/webhooks.sqlite3"
+    poll_interval: float = 1.0
+    subscriptions: list[WebhookSubscriptionConfig] = Field(default_factory=list)
+
+    model_config = SettingsConfigDict(env_prefix="webhooks_")
+
+    @field_validator("poll_interval")
+    @classmethod
+    def validate_poll_interval(cls, value: float) -> float:
+        if not math.isfinite(value) or not 0 < value <= 60:
+            raise ValueError("webhooks poll_interval must be greater than 0 and at most 60")
+        return value
+
+
 class GoalConfig(BaseSettings):
     default: str = "Explore the world and gather resources"
     max_depth: int = 5
@@ -183,6 +229,7 @@ class AppConfig(BaseSettings):
     authz: AuthzConfig = Field(default_factory=AuthzConfig)
     chat_control: ChatControlConfig = Field(default_factory=ChatControlConfig)
     goals: GoalConfig = Field(default_factory=GoalConfig)
+    webhooks: WebhooksConfig = Field(default_factory=WebhooksConfig)
 
     model_config = SettingsConfigDict(env_prefix="app_")
 
@@ -219,6 +266,7 @@ class AppConfig(BaseSettings):
             "authz",
             "chat_control",
             "goals",
+            "webhooks",
         ):
             yaml_data = raw.get(section_name, {})
             if section_name == "authz":
@@ -226,6 +274,13 @@ class AppConfig(BaseSettings):
                     if secret_field in yaml_data:
                         raise ValueError(
                             f"authz.{secret_field} must be supplied by an environment variable"
+                        )
+            if section_name == "webhooks" and isinstance(yaml_data, dict):
+                for item in yaml_data.get("subscriptions") or []:
+                    if isinstance(item, dict) and "secret" in item:
+                        raise ValueError(
+                            "webhook secrets must be supplied by an environment variable; "
+                            "set secret_env to its name"
                         )
 
             # Gather env-var overrides for this section

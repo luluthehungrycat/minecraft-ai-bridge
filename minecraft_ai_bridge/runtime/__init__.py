@@ -56,6 +56,7 @@ from .webhooks import (
     WebhookError,
     WebhookService,
     WebhookSubscription,
+    webhook_subscriptions,
 )
 from .world_adapter import McpqWorldAdapter, WorldAdapter
 
@@ -109,6 +110,7 @@ __all__ = [
     "PinnedWebhookTransport",
     "WebhookService",
     "WebhookSubscription",
+    "webhook_subscriptions",
 ]
 
 from .tasks import SqliteTaskStore
