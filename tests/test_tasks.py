@@ -593,16 +593,21 @@ async def test_another_controller_can_run_tasks_after_a_paused_task_is_abandoned
 
 
 async def _cancel_after_commit(runtime, monkeypatch, method, call):
-    """Cancel ``call`` after the store ``method`` commits but before it returns."""
+    """Cancel ``call`` after the store ``method`` commits but before it returns.
+
+    Returns what the store method committed.
+    """
     import threading
 
     store = runtime._tasks.store
     committed = threading.Event()
     release = threading.Event()
     original = getattr(store, method)
+    results = []
 
     def slow(*args, **kwargs):
         result = original(*args, **kwargs)
+        results.append(result)
         committed.set()
         assert release.wait(10)
         return result
@@ -616,11 +621,12 @@ async def _cancel_after_commit(runtime, monkeypatch, method, call):
     with pytest.raises(asyncio.CancelledError):
         await pending
     monkeypatch.setattr(store, method, original)
+    return results[0]
 
 
 async def test_a_cancelled_create_still_runs_the_committed_task(runtime, setup, monkeypatch):
     session = await runtime.open_session(setup.controller)
-    await _cancel_after_commit(
+    committed = await _cancel_after_commit(
         runtime,
         monkeypatch,
         "create",
@@ -633,9 +639,11 @@ async def test_a_cancelled_create_still_runs_the_committed_task(runtime, setup, 
             [{"action": "chat", "params": {"message": "ran"}}],
         ),
     )
-    async with asyncio.timeout(3):
-        while setup.world.chat_messages_sent != ["ran"]:
-            await asyncio.sleep(0.01)
+    # Wait for the final checkpoint, not just the chat: the step dispatches
+    # before the task is recorded as succeeded, and until then the Steve
+    # still has a running task.
+    await finished(runtime, setup.controller, committed.task_id, TaskStatus.SUCCEEDED)
+    assert setup.world.chat_messages_sent == ["ran"]
     # Nothing is left pending: the next task is admitted and runs.
     task = await runtime.create_task(
         setup.controller,
