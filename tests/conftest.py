@@ -38,6 +38,8 @@ class MockMcpqClient:
         self._chat_events_backlog: list[Any] = []
         self._hostile_mobs: list[str] = []
         self._hurt_by_entity: bool = True  # default: yes, was hurt by an entity
+        self._attacker_type: str | None = "minecraft:zombie"
+        self._death_messages: list[str] = []
 
     # ── Pre-configuration helpers ─────────────────────────────────────
 
@@ -88,6 +90,14 @@ class MockMcpqClient:
         Default is True (most recent damage was from a mob).
         """
         self._hurt_by_entity = bool(was_hurt_by_entity)
+
+    def set_attacker_type(self, entity_type: str | None) -> None:
+        """Entity type ``get_last_attacker`` reports while hurt by an entity."""
+        self._attacker_type = entity_type
+
+    def add_death_message(self, message: str) -> None:
+        """Queue a death message for the next ``get_death_messages`` call."""
+        self._death_messages.append(message)
 
     # ── Assertions ────────────────────────────────────────────────────
 
@@ -164,6 +174,17 @@ class MockMcpqClient:
         the ``/data get entity @p LastHurtByEntity`` NBT response.
         """
         return getattr(self, "_hurt_by_entity", True)
+
+    async def get_last_attacker(self, max_age_ticks: int = 60):
+        from minecraft_ai_bridge.minecraft.mc_api import LastAttacker
+
+        if not getattr(self, "_hurt_by_entity", True):
+            return None
+        return LastAttacker(entity_type=self._attacker_type, uuid=None, ticks_since=5)
+
+    async def get_death_messages(self) -> list[str]:
+        messages, self._death_messages = self._death_messages, []
+        return messages
 
     async def teleport_player(self, x: float, y: float, z: float) -> None:
         self._pos = (x, y, z)

@@ -885,6 +885,7 @@ class Orchestrator:
             condition_events=ConditionEventDetector(
                 self._preservation_config.condition_event_config(), steve_id=steve_id
             ),
+            world_events=self._world,
         )
         self._safety_stop_event = asyncio.Event()
         self._safety_task = asyncio.create_task(
