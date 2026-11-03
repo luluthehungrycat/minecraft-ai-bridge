@@ -43,6 +43,23 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
   `max_attempts`, and resumes across restarts. A missing secret or invalid URL
   fails at startup. An `event_types` filter now skips a run of non-matching
   events in one pass instead of one per poll (#18).
+- New events: `steve.died` (with the server's death message, such as
+  `AIBot was slain by Zombie`) and `steve.respawned` (with the new position).
+  `steve.damaged` now has a `source`: the attacking entity's type when an
+  entity hurt the bot in the last 3 seconds, otherwise `environment`, or
+  `unknown` if the server could not be asked (#18).
+
+### Fixed
+
+- The bot no longer stays dead forever: the bot plugin respawns a summoned
+  bot one tick after it dies, and `/botsummon` no longer creates a duplicate
+  player when the bot is already online (it respawns a dead one instead).
+  Rebuild the plugin jar (`scripts/download-plugins.sh`) to get this.
+- Detecting that an entity (rather than a fall or fire) hurt the bot works on
+  Paper 26.x, which renamed the NBT field the check read, and the check now
+  targets the bot by name instead of `@p`, the player nearest the command
+  origin. The attack reflex still cannot pick a target on Paper 26.x because
+  `scan_entities` does not find mobs there; that is tracked separately.
 
 ## [0.6.0] — 2026-11-02
 

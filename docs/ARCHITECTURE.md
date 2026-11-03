@@ -492,9 +492,18 @@ supervisor also passes each observation to a `ConditionEventDetector`
 damage accumulated across the cooldown) and edge-triggered `steve.health_low` /
 `steve.hunger_low` events with hysteresis, using the preservation thresholds.
 They are written in order by one detached task from a queue capped at 64 events;
-if the journal stalls that long, the oldest are dropped and logged. Damage-source
-attribution (attacks, creepers), world-change, death, and backend events remain
-unimplemented. The compact event-ID index
+if the journal stalls that long, the oldest are dropped and logged. Given a
+`world_events` source (the `WorldAdapter`), the supervisor also polls MCPQ
+player-death events after each tick's evaluation, journaling `steve.died` with
+the server's death message and arming `steve.respawned` for the next live
+observation (the bot plugin respawns the bot one tick after death, before an
+observation usually sees health 0). Before journaling a `steve.damaged` event,
+the writer adds a `source` from `get_last_attacker()`: Paper 26.x's
+`ticks_since_last_hurt_by_mob` (within 60 ticks) and `last_hurt_by_mob` UUID,
+resolved to a type with MCPQ `getEntityById`; each query is bounded to 2 s and
+a failure yields `{"kind": "unknown"}`. Deaths are not attributed this way
+because the respawn clears the attacker record. Unexpected world-change events
+remain unimplemented. The compact event-ID index
 grows with unique IDs even though event payload retention is bounded.
 If the journal sink is slow, the safety producer keeps one write in flight and
 coalesces pending safety-event reporting into one bounded summary. The summary

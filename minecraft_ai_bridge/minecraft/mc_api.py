@@ -10,7 +10,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
+import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 from mcpq import Minecraft, Vec3
@@ -144,32 +147,73 @@ class McpqClient:
             return (player.pos.x, player.pos.y, player.pos.z)
         return None
 
+    async def get_last_attacker(self, max_age_ticks: int = 60) -> LastAttacker | None:
+        """Return the entity that hurt the player in the last ``max_age_ticks``.
+
+        Paper 26.x (Minecraft 1.21.5+) stores the attacker's UUID as
+        ``last_hurt_by_mob`` next to ``ticks_since_last_hurt_by_mob`` and
+        drops both about 100 ticks after the hit; older servers store a
+        ``LastHurtByEntity`` field instead, which only says that an entity
+        was involved. Returns None when no entity hurt the player recently
+        (environmental damage: falls, fire, lava, drowning, ...). The
+        attacker's type is resolved while it is still loaded; a despawned
+        attacker leaves ``entity_type`` None.
+        """
+        name = self._player_name
+        ticks = _nbt_int(
+            await self.run_command_blocking(f"data get entity {name} ticks_since_last_hurt_by_mob")
+        )
+        if ticks is None:
+            legacy = await self.run_command_blocking(f"data get entity {name} LastHurtByEntity")
+            if legacy and _NBT_FOUND in legacy:
+                return LastAttacker(entity_type=None, uuid=None, ticks_since=None)
+            return None
+        if ticks > max_age_ticks:
+            return None
+        attacker_uuid = _nbt_uuid(
+            await self.run_command_blocking(f"data get entity {name} last_hurt_by_mob")
+        )
+        entity_type = None
+        if attacker_uuid is not None:
+            entity_type = await self._entity_type(attacker_uuid)
+        return LastAttacker(entity_type=entity_type, uuid=attacker_uuid, ticks_since=ticks)
+
+    async def _entity_type(self, entity_id: str) -> str | None:
+        """Return ``minecraft:<type>`` of a loaded entity, or None if it is gone."""
+        if self._mc is None:
+            return None
+        try:
+            entity = await self._run(self._mc.getEntityById, entity_id)
+            entity_type = str(entity.type)
+        except Exception:
+            # Despawned or unloaded attackers cannot be looked up.
+            return None
+        return entity_type if ":" in entity_type else f"minecraft:{entity_type}"
+
     async def get_hurt_by_entity(self) -> bool:
-        """Return True if the player was last hurt by an entity.
+        """Return True if an entity hurt the player in the last 3 seconds.
 
-        Reads the ``LastHurtByEntity`` NBT field via
-        ``/data get entity @p LastHurtByEntity``.  Returns True when
-        the field is present (damage came from another entity — a mob,
-        a player, a projectile, etc.), False when the field is absent
-        (damage came from the environment: fall, cactus, fire, lava,
-        suffocation, drowning, etc.).
-
-        The reflex-attack path in the self-preservation layer uses
-        this to skip reflex behaviour on environmental damage — we
-        don't want the agent to charge a zombie because it tripped
-        on a cactus.
+        The reflex-attack path in the self-preservation layer uses this to
+        skip reflex behaviour on environmental damage, so the agent does
+        not charge a zombie because it tripped on a cactus. Any failure
+        reads as False.
         """
         try:
-            resp = await self.run_command_blocking("data get entity @p LastHurtByEntity")
-            if not resp:
-                return False
-            # The response includes the UUID array only when an entity
-            # is recorded. Paper 1.21 emits the response as
-            # "<name> has the following entity data: [I;...]" when set
-            # and "No entity was found" (or similar) when not.
-            return "has the following entity data" in resp
+            return await self.get_last_attacker() is not None
         except Exception:
             return False
+
+    async def get_death_messages(self) -> list[str]:
+        """Return the death messages of this player since the last call.
+
+        Uses MCPQ's player-death event stream, which starts recording at
+        the first call; deaths of other players are discarded.
+        """
+        if self._mc is None:
+            return []
+        events = await self._run(self._mc.events.player_death.poll)
+        name = self._player_name
+        return [str(event.deathMessage) for event in events if event.player.name == name]
 
     async def get_player_info(self) -> dict[str, Any]:
         """Return structured info about the configured player."""
@@ -368,3 +412,38 @@ class McpqClient:
         assert self._mc is not None
         players = await self._run(self._mc.getPlayerList)
         return [p.name for p in players]
+
+
+_NBT_FOUND = "has the following entity data:"
+_NBT_INT = re.compile(r"has the following entity data: (-?\d+)[bsl]?\s*$")
+_NBT_UUID = re.compile(r"\[I;\s*(-?\d+),\s*(-?\d+),\s*(-?\d+),\s*(-?\d+)\s*\]")
+
+
+@dataclass(frozen=True)
+class LastAttacker:
+    """The entity that most recently hurt the player.
+
+    Every field may be None: ``entity_type`` (for example
+    ``"minecraft:zombie"``) when the attacker is no longer loaded, and all
+    of them on servers that only record that some entity was involved.
+    """
+
+    entity_type: str | None
+    uuid: str | None
+    ticks_since: int | None
+
+
+def _nbt_int(response: str | None) -> int | None:
+    match = _NBT_INT.search(response or "")
+    return int(match.group(1)) if match else None
+
+
+def _nbt_uuid(response: str | None) -> str | None:
+    """Convert an NBT int-array UUID (``[I; a, b, c, d]``) to its string form."""
+    match = _NBT_UUID.search(response or "")
+    if match is None:
+        return None
+    value = 0
+    for part in match.groups():
+        value = (value << 32) | (int(part) & 0xFFFFFFFF)
+    return str(uuid.UUID(int=value))

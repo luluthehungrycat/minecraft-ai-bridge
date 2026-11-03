@@ -9,6 +9,16 @@ takes into a small number of durable events a controller can poll:
   ``amount`` and ``hits`` cover every drop since the previous event.
 - ``steve.health_low`` — health fell below ``health_low_threshold``.
 - ``steve.hunger_low`` — hunger fell below ``hunger_low_threshold``.
+- ``steve.respawned`` — the bot is alive (health above 0) again after an
+  observation showed it dead or :meth:`ConditionEventDetector.mark_dead`
+  reported a death. The bot plugin respawns the bot one tick after death,
+  usually before any observation sees health 0.
+
+``steve.died`` comes from the backend's death events rather than from
+observations; :func:`death_event` builds it, and the server's death message
+names the cause. The supervisor adds a damage ``source`` (see
+:func:`damage_source`) to ``steve.damaged`` before journaling it; deaths are
+not attributed that way because the respawn clears the attacker record.
 
 The low-value events are edge-triggered: each fires once when the value
 first crosses below its threshold (including on the first observation) and
@@ -25,15 +35,23 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from ..minecraft.observer import WorldState
 from .contracts import Event, EventSeverity
 
+if TYPE_CHECKING:
+    from ..minecraft.mc_api import LastAttacker
+
 DAMAGED_EVENT_TYPE = "steve.damaged"
 HEALTH_LOW_EVENT_TYPE = "steve.health_low"
 HUNGER_LOW_EVENT_TYPE = "steve.hunger_low"
+DIED_EVENT_TYPE = "steve.died"
+RESPAWNED_EVENT_TYPE = "steve.respawned"
 CONDITION_EVENT_SOURCE = "condition_monitor"
+# Event types that get a damage ``source`` before they are journaled.
+ATTRIBUTED_EVENT_TYPES = frozenset({DAMAGED_EVENT_TYPE})
 
 
 @dataclass(frozen=True)
@@ -99,6 +117,11 @@ class ConditionEventDetector:
         self._damage = _DamageState()
         self._health_low = _LowValueState(self.config.health_low_threshold, self.config.hysteresis)
         self._hunger_low = _LowValueState(self.config.hunger_low_threshold, self.config.hysteresis)
+        self._dead = False
+
+    def mark_dead(self) -> None:
+        """Record a backend-reported death; the next live observation is a respawn."""
+        self._dead = True
 
     def observe(self, world: WorldState, now: float) -> list[Event]:
         """Return the events this observation triggers (usually none).
@@ -111,6 +134,21 @@ class ConditionEventDetector:
         hunger = _finite(world.hunger)
 
         if health is not None:
+            if health <= 0:
+                self._dead = True
+            elif self._dead:
+                self._dead = False
+                position = world.position
+                events.append(
+                    self._event(
+                        RESPAWNED_EVENT_TYPE,
+                        EventSeverity.INFO,
+                        {
+                            "health": health,
+                            "position": list(position) if position is not None else None,
+                        },
+                    )
+                )
             damaged = self._observe_damage(health, now)
             if damaged is not None:
                 events.append(damaged)
@@ -187,6 +225,36 @@ class ConditionEventDetector:
         )
 
 
+def death_event(message: str, steve_id: str | None) -> Event:
+    """Build a ``steve.died`` event from a backend death message.
+
+    ``message`` is the server's death message, for example
+    ``"AIBot was blown up by Creeper"``.
+    """
+    return Event(
+        event_id=f"evt-{uuid4()}",
+        type=DIED_EVENT_TYPE,
+        severity=EventSeverity.CRITICAL,
+        steve_id=steve_id,
+        source=CONDITION_EVENT_SOURCE,
+        payload={"message": message[:500]},
+    )
+
+
+def damage_source(attacker: LastAttacker | None) -> dict[str, object]:
+    """Describe the likely damage source for an event payload.
+
+    ``{"kind": "entity", "entity_type": "minecraft:zombie"}`` when an entity
+    hurt the bot recently (``entity_type`` is None if it is no longer
+    loaded or the server does not record it), otherwise
+    ``{"kind": "environment"}``. This is an inference: an entity hit within
+    the last few seconds is credited even if a later fall did the damage.
+    """
+    if attacker is None:
+        return {"kind": "environment"}
+    return {"kind": "entity", "entity_type": attacker.entity_type}
+
+
 def _finite(value: float | int | None) -> float | None:
     if value is None or isinstance(value, bool):
         return None
@@ -195,10 +263,15 @@ def _finite(value: float | int | None) -> float | None:
 
 
 __all__ = [
+    "ATTRIBUTED_EVENT_TYPES",
     "CONDITION_EVENT_SOURCE",
     "DAMAGED_EVENT_TYPE",
+    "DIED_EVENT_TYPE",
     "HEALTH_LOW_EVENT_TYPE",
     "HUNGER_LOW_EVENT_TYPE",
+    "RESPAWNED_EVENT_TYPE",
     "ConditionEventConfig",
     "ConditionEventDetector",
+    "damage_source",
+    "death_event",
 ]

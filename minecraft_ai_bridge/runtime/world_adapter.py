@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 from .contracts import BackendKind, Capabilities, CraftingMode, MovementMode
 
 if TYPE_CHECKING:
-    from ..minecraft.mc_api import McpqClient
+    from ..minecraft.mc_api import LastAttacker, McpqClient
 
 __all__ = ["McpqWorldAdapter", "WorldAdapter"]
 
@@ -52,7 +52,11 @@ class WorldAdapter(Protocol):
 
     async def get_hurt_by_entity(self) -> bool: ...
 
-    # ── Chat events ────────────────────────────────────────────────
+    async def get_last_attacker(self, max_age_ticks: int = 60) -> LastAttacker | None: ...
+
+    # ── Events ─────────────────────────────────────────────────────
+
+    async def get_death_messages(self) -> list[str]: ...
 
     async def get_chat_events(self) -> list[Any]: ...
 
@@ -131,6 +135,12 @@ class McpqWorldAdapter:
 
     async def get_hurt_by_entity(self) -> bool:
         return await self._client.get_hurt_by_entity()
+
+    async def get_last_attacker(self, max_age_ticks: int = 60) -> LastAttacker | None:
+        return await self._client.get_last_attacker(max_age_ticks)
+
+    async def get_death_messages(self) -> list[str]:
+        return await self._client.get_death_messages()
 
     async def get_chat_events(self) -> list[Any]:
         return await self._client.get_chat_events()
