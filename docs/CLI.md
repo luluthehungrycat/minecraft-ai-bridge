@@ -188,7 +188,7 @@ The same polling records the bot's condition, also attributed to this Steve:
 | `steve.health_low` | Health fell below 4 (HIGH). | `health`, `threshold` |
 | `steve.hunger_low` | Hunger fell below 6 (MEDIUM). | `hunger`, `threshold` |
 | `steve.died` | The bot died (CRITICAL). | `message`: the server's death message, such as `AIBot was slain by Zombie` |
-| `steve.respawned` | The bot is alive again after dying (INFO). The bot plugin respawns it one tick after death. | `health`, `position` (`[x, y, z]` or null) |
+| `steve.respawned` | The bot is alive again after dying (INFO). The bot plugin respawns it one tick after death. Every `steve.died` is followed by exactly one `steve.respawned` before the next `steve.died`. | `health`, `position` (`[x, y, z]`); both null if the bot died again before a respawn was observed |
 
 The two `_low` events fire once when the value crosses below the threshold and
 again only after it has recovered by 2 points.

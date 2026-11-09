@@ -21,6 +21,10 @@ from mcpq import Minecraft, Vec3
 logger = logging.getLogger(__name__)
 
 
+# An entity hit within this many ticks (3 s) counts as the damage source.
+_RECENT_ATTACK_TICKS = 60
+
+
 class McpqClient:
     """Async wrapper around a gRPC connection to the MCPQ plugin.
 
@@ -147,7 +151,9 @@ class McpqClient:
             return (player.pos.x, player.pos.y, player.pos.z)
         return None
 
-    async def get_last_attacker(self, max_age_ticks: int = 60) -> LastAttacker | None:
+    async def get_last_attacker(
+        self, max_age_ticks: int = _RECENT_ATTACK_TICKS
+    ) -> LastAttacker | None:
         """Return the entity that hurt the player in the last ``max_age_ticks``.
 
         Paper 26.x (Minecraft 1.21.5+) stores the attacker's UUID as
@@ -159,17 +165,14 @@ class McpqClient:
         attacker's type is resolved while it is still loaded; a despawned
         attacker leaves ``entity_type`` None.
         """
+        recent = await self._recent_attack(max_age_ticks)
+        if recent is None:
+            return None
+        ticks = recent
+        if ticks < 0:
+            # Legacy server: an entity was involved, nothing more is known.
+            return LastAttacker(entity_type=None, uuid=None, ticks_since=None)
         name = self._player_name
-        ticks = _nbt_int(
-            await self.run_command_blocking(f"data get entity {name} ticks_since_last_hurt_by_mob")
-        )
-        if ticks is None:
-            legacy = await self.run_command_blocking(f"data get entity {name} LastHurtByEntity")
-            if legacy and _NBT_FOUND in legacy:
-                return LastAttacker(entity_type=None, uuid=None, ticks_since=None)
-            return None
-        if ticks > max_age_ticks:
-            return None
         attacker_uuid = _nbt_uuid(
             await self.run_command_blocking(f"data get entity {name} last_hurt_by_mob")
         )
@@ -177,6 +180,21 @@ class McpqClient:
         if attacker_uuid is not None:
             entity_type = await self._entity_type(attacker_uuid)
         return LastAttacker(entity_type=entity_type, uuid=attacker_uuid, ticks_since=ticks)
+
+    async def _recent_attack(self, max_age_ticks: int) -> int | None:
+        """Ticks since an entity hurt the player, if within ``max_age_ticks``.
+
+        Returns None when no entity hurt the player recently, and -1 on
+        legacy servers that only record that some entity was involved.
+        """
+        name = self._player_name
+        ticks = _nbt_int(
+            await self.run_command_blocking(f"data get entity {name} ticks_since_last_hurt_by_mob")
+        )
+        if ticks is None:
+            legacy = await self.run_command_blocking(f"data get entity {name} LastHurtByEntity")
+            return -1 if legacy and _NBT_FOUND in legacy else None
+        return ticks if ticks <= max_age_ticks else None
 
     async def _entity_type(self, entity_id: str) -> str | None:
         """Return ``minecraft:<type>`` of a loaded entity, or None if it is gone."""
@@ -208,7 +226,9 @@ class McpqClient:
         reads as False.
         """
         try:
-            return await self.get_last_attacker() is not None
+            # Only the cheap NBT check: resolving the attacker's type is not
+            # needed here and must not slow the reflex path.
+            return await self._recent_attack(_RECENT_ATTACK_TICKS) is not None
         except Exception:
             return False
 

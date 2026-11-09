@@ -500,8 +500,17 @@ reflex. The detector owns the death lifecycle: each death yields one
 `steve.died` (with the server's death message) followed by one
 `steve.respawned`, even when an observation shows the bot alive again before
 the death message arrives (the bot plugin respawns the bot one tick after
-death; that respawn is held until the message). Every server query for these
-events, including reading an MCPQ entity's type, runs in a worker thread. Before journaling a `steve.damaged` event,
+death; that respawn is held until the message). Deaths and respawns strictly
+alternate: several observed deaths pair with their late messages in order, and
+a second death message before any observed respawn first closes the previous
+death with a `steve.respawned` whose `health` and `position` are null. Every
+server query for these events, including reading an MCPQ entity's type, runs in
+a worker thread; the supervisor runs at most one query of each kind (death
+poll, attacker lookup) at a time and waits at most 2 s for it, so a stalled
+server cannot pile up threads, and `close()` stops waiting for stalled queries.
+The damage cooldown is timed by when observations complete, ordering against
+death messages by when they start. The reflex check `get_hurt_by_entity()`
+reads only the attacker NBT, never the attacker's type. Before journaling a `steve.damaged` event,
 the writer adds a `source` from `get_last_attacker()`: Paper 26.x's
 `ticks_since_last_hurt_by_mob` (within 60 ticks) and `last_hurt_by_mob` UUID,
 resolved to a type with MCPQ `getEntityById`; each query is bounded to 2 s and

@@ -19,6 +19,7 @@ from minecraft_ai_bridge.minecraft.mc_api import (
 )
 from minecraft_ai_bridge.minecraft.observer import WorldState
 from minecraft_ai_bridge.runtime import (
+    ConditionEventConfig,
     ConditionEventDetector,
     ControllerService,
     Event,
@@ -82,7 +83,8 @@ def make_client(
     """Client whose commands are answered by substring; returns (client, log).
 
     ``entities`` maps loaded entity UUIDs to the MCPQ type ``getEntityById``
-    reports; any other UUID raises, as MCPQ does for a missing entity.
+    reports; any other UUID yields type ``UNKNOWN``, as MCPQ does for a
+    missing entity.
     """
     client = McpqClient(host="x", port=1, player_name="AIBot")
     log: list[str] = []
@@ -166,6 +168,25 @@ async def test_last_attacker_legacy_server(monkeypatch: pytest.MonkeyPatch) -> N
 async def test_last_attacker_nothing_recorded(monkeypatch: pytest.MonkeyPatch) -> None:
     client, _ = make_client({}, monkeypatch)
     assert await client.get_last_attacker() is None
+
+
+async def test_hurt_by_entity_only_reads_nbt(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The reflex check must not wait on resolving the attacker's type (round 2)."""
+    client, log = make_client(
+        {
+            "ticks_since_last_hurt_by_mob": "AIBot has the following entity data: 3",
+            "last_hurt_by_mob": UUID_RESPONSE,
+        },
+        monkeypatch,
+        entities={ZOMBIE_UUID: "zombie"},
+    )
+
+    def no_lookup(entity_id: str) -> None:
+        raise AssertionError("get_hurt_by_entity resolved the attacker's type")
+
+    client._mc.getEntityById = no_lookup  # type: ignore[union-attr]
+    assert await client.get_hurt_by_entity() is True
+    assert log == ["data get entity AIBot ticks_since_last_hurt_by_mob"]
 
 
 async def test_hurt_by_entity_true_false_and_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -293,21 +314,49 @@ def test_observed_death_then_message_then_alive() -> None:
     assert _types(events) == ["steve.respawned"]
 
 
-def test_held_respawn_is_dropped_if_the_bot_is_dead_again() -> None:
+def test_two_observed_deaths_pair_with_their_late_messages_in_order() -> None:
     detector = ConditionEventDetector(steve_id="AIBot")
     detector.expect_death_messages()
     detector.observe(WorldState(health=0, hunger=20), 0.0)
-    detector.observe(WorldState(health=20, hunger=20), 0.25)
+    detector.observe(WorldState(health=20, hunger=20, position=(1, 70, 1)), 0.25)
     detector.observe(WorldState(health=0, hunger=20), 0.5)
-    # The message pairs with the death still in progress: no respawn yet.
-    assert _types(detector.record_death("AIBot fell from a high place")) == ["steve.died"]
-    assert _types(
-        [
-            e
-            for e in detector.observe(WorldState(health=20, hunger=20), 1.0)
-            if e.type == "steve.respawned"
-        ]
-    ) == ["steve.respawned"]
+    detector.observe(WorldState(health=20, hunger=20, position=(2, 70, 2)), 0.75)
+    first = detector.record_death("AIBot fell from a high place", 1.0)
+    second = detector.record_death("AIBot drowned", 1.0)
+    assert _types(first + second) == [
+        "steve.died",
+        "steve.respawned",
+        "steve.died",
+        "steve.respawned",
+    ]
+    assert first[1].payload["position"] == [1, 70, 1]
+    assert second[1].payload["position"] == [2, 70, 2]
+
+
+def test_batched_death_messages_keep_died_and_respawned_alternating() -> None:
+    """Two deaths reported before any fresh observation (review round 2)."""
+    detector = ConditionEventDetector(steve_id="AIBot")
+    detector.expect_death_messages()
+    events = detector.record_death("AIBot was slain by Zombie", 1.0)
+    events += detector.record_death("AIBot was slain by Zombie", 1.0)
+    events += detector.observe(WorldState(health=20, hunger=20, position=(0, 70, 0)), 2.0)
+    assert _types(events) == ["steve.died", "steve.respawned", "steve.died", "steve.respawned"]
+    # The respawn between the two deaths was never observed.
+    assert events[1].payload == {"health": None, "position": None}
+    assert events[3].payload == {"health": 20.0, "position": [0, 70, 0]}
+    assert detector.observe(WorldState(health=20, hunger=20), 3.0) == []
+
+
+def test_damage_cooldown_uses_completion_time_not_start_time() -> None:
+    """A slow observation must not let the next one bypass the cooldown (round 2)."""
+    detector = ConditionEventDetector(ConditionEventConfig(damage_cooldown=0.05))
+    detector.observe(WorldState(health=20, hunger=20), 0.0)
+    # Slow observation: started at 0.02, completed at 0.10.
+    assert _types(detector.observe(WorldState(health=15, hunger=20), 0.10, started=0.02)) == [
+        "steve.damaged"
+    ]
+    # Quick one right after: within 50 ms of the previous event's emission.
+    assert detector.observe(WorldState(health=10, hunger=20), 0.12, started=0.11) == []
 
 
 def test_respawn_without_position_has_none_position() -> None:
@@ -508,6 +557,45 @@ async def test_slow_death_poll_does_not_delay_reflexes(tmp_path: Path) -> None:
         await asyncio.wait_for(task, 2)
         release.set()
     await supervisor.close()
+
+
+async def test_stalled_attribution_is_not_duplicated_and_close_is_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stuck lookup is not restarted per event, and close() does not wait on it."""
+    monkeypatch.setattr(supervisor_module, "_WORLD_EVENT_TIMEOUT_SECONDS", 0.01)
+    release = asyncio.Event()
+
+    class Stuck(FakeWorldEvents):
+        calls = 0
+
+        async def get_last_attacker(self, max_age_ticks: int = 60) -> LastAttacker | None:
+            Stuck.calls += 1
+            await release.wait()
+            return None
+
+    supervisor = SafetySupervisor(
+        _const_world,
+        _no_intervention,
+        event_sink=lambda event: 1,
+        condition_events=ConditionEventDetector(),
+        world_events=Stuck(),
+    )
+    damaged = Event(
+        event_id="evt-1",
+        type="steve.damaged",
+        severity=EventSeverity.MEDIUM,
+        source="test",
+        payload={},
+    )
+    try:
+        results = [await supervisor._attribute(damaged) for _ in range(3)]
+        assert [r.payload["source"] for r in results] == [{"kind": "unknown"}] * 3
+        assert Stuck.calls == 1
+        await asyncio.wait_for(supervisor.close(), 1)
+        assert not supervisor._queries
+    finally:
+        release.set()
 
 
 async def test_death_poller_stops_with_the_supervisor(tmp_path: Path) -> None:

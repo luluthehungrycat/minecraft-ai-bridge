@@ -8,7 +8,7 @@ import inspect
 import logging
 from collections import deque
 from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 from uuid import uuid4
 
 from ..minecraft.actions import ActionResult, ActionType
@@ -95,6 +95,8 @@ class SafetySupervisor:
         self._world_events = world_events if self._conditions is not None else None
         if self._world_events is not None and self._conditions is not None:
             self._conditions.expect_death_messages()
+        # At most one backend query of each kind at a time (see _query).
+        self._queries: dict[str, asyncio.Task[Any]] = {}
 
     async def run(self, stop_event: asyncio.Event) -> None:
         """Poll independently until asked to stop; isolate per-tick failures."""
@@ -191,7 +193,11 @@ class SafetySupervisor:
         if self._conditions is None:
             return
         try:
-            events = self._conditions.observe(world, started)
+            # Completion time for the damage cooldown, start time for
+            # ordering against death messages.
+            events = self._conditions.observe(
+                world, asyncio.get_running_loop().time(), started=started
+            )
         except Exception:
             logger.exception("Condition event detection failed")
             return
@@ -209,17 +215,36 @@ class SafetySupervisor:
         if self._world_events is None or self._conditions is None:
             return
         try:
-            messages = await asyncio.wait_for(
-                self._world_events.get_death_messages(), _WORLD_EVENT_TIMEOUT_SECONDS
-            )
+            finished, messages = await self._query("deaths", self._world_events.get_death_messages)
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.warning("Could not poll death events", exc_info=True)
             return
+        if not finished:
+            return
         for message in messages:
             received = asyncio.get_running_loop().time()
             self._queue_condition_events(self._conditions.record_death(message, received))
+
+    async def _query(self, kind: str, start: Callable[[], Awaitable[Any]]) -> tuple[bool, Any]:
+        """Run one backend query of ``kind``, waiting at most the timeout.
+
+        Returns ``(True, result)``, or ``(False, None)`` if it is still
+        running after the timeout. A query that timed out keeps running in
+        its worker thread and is not started again until it finishes, so a
+        stalled server cannot pile up threads; its eventual result is used
+        by the next call. Failures propagate.
+        """
+        task = self._queries.get(kind)
+        if task is None:
+            task = asyncio.ensure_future(start())
+            self._queries[kind] = task
+        done, _ = await asyncio.wait({task}, timeout=_WORLD_EVENT_TIMEOUT_SECONDS)
+        if not done:
+            return False, None
+        del self._queries[kind]
+        return True, task.result()
 
     def _queue_condition_events(self, events: list[Event]) -> None:
         for event in events:
@@ -250,10 +275,8 @@ class SafetySupervisor:
             return event
         source: dict[str, object]
         try:
-            attacker = await asyncio.wait_for(
-                self._world_events.get_last_attacker(), _WORLD_EVENT_TIMEOUT_SECONDS
-            )
-            source = damage_source(attacker)
+            finished, attacker = await self._query("attacker", self._world_events.get_last_attacker)
+            source = damage_source(attacker) if finished else {"kind": "unknown"}
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -336,6 +359,13 @@ class SafetySupervisor:
             await asyncio.gather(*list(self._event_writes))
         if self._condition_writer is not None:
             await self._condition_writer
+        # Stalled backend queries: stop waiting for them (their worker
+        # threads end with the call they are blocked in).
+        queries = list(self._queries.values())
+        self._queries.clear()
+        for task in queries:
+            task.cancel()
+        await asyncio.gather(*queries, return_exceptions=True)
 
     def take_nowait(self) -> ActionResult | None:
         """Return and clear the pending intervention, if one is available."""

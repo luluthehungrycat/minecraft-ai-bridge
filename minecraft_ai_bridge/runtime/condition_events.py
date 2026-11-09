@@ -37,6 +37,7 @@ the ``now`` timestamps, which makes it independent of wall-clock time.
 from __future__ import annotations
 
 import math
+from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 from uuid import uuid4
@@ -53,6 +54,8 @@ HUNGER_LOW_EVENT_TYPE = "steve.hunger_low"
 DIED_EVENT_TYPE = "steve.died"
 RESPAWNED_EVENT_TYPE = "steve.respawned"
 CONDITION_EVENT_SOURCE = "condition_monitor"
+# Live-after-death observations kept while their death messages are late.
+_MAX_HELD_RESPAWNS = 16
 # Event types that get a damage ``source`` before they are journaled.
 ATTRIBUTED_EVENT_TYPES = frozenset({DAMAGED_EVENT_TYPE})
 
@@ -121,73 +124,89 @@ class ConditionEventDetector:
         self._health_low = _LowValueState(self.config.health_low_threshold, self.config.hysteresis)
         self._hunger_low = _LowValueState(self.config.hunger_low_threshold, self.config.hysteresis)
         self._death_messages = False
-        # Observed health 0 since the last respawn.
+        # Observed health 0 and no live observation since.
         self._observed_dead = False
-        # A death message was reported; the next live observation is the respawn.
-        self._died_reported = False
-        # Alive again after an observed death, held until its death message.
-        self._held_respawn: dict[str, object] | None = None
+        # ``steve.died`` was emitted and its ``steve.respawned`` is still due.
+        self._awaiting_respawn = False
         self._died_at: float | None = None
+        # Live observations after observed deaths, oldest first, each held
+        # until its death message arrives.
+        self._held_respawns: deque[dict[str, object]] = deque(maxlen=_MAX_HELD_RESPAWNS)
 
     def expect_death_messages(self) -> None:
         """Pair respawns with :meth:`record_death` instead of observations alone."""
         self._death_messages = True
 
     def record_death(self, message: str, now: float | None = None) -> list[Event]:
-        """Return ``steve.died`` for a backend death message, plus a held respawn.
+        """Return the events for one backend death message.
 
-        ``now`` is when the message was received, on the same clock as
-        :meth:`observe`'s ``now``. Only an observation that started after it
-        can count as the respawn: one already in flight may still show the
-        bot alive from before it died.
+        Deaths and respawns strictly alternate: ``steve.died``, then a held
+        ``steve.respawned`` if the bot was already seen alive again after this
+        death. If the previous death's respawn was never observed (the bot
+        died again first), a ``steve.respawned`` with null ``health`` and
+        ``position`` closes it before this ``steve.died``.
+
+        ``now`` is when the message was received, on the clock of
+        :meth:`observe`'s ``started``. Only an observation that started after
+        it can count as the respawn: one already in flight may still show
+        the bot alive from before it died.
         """
-        events = [death_event(message, self.steve_id)]
-        if self._held_respawn is not None:
-            events.append(self._event(RESPAWNED_EVENT_TYPE, EventSeverity.INFO, self._held_respawn))
-            self._held_respawn = None
+        events: list[Event] = []
+        if self._awaiting_respawn:
+            events.append(self._respawned({"health": None, "position": None}))
+            self._awaiting_respawn = False
+        events.append(death_event(message, self.steve_id))
+        if self._held_respawns:
+            # This message belongs to the oldest observed death and respawn.
+            events.append(self._respawned(self._held_respawns.popleft()))
         else:
-            self._died_reported = True
+            self._awaiting_respawn = True
             self._died_at = now
-        self._observed_dead = False
+            self._observed_dead = False
         return events
 
-    def _observe_life(self, health: float, world: WorldState, now: float) -> Event | None:
+    def _respawned(self, payload: dict[str, object]) -> Event:
+        return self._event(RESPAWNED_EVENT_TYPE, EventSeverity.INFO, payload)
+
+    def _observe_life(self, health: float, world: WorldState, started: float) -> Event | None:
         if health <= 0:
             self._observed_dead = True
-            self._held_respawn = None
-            return None
-        if self._died_reported and self._died_at is not None and now <= self._died_at:
-            # Taken before the death was reported: it may predate the death.
-            return None
-        if not (self._died_reported or self._observed_dead):
             return None
         position = world.position
         payload: dict[str, object] = {
             "health": health,
             "position": list(position) if position is not None else None,
         }
-        if self._died_reported or not self._death_messages:
-            self._died_reported = False
+        if self._awaiting_respawn:
+            if self._died_at is not None and started <= self._died_at:
+                # Begun before the death was reported: it may predate the death.
+                return None
+            self._awaiting_respawn = False
             self._observed_dead = False
-            return self._event(RESPAWNED_EVENT_TYPE, EventSeverity.INFO, payload)
-        # Seen dead and alive again, but the death message is still on its way.
+            return self._respawned(payload)
+        if not self._observed_dead:
+            return None
         self._observed_dead = False
-        self._held_respawn = payload
+        if not self._death_messages:
+            return self._respawned(payload)
+        # Seen dead and alive again, but the death message is still on its way.
+        self._held_respawns.append(payload)
         return None
 
-    def observe(self, world: WorldState, now: float) -> list[Event]:
+    def observe(self, world: WorldState, now: float, started: float | None = None) -> list[Event]:
         """Return the events this observation triggers (usually none).
 
         ``now`` is a monotonic timestamp in seconds for when the observation
-        started; it times the damage cooldown and orders observations
-        against :meth:`record_death`.
+        completed; it times the damage cooldown. ``started`` (default
+        ``now``) is when the observation began, which orders it against
+        :meth:`record_death`.
         """
         events: list[Event] = []
         health = _finite(world.health)
         hunger = _finite(world.hunger)
 
         if health is not None:
-            respawned = self._observe_life(health, world, now)
+            respawned = self._observe_life(health, world, now if started is None else started)
             if respawned is not None:
                 events.append(respawned)
             damaged = self._observe_damage(health, now)
