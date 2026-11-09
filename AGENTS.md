@@ -103,7 +103,7 @@ examples and the conventions block at the top.
 ### Paper / MCPQ
 - **Paper pin**: Paper 26.2 build 123 with MCPQ v2.2. Docker pins the Java 25 server image by digest; update the Paper version/build and image digest together.
 - **Bot plugin**: Custom `mc-bot-plugin-1.0.0.jar` provides the bot entity. Built in `bot-plugin/` with Gradle + paperweight-userdev (Java 25). Provides `/botsummon <name>` command that creates a ServerPlayer entity MCPQ can detect. It respawns summoned bots one tick after death (the fake connection never requests a respawn), and `/botsummon` creates no duplicate when the player is already online (it respawns a dead bot instead).
-- **Damage attribution on Paper 26.x**: the attacker is NBT `last_hurt_by_mob` (UUID int array) plus `ticks_since_last_hurt_by_mob`; the legacy `LastHurtByEntity` no longer exists. `scan_entities` does not find mobs on Paper 26.x (see ROADMAP), so the attack reflex still cannot pick a target.
+- **Damage attribution on Paper 26.x**: the attacker is NBT `last_hurt_by_mob` (UUID int array) plus `ticks_since_last_hurt_by_mob`; the legacy `LastHurtByEntity` no longer exists. `scan_entities` was fixed to find mobs on Paper 26.x by anchoring each selector at the bot (`execute at <bot> if entity ...`, result `Test passed. Count: N`), so the attack reflex can pick a target.
 - **Plugin version pinning**: MCPQ jar is downloaded from GitHub releases. The bot plugin and Paperweight dev bundle are pinned; update them deliberately together.
 - **Known Paper 26.x issues**:
   - `time query daytime` throws CommandException — use `time query day` instead (fixed in bridge code)
@@ -115,7 +115,7 @@ examples and the conventions block at the top.
 - **config.yaml volume mount**: Mounted read-only at `/app/config.yaml`. Changes require `docker compose restart bridge`.
 
 ### Code Quality
-- **Tests**: 983 tests collected in total — 969 deterministic unit tests plus 14 integration tests (12 agent-loop, 2 MCP end-to-end). The 64 MCP adapter unit tests and both MCP end-to-end tests need the `mcp` extra (included in `[dev]`) and skip without it. Unit tests use `MockMcpqClient` for deterministic MCPQ simulation. Integration tests use a real MCPQ server + real LLM (OpenRouter `openai/gpt-oss-20b`, or Requesty `runware/gpt-oss-120b` when only `REQUESTY_API_KEY` is set; override with `INTEGRATION_LLM_MODEL`) for end-to-end validation. The stack uses pinned Paper 26.2 build 123. Run with `pytest tests/`.
+- **Tests**: 985 tests collected in total — 971 deterministic unit tests plus 14 integration tests (12 agent-loop, 2 MCP end-to-end). The 64 MCP adapter unit tests and both MCP end-to-end tests need the `mcp` extra (included in `[dev]`) and skip without it. Unit tests use `MockMcpqClient` for deterministic MCPQ simulation. Integration tests use a real MCPQ server + real LLM (OpenRouter `openai/gpt-oss-20b`, or Requesty `runware/gpt-oss-120b` when only `REQUESTY_API_KEY` is set; override with `INTEGRATION_LLM_MODEL`) for end-to-end validation. The stack uses pinned Paper 26.2 build 123. Run with `pytest tests/`.
 - **Mypy**: runs in CI on every push and PR (`mypy minecraft_ai_bridge/ --ignore-missing-imports`) and must pass.
 - **gRPC stubs are synchronous**: MCPQ generated stubs block; dispatched via `asyncio.to_thread`. Not ideal but works.
 - **RCON client is unmaintained**: Since the MCPQ migration, `rcon.py` isn't tested. Consider removing or marking deprecated.
@@ -141,7 +141,7 @@ Some LLMs (especially smaller/local ones) can't reliably output structured JSON 
 
 ### P0: None (Testing Complete)
 The 0.5.0 release completed the testing milestone:
-- **Unit tests** (969): MockMcpqClient covers all 36 actions, observer parsing, memory, goal fallback plans, config, inventory manager, chat commands, pathfinding, the runtime action gate, the safety supervisor, the event journal, webhook delivery, and the local authorization service
+- **Unit tests** (971): MockMcpqClient covers all 36 actions, observer parsing, memory, goal fallback plans, config, inventory manager, chat commands, pathfinding, the runtime action gate, the safety supervisor, the event journal, webhook delivery, and the local authorization service
 - **Integration tests** (12): Full think-act-observe loop with real MCPQ server + real LLM inference (OpenRouter `openai/gpt-oss-20b`). Covers teleport, exploration, disconnect handling, fallback decomposition, failure counting, memory recording, chat command stop, and inventory creation.
 - **Goal-verification assertions**: Integration tests verify agent behavior via:
   - `action_taken(orch, *names) → bool` — checks if the agent performed a specific action (parses `MemoryEntry.raw`)
@@ -218,7 +218,7 @@ The 0.5.0 release completed the testing milestone:
 | `docker-compose.yml` | Paper server + bridge services |
 | `docs/*.md` | Full documentation set |
 | `tests/conftest.py` | MockMcpqClient, MockLLMClient, test fixtures |
-| `tests/test_*.py` | Unit + integration tests (983 total: 969 unit + 14 integration) |
+| `tests/test_*.py` | Unit + integration tests (985 total: 971 unit + 14 integration) |
 | `AGENTS.md` | This file |
 
 ## Environment Info
@@ -254,7 +254,7 @@ Helpers in `tests/test_integration.py`:
 ### Test Organization
 | Directory | Tests | Description |
 |-----------|-------|-------------|
-| `tests/test_actions.py` | 152 | All 36 action handlers with MockMcpqClient |
+| `tests/test_actions.py` | 154 | All 36 action handlers with MockMcpqClient |
 | `tests/test_self_preservation.py` | 61 | Self-preservation reflex heuristics and dispatch |
 | `tests/test_observer.py` | 43 | NBT parsing, inventory parsing, observation formatting |
 | `tests/test_memory.py` | 25 | Short/long-term memory, dedup, persistence |

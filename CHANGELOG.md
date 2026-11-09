@@ -51,6 +51,9 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
 
 ### Fixed
 
+- `scan_entities` finds mobs again on Paper 26.x: it measured distance from the
+  server console's position and looked for `say` output the server never
+  returns, so the attack reflex could never pick a target.
 - The bot no longer stays dead forever: the bot plugin respawns a summoned
   bot one tick after it dies, and `/botsummon` no longer creates a duplicate
   player when the bot is already online (it respawns a dead one instead).

@@ -1904,8 +1904,9 @@ async def _scan_entities(mc: WorldAdapter, params: dict) -> ActionResult:
     """Detect hostile mobs near the player.
 
     Iterates over a curated list of common hostile mob types and runs
-    ``/execute if entity @e[type=...minecraft:X,r=R,limit=1]`` for each
-    to check whether at least one of that type is within radius.
+    ``/execute at <bot> if entity @e[type=minecraft:X,distance=..R]`` for
+    each to check whether at least one of that type is within radius of
+    the bot (the result starts with ``Test passed`` when one is).
 
     Parameters (from ``params``):
       - ``radius`` (optional, default 16, cap 16): search radius in blocks
@@ -1943,13 +1944,13 @@ async def _scan_entities(mc: WorldAdapter, params: dict) -> ActionResult:
 
     for mob in _SCAN_ENTITY_TYPES:
         try:
-            marker = f"__mob_{mob}__"
-            cmd = (
-                f"execute if entity @e[type=minecraft:{mob},"
-                f"distance=..{radius},limit=1] run say {marker}"
-            )
+            # Anchor at the bot (``@p`` becomes the bot's name): commands
+            # run from the console, so a bare ``distance=`` would be
+            # measured from world spawn.  ``execute if entity`` reports
+            # "Test passed. Count: N" / "Test failed" in its result.
+            cmd = f"execute at @p if entity @e[type=minecraft:{mob},distance=..{radius}]"
             resp = await _cmd(mc, cmd)
-            present = bool(resp) and marker in resp
+            present = resp.casefold().startswith("test passed")
         except Exception:
             present = False
         presence[mob] = present
