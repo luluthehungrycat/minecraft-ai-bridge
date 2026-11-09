@@ -508,6 +508,11 @@ server query for these events, including reading an MCPQ entity's type, runs in
 a worker thread; the supervisor runs at most one query of each kind (death
 poll, attacker lookup) at a time and waits at most 2 s for it, so a stalled
 server cannot pile up threads, and `close()` stops waiting for stalled queries.
+A late death poll's messages are still journaled; a late attacker lookup's
+answer is discarded (it belonged to an earlier hit), and damage events get
+`{"kind": "unknown"}` while it runs. If more than 16 respawns are held waiting
+for late death messages, the oldest are dropped and their deaths get a
+`steve.respawned` with null fields, so later deaths keep their own respawns.
 The damage cooldown is timed by when observations complete, ordering against
 death messages by when they start. The reflex check `get_hurt_by_entity()`
 reads only the attacker NBT, never the attacker's type. Before journaling a `steve.damaged` event,

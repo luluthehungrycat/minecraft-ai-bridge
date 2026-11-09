@@ -215,7 +215,9 @@ class SafetySupervisor:
         if self._world_events is None or self._conditions is None:
             return
         try:
-            finished, messages = await self._query("deaths", self._world_events.get_death_messages)
+            finished, messages = await self._query(
+                "deaths", self._world_events.get_death_messages, reuse_late=True
+            )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -227,16 +229,29 @@ class SafetySupervisor:
             received = asyncio.get_running_loop().time()
             self._queue_condition_events(self._conditions.record_death(message, received))
 
-    async def _query(self, kind: str, start: Callable[[], Awaitable[Any]]) -> tuple[bool, Any]:
+    async def _query(
+        self, kind: str, start: Callable[[], Awaitable[Any]], *, reuse_late: bool
+    ) -> tuple[bool, Any]:
         """Run one backend query of ``kind``, waiting at most the timeout.
 
-        Returns ``(True, result)``, or ``(False, None)`` if it is still
-        running after the timeout. A query that timed out keeps running in
-        its worker thread and is not started again until it finishes, so a
-        stalled server cannot pile up threads; its eventual result is used
-        by the next call. Failures propagate.
+        Returns ``(True, result)``, or ``(False, None)`` if no current result
+        is available within the timeout. A query that timed out keeps running
+        in its worker thread and no other query of its kind starts until it
+        finishes, so a stalled server cannot pile up threads. With
+        ``reuse_late`` its eventual result is returned by the next call (death
+        messages must not be lost); otherwise it is discarded, since it
+        answered an earlier question (an attacker lookup for an earlier hit),
+        and calls return ``(False, None)`` without waiting while it runs.
+        Failures propagate.
         """
         task = self._queries.get(kind)
+        if task is not None and not reuse_late:
+            if not task.done():
+                return False, None
+            del self._queries[kind]
+            if not task.cancelled():
+                task.exception()  # retrieved, so a late failure is not logged as unhandled
+            task = None
         if task is None:
             task = asyncio.ensure_future(start())
             self._queries[kind] = task
@@ -275,7 +290,9 @@ class SafetySupervisor:
             return event
         source: dict[str, object]
         try:
-            finished, attacker = await self._query("attacker", self._world_events.get_last_attacker)
+            finished, attacker = await self._query(
+                "attacker", self._world_events.get_last_attacker, reuse_late=False
+            )
             source = damage_source(attacker) if finished else {"kind": "unknown"}
         except asyncio.CancelledError:
             raise

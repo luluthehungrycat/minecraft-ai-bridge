@@ -131,7 +131,10 @@ class ConditionEventDetector:
         self._died_at: float | None = None
         # Live observations after observed deaths, oldest first, each held
         # until its death message arrives.
-        self._held_respawns: deque[dict[str, object]] = deque(maxlen=_MAX_HELD_RESPAWNS)
+        self._held_respawns: deque[dict[str, object]] = deque()
+        # Held respawns dropped for space: the oldest deaths, whose messages
+        # arrive first and get a null ``steve.respawned``.
+        self._dropped_respawns = 0
 
     def expect_death_messages(self) -> None:
         """Pair respawns with :meth:`record_death` instead of observations alone."""
@@ -156,7 +159,11 @@ class ConditionEventDetector:
             events.append(self._respawned({"health": None, "position": None}))
             self._awaiting_respawn = False
         events.append(death_event(message, self.steve_id))
-        if self._held_respawns:
+        if self._dropped_respawns:
+            # The oldest deaths' respawns were dropped for space.
+            self._dropped_respawns -= 1
+            events.append(self._respawned({"health": None, "position": None}))
+        elif self._held_respawns:
             # This message belongs to the oldest observed death and respawn.
             events.append(self._respawned(self._held_respawns.popleft()))
         else:
@@ -190,6 +197,9 @@ class ConditionEventDetector:
         if not self._death_messages:
             return self._respawned(payload)
         # Seen dead and alive again, but the death message is still on its way.
+        if len(self._held_respawns) >= _MAX_HELD_RESPAWNS:
+            self._held_respawns.popleft()
+            self._dropped_respawns += 1
         self._held_respawns.append(payload)
         return None
 

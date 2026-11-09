@@ -333,6 +333,30 @@ def test_two_observed_deaths_pair_with_their_late_messages_in_order() -> None:
     assert second[1].payload["position"] == [2, 70, 2]
 
 
+def test_held_respawn_overflow_keeps_deaths_paired_with_their_respawns() -> None:
+    """More observed death/respawn cycles than can be held (review round 3)."""
+    from minecraft_ai_bridge.runtime import condition_events
+
+    cycles = condition_events._MAX_HELD_RESPAWNS + 1
+    detector = ConditionEventDetector(steve_id="AIBot")
+    detector.expect_death_messages()
+    t = 0.0
+    for i in range(cycles):
+        detector.observe(WorldState(health=0, hunger=20), t)
+        detector.observe(WorldState(health=20, hunger=20, position=(i, 70, 0)), t + 0.1)
+        t += 1.0
+    events: list[Event] = []
+    for _ in range(cycles):
+        events += detector.record_death("AIBot died", t)
+    assert _types(events) == ["steve.died", "steve.respawned"] * cycles
+    positions = [e.payload["position"] for e in events if e.type == "steve.respawned"]
+    # The oldest respawn was dropped: its death gets a null one, and every
+    # later death still gets its own respawn's position.
+    assert positions == [None] + [[i, 70, 0] for i in range(1, cycles)]
+    later = detector.observe(WorldState(health=20, hunger=20), t + 1)
+    assert not [e for e in later if e.type in ("steve.died", "steve.respawned")]
+
+
 def test_batched_death_messages_keep_died_and_respawned_alternating() -> None:
     """Two deaths reported before any fresh observation (review round 2)."""
     detector = ConditionEventDetector(steve_id="AIBot")
@@ -596,6 +620,47 @@ async def test_stalled_attribution_is_not_duplicated_and_close_is_prompt(
         assert not supervisor._queries
     finally:
         release.set()
+
+
+async def test_late_attacker_result_is_not_applied_to_a_later_hit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A timed-out zombie lookup must not label a later fall (review round 3)."""
+    monkeypatch.setattr(supervisor_module, "_WORLD_EVENT_TIMEOUT_SECONDS", 0.01)
+    release = asyncio.Event()
+
+    class Slow(FakeWorldEvents):
+        calls = 0
+
+        async def get_last_attacker(self, max_age_ticks: int = 60) -> LastAttacker | None:
+            Slow.calls += 1
+            if Slow.calls == 1:
+                await release.wait()  # the zombie hit's lookup, answered late
+                return LastAttacker("minecraft:zombie", None, 2)
+            return None  # the later fall: no recent attacker
+
+    supervisor = SafetySupervisor(
+        _const_world,
+        _no_intervention,
+        event_sink=lambda event: 1,
+        condition_events=ConditionEventDetector(),
+        world_events=Slow(),
+    )
+    damaged = Event(
+        event_id="evt-1",
+        type="steve.damaged",
+        severity=EventSeverity.MEDIUM,
+        source="test",
+        payload={},
+    )
+    first = await supervisor._attribute(damaged)
+    assert first.payload["source"] == {"kind": "unknown"}
+    release.set()
+    await asyncio.sleep(0.01)  # the late zombie answer arrives
+    later = await supervisor._attribute(damaged)
+    assert later.payload["source"] == {"kind": "environment"}
+    assert Slow.calls == 2
+    await supervisor.close()
 
 
 async def test_death_poller_stops_with_the_supervisor(tmp_path: Path) -> None:
