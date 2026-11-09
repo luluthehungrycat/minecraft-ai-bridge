@@ -494,10 +494,14 @@ damage accumulated across the cooldown) and edge-triggered `steve.health_low` /
 They are written in order by one detached task from a queue capped at 64 events;
 if the journal stalls that long, the oldest are dropped and logged. Given a
 `world_events` source (the `WorldAdapter`), the supervisor also polls MCPQ
-player-death events after each tick's evaluation, journaling `steve.died` with
-the server's death message and arming `steve.respawned` for the next live
-observation (the bot plugin respawns the bot one tick after death, before an
-observation usually sees health 0). Before journaling a `steve.damaged` event,
+player-death events in a separate task at the same interval (cancelled and
+joined when `run()` ends), so a slow query never delays an observation or a
+reflex. The detector owns the death lifecycle: each death yields one
+`steve.died` (with the server's death message) followed by one
+`steve.respawned`, even when an observation shows the bot alive again before
+the death message arrives (the bot plugin respawns the bot one tick after
+death; that respawn is held until the message). Every server query for these
+events, including reading an MCPQ entity's type, runs in a worker thread. Before journaling a `steve.damaged` event,
 the writer adds a `source` from `get_last_attacker()`: Paper 26.x's
 `ticks_since_last_hurt_by_mob` (within 60 ticks) and `last_hurt_by_mob` UUID,
 resolved to a type with MCPQ `getEntityById`; each query is bounded to 2 s and

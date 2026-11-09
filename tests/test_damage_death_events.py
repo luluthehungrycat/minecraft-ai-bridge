@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -87,10 +88,21 @@ def make_client(
     log: list[str] = []
     known = entities or {}
 
-    def get_entity_by_id(entity_id: str) -> SimpleNamespace:
-        if entity_id not in known:
-            raise LookupError(entity_id)
-        return SimpleNamespace(type=known[entity_id])
+    loop_thread = threading.get_ident()
+
+    class FakeEntity:
+        def __init__(self, entity_type: str) -> None:
+            self._type = entity_type
+
+        @property
+        def type(self) -> str:
+            # MCPQ may query the server here, so it must not run on the loop.
+            assert threading.get_ident() != loop_thread, "entity.type read on the event loop"
+            return self._type
+
+    def get_entity_by_id(entity_id: str) -> FakeEntity:
+        # Like MCPQ: an unknown ID yields an entity whose type is UNKNOWN.
+        return FakeEntity(known.get(entity_id, "UNKNOWN"))
 
     client._mc = SimpleNamespace(getEntityById=get_entity_by_id)  # type: ignore[assignment]
 
@@ -228,14 +240,74 @@ def test_dying_again_after_respawn_rearms() -> None:
     assert count == 2
 
 
+def _types(events: list[Event]) -> list[str]:
+    return [e.type for e in events]
+
+
 def test_backend_death_arms_respawn_without_observing_health_zero() -> None:
     detector = ConditionEventDetector(steve_id="AIBot")
+    detector.expect_death_messages()
     assert detector.observe(WorldState(health=20, hunger=20, position=(1, 64, 2)), 0.0) == []
-    detector.mark_dead()
+    assert _types(detector.record_death("AIBot was slain by Zombie")) == ["steve.died"]
     events = detector.observe(WorldState(health=20, hunger=20, position=(0, 70, 0)), 1.0)
-    assert [e.type for e in events] == ["steve.respawned"]
+    assert _types(events) == ["steve.respawned"]
     assert events[0].payload == {"health": 20.0, "position": [0, 70, 0]}
     assert detector.observe(WorldState(health=20, hunger=20), 2.0) == []
+
+
+def test_observation_started_before_the_death_message_is_not_the_respawn() -> None:
+    """Seen live: a 2.4 s observation begun before the death finished after the
+    death message arrived and reported pre-death health as the respawn."""
+    detector = ConditionEventDetector(steve_id="AIBot")
+    detector.expect_death_messages()
+    detector.observe(WorldState(health=17.5, hunger=20), 0.0)
+    assert _types(detector.record_death("AIBot was slain by Zombie", now=10.0)) == ["steve.died"]
+    # In flight since t=9.5, before the death was reported: stale.
+    stale = detector.observe(WorldState(health=14.5, hunger=20, position=(0, 0, 0)), 9.5)
+    assert "steve.respawned" not in _types(stale)
+    fresh = detector.observe(WorldState(health=20, hunger=20, position=(8, 70, 2)), 10.25)
+    assert [e.payload for e in fresh if e.type == "steve.respawned"] == [
+        {"health": 20.0, "position": [8, 70, 2]}
+    ]
+
+
+def test_late_death_message_keeps_one_ordered_lifecycle() -> None:
+    """Seen dead, then alive, then the death message arrives (review round 1)."""
+    detector = ConditionEventDetector(steve_id="AIBot")
+    detector.expect_death_messages()
+    events = detector.observe(WorldState(health=0, hunger=20), 0.0)
+    events += detector.observe(WorldState(health=20, hunger=20, position=(0, 70, 0)), 0.25)
+    assert "steve.respawned" not in _types(events)  # held for the death message
+    late = detector.record_death("AIBot was slain by Zombie")
+    assert _types(late) == ["steve.died", "steve.respawned"]
+    assert late[1].payload == {"health": 20.0, "position": [0, 70, 0]}
+    assert "steve.respawned" not in _types(detector.observe(WorldState(health=20, hunger=20), 0.5))
+
+
+def test_observed_death_then_message_then_alive() -> None:
+    detector = ConditionEventDetector(steve_id="AIBot")
+    detector.expect_death_messages()
+    detector.observe(WorldState(health=0, hunger=20), 0.0)
+    assert _types(detector.record_death("AIBot drowned")) == ["steve.died"]
+    events = detector.observe(WorldState(health=20, hunger=20), 1.0)
+    assert _types(events) == ["steve.respawned"]
+
+
+def test_held_respawn_is_dropped_if_the_bot_is_dead_again() -> None:
+    detector = ConditionEventDetector(steve_id="AIBot")
+    detector.expect_death_messages()
+    detector.observe(WorldState(health=0, hunger=20), 0.0)
+    detector.observe(WorldState(health=20, hunger=20), 0.25)
+    detector.observe(WorldState(health=0, hunger=20), 0.5)
+    # The message pairs with the death still in progress: no respawn yet.
+    assert _types(detector.record_death("AIBot fell from a high place")) == ["steve.died"]
+    assert _types(
+        [
+            e
+            for e in detector.observe(WorldState(health=20, hunger=20), 1.0)
+            if e.type == "steve.respawned"
+        ]
+    ) == ["steve.respawned"]
 
 
 def test_respawn_without_position_has_none_position() -> None:
@@ -396,6 +468,73 @@ async def test_attribution_timeout_is_unknown(
     events = await _drive(tmp_path, Slow(), [20, 10])
     damaged = [e for e in events if e.type == "steve.damaged"]
     assert damaged and damaged[0].payload["source"] == {"kind": "unknown"}
+
+
+async def test_slow_death_poll_does_not_delay_reflexes(tmp_path: Path) -> None:
+    """A death query stuck for a long time must not slow the safety ticks."""
+    release = asyncio.Event()
+
+    class StuckDeaths(FakeWorldEvents):
+        async def get_death_messages(self) -> list[str]:
+            self.message_polls += 1
+            await release.wait()
+            return []
+
+    world = StuckDeaths()
+    times: list[float] = []
+
+    async def evaluate(state: WorldState) -> None:
+        times.append(asyncio.get_running_loop().time())
+
+    supervisor = SafetySupervisor(
+        lambda: _const_world(),
+        evaluate,
+        interval=0.001,
+        event_sink=lambda event: 1,
+        condition_events=ConditionEventDetector(),
+        world_events=world,
+    )
+    stop = asyncio.Event()
+    task = asyncio.create_task(supervisor.run(stop))
+    try:
+        async with asyncio.timeout(2):
+            while len(times) < 20:
+                await asyncio.sleep(0.001)
+        # The death query is still stuck, yet ticks kept their pace.
+        assert world.message_polls == 1 and not release.is_set()
+        assert max(b - a for a, b in zip(times, times[1:], strict=False)) < 0.2
+    finally:
+        stop.set()
+        await asyncio.wait_for(task, 2)
+        release.set()
+    await supervisor.close()
+
+
+async def test_death_poller_stops_with_the_supervisor(tmp_path: Path) -> None:
+    world = FakeWorldEvents()
+    supervisor = SafetySupervisor(
+        lambda: _const_world(),
+        _no_intervention,
+        interval=0.001,
+        event_sink=lambda event: 1,
+        condition_events=ConditionEventDetector(),
+        world_events=world,
+    )
+    stop = asyncio.Event()
+    task = asyncio.create_task(supervisor.run(stop))
+    async with asyncio.timeout(2):
+        while world.message_polls < 3:
+            await asyncio.sleep(0.001)
+    stop.set()
+    await asyncio.wait_for(task, 2)
+    polls = world.message_polls
+    await asyncio.sleep(0.02)
+    assert world.message_polls == polls
+    assert not [t for t in asyncio.all_tasks() if "_poll_death_events" in repr(t.get_coro())]
+
+
+async def _const_world() -> WorldState:
+    return WorldState(health=20, hunger=20)
 
 
 async def test_failing_death_poll_does_not_stop_reflexes(tmp_path: Path) -> None:

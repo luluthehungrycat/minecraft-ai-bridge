@@ -70,7 +70,9 @@ public class BotPlugin extends JavaPlugin implements Listener {
 
         Player existing = Bukkit.getPlayerExact(playerName);
         if (existing != null) {
-            if (bots.contains(existing.getUniqueId()) && existing.isDead()) {
+            if (!bots.contains(existing.getUniqueId())) {
+                sender.sendMessage("Player already online: " + playerName);
+            } else if (existing.isDead()) {
                 respawnBot(existing);
                 sender.sendMessage("Respawned bot: " + playerName);
             } else {

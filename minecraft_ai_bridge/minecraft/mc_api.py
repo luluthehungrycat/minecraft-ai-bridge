@@ -180,13 +180,22 @@ class McpqClient:
 
     async def _entity_type(self, entity_id: str) -> str | None:
         """Return ``minecraft:<type>`` of a loaded entity, or None if it is gone."""
-        if self._mc is None:
+        mc = self._mc
+        if mc is None:
             return None
+
+        def lookup() -> str:
+            # Reading ``type`` can itself query the server, so it runs in the
+            # worker thread with the lookup, never on the event loop.
+            return str(mc.getEntityById(entity_id).type)
+
         try:
-            entity = await self._run(self._mc.getEntityById, entity_id)
-            entity_type = str(entity.type)
+            entity_type = await self._run(lookup)
         except Exception:
             # Despawned or unloaded attackers cannot be looked up.
+            return None
+        if not entity_type or entity_type.upper() == "UNKNOWN":
+            # MCPQ reports an entity it could not find as type UNKNOWN.
             return None
         return entity_type if ":" in entity_type else f"minecraft:{entity_type}"
 

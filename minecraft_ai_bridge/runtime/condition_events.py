@@ -9,14 +9,17 @@ takes into a small number of durable events a controller can poll:
   ``amount`` and ``hits`` cover every drop since the previous event.
 - ``steve.health_low`` — health fell below ``health_low_threshold``.
 - ``steve.hunger_low`` — hunger fell below ``hunger_low_threshold``.
-- ``steve.respawned`` — the bot is alive (health above 0) again after an
-  observation showed it dead or :meth:`ConditionEventDetector.mark_dead`
-  reported a death. The bot plugin respawns the bot one tick after death,
-  usually before any observation sees health 0.
+- ``steve.died`` — a backend death message, passed to
+  :meth:`ConditionEventDetector.record_death`; the message names the cause.
+- ``steve.respawned`` — the bot is alive (health above 0) again after dying.
 
-``steve.died`` comes from the backend's death events rather than from
-observations; :func:`death_event` builds it, and the server's death message
-names the cause. The supervisor adds a damage ``source`` (see
+Each death yields one ``steve.died`` followed by one ``steve.respawned``,
+whatever order the two sources report it in: the bot plugin respawns the bot
+one tick after death, so an observation may show it alive again before the
+death message arrives (the respawn is then held for the message), or never
+show health 0 at all. Without death messages (:meth:`expect_death_messages`
+not called) an observed 0-then-alive transition emits ``steve.respawned``
+alone. The supervisor adds a damage ``source`` (see
 :func:`damage_source`) to ``steve.damaged`` before journaling it; deaths are
 not attributed that way because the respawn clears the attacker record.
 
@@ -117,38 +120,76 @@ class ConditionEventDetector:
         self._damage = _DamageState()
         self._health_low = _LowValueState(self.config.health_low_threshold, self.config.hysteresis)
         self._hunger_low = _LowValueState(self.config.hunger_low_threshold, self.config.hysteresis)
-        self._dead = False
+        self._death_messages = False
+        # Observed health 0 since the last respawn.
+        self._observed_dead = False
+        # A death message was reported; the next live observation is the respawn.
+        self._died_reported = False
+        # Alive again after an observed death, held until its death message.
+        self._held_respawn: dict[str, object] | None = None
+        self._died_at: float | None = None
 
-    def mark_dead(self) -> None:
-        """Record a backend-reported death; the next live observation is a respawn."""
-        self._dead = True
+    def expect_death_messages(self) -> None:
+        """Pair respawns with :meth:`record_death` instead of observations alone."""
+        self._death_messages = True
+
+    def record_death(self, message: str, now: float | None = None) -> list[Event]:
+        """Return ``steve.died`` for a backend death message, plus a held respawn.
+
+        ``now`` is when the message was received, on the same clock as
+        :meth:`observe`'s ``now``. Only an observation that started after it
+        can count as the respawn: one already in flight may still show the
+        bot alive from before it died.
+        """
+        events = [death_event(message, self.steve_id)]
+        if self._held_respawn is not None:
+            events.append(self._event(RESPAWNED_EVENT_TYPE, EventSeverity.INFO, self._held_respawn))
+            self._held_respawn = None
+        else:
+            self._died_reported = True
+            self._died_at = now
+        self._observed_dead = False
+        return events
+
+    def _observe_life(self, health: float, world: WorldState, now: float) -> Event | None:
+        if health <= 0:
+            self._observed_dead = True
+            self._held_respawn = None
+            return None
+        if self._died_reported and self._died_at is not None and now <= self._died_at:
+            # Taken before the death was reported: it may predate the death.
+            return None
+        if not (self._died_reported or self._observed_dead):
+            return None
+        position = world.position
+        payload: dict[str, object] = {
+            "health": health,
+            "position": list(position) if position is not None else None,
+        }
+        if self._died_reported or not self._death_messages:
+            self._died_reported = False
+            self._observed_dead = False
+            return self._event(RESPAWNED_EVENT_TYPE, EventSeverity.INFO, payload)
+        # Seen dead and alive again, but the death message is still on its way.
+        self._observed_dead = False
+        self._held_respawn = payload
+        return None
 
     def observe(self, world: WorldState, now: float) -> list[Event]:
         """Return the events this observation triggers (usually none).
 
-        ``now`` is a monotonic timestamp in seconds used only for the damage
-        cooldown.
+        ``now`` is a monotonic timestamp in seconds for when the observation
+        started; it times the damage cooldown and orders observations
+        against :meth:`record_death`.
         """
         events: list[Event] = []
         health = _finite(world.health)
         hunger = _finite(world.hunger)
 
         if health is not None:
-            if health <= 0:
-                self._dead = True
-            elif self._dead:
-                self._dead = False
-                position = world.position
-                events.append(
-                    self._event(
-                        RESPAWNED_EVENT_TYPE,
-                        EventSeverity.INFO,
-                        {
-                            "health": health,
-                            "position": list(position) if position is not None else None,
-                        },
-                    )
-                )
+            respawned = self._observe_life(health, world, now)
+            if respawned is not None:
+                events.append(respawned)
             damaged = self._observe_damage(health, now)
             if damaged is not None:
                 events.append(damaged)

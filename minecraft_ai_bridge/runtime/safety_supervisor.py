@@ -17,7 +17,6 @@ from .condition_events import (
     ATTRIBUTED_EVENT_TYPES,
     ConditionEventDetector,
     damage_source,
-    death_event,
 )
 from .contracts import Event, EventSeverity
 
@@ -94,14 +93,33 @@ class SafetySupervisor:
         self._condition_dropped = 0
         # Death events and damage sources; used only with condition events.
         self._world_events = world_events if self._conditions is not None else None
+        if self._world_events is not None and self._conditions is not None:
+            self._conditions.expect_death_messages()
 
     async def run(self, stop_event: asyncio.Event) -> None:
         """Poll independently until asked to stop; isolate per-tick failures."""
 
+        # Death events are polled by their own task so a slow backend query
+        # never delays an observation or a reflex.
+        death_poller = (
+            asyncio.create_task(self._poll_death_events(stop_event))
+            if self._world_events is not None
+            else None
+        )
+        try:
+            await self._run_ticks(stop_event)
+        finally:
+            if death_poller is not None:
+                death_poller.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await death_poller
+
+    async def _run_ticks(self, stop_event: asyncio.Event) -> None:
         while not stop_event.is_set():
             try:
+                started = asyncio.get_running_loop().time()
                 world = await self._observe()
-                self._record_condition_events(world)
+                self._record_condition_events(world, started)
                 if stop_event.is_set():
                     break
                 result = await self._evaluate(world)
@@ -113,8 +131,6 @@ class SafetySupervisor:
                         self._pending = result
                     self._intervention_ready.set()
                     self._record_intervention_event(result)
-                # After the reflex, so a slow backend query never delays it.
-                await self._record_death_events()
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -169,22 +185,28 @@ class SafetySupervisor:
         self._event_writes.add(write_task)
         write_task.add_done_callback(self._event_writes.discard)
 
-    def _record_condition_events(self, world: WorldState) -> None:
+    def _record_condition_events(self, world: WorldState, started: float) -> None:
         """Queue this observation's condition events without awaiting the journal."""
 
         if self._conditions is None:
             return
         try:
-            events = self._conditions.observe(world, asyncio.get_running_loop().time())
+            events = self._conditions.observe(world, started)
         except Exception:
             logger.exception("Condition event detection failed")
             return
         self._queue_condition_events(events)
 
-    async def _record_death_events(self) -> None:
-        """Queue a ``steve.died`` event for each backend death message."""
+    async def _poll_death_events(self, stop_event: asyncio.Event) -> None:
+        while not stop_event.is_set():
+            await self._record_death_events()
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(stop_event.wait(), timeout=self._interval)
 
-        if self._world_events is None:
+    async def _record_death_events(self) -> None:
+        """Queue a ``steve.died`` event (and any held respawn) per death message."""
+
+        if self._world_events is None or self._conditions is None:
             return
         try:
             messages = await asyncio.wait_for(
@@ -195,9 +217,9 @@ class SafetySupervisor:
         except Exception:
             logger.warning("Could not poll death events", exc_info=True)
             return
-        if messages and self._conditions is not None:
-            self._conditions.mark_dead()
-        self._queue_condition_events([death_event(m, self._steve_id) for m in messages])
+        for message in messages:
+            received = asyncio.get_running_loop().time()
+            self._queue_condition_events(self._conditions.record_death(message, received))
 
     def _queue_condition_events(self, events: list[Event]) -> None:
         for event in events:
