@@ -77,6 +77,7 @@ class ControllerSafety:
                 self._preservation.config.condition_event_config(),
                 steve_id=controller.steve_id,
             ),
+            world_events=world,
         )
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None

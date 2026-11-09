@@ -184,13 +184,22 @@ The same polling records the bot's condition, also attributed to this Steve:
 
 | Event | When | Payload |
 |-------|------|---------|
-| `steve.damaged` | Health dropped by at least 1.5 HP. During sustained damage, at most one event every 2 s; damage taken in between is added to the next event. | `health`, `previous_health`, `amount` (HP lost), `hits` |
+| `steve.damaged` | Health dropped by at least 1.5 HP. During sustained damage, at most one event every 2 s; damage taken in between is added to the next event. | `health`, `previous_health`, `amount` (HP lost), `hits`, `source` |
 | `steve.health_low` | Health fell below 4 (HIGH). | `health`, `threshold` |
 | `steve.hunger_low` | Hunger fell below 6 (MEDIUM). | `hunger`, `threshold` |
+| `steve.died` | The bot died (CRITICAL). | `message`: the server's death message, such as `AIBot was slain by Zombie` |
+| `steve.respawned` | The bot is alive again after dying (INFO). The bot plugin respawns it one tick after death. Every `steve.died` is followed by exactly one `steve.respawned` before the next `steve.died`. | `health`, `position` (`[x, y, z]`); both null if the bot died again before a respawn was observed |
 
 The two `_low` events fire once when the value crosses below the threshold and
-again only after it has recovered by 2 points. `steve.damaged` does not say what
-caused the damage. These events are informational: the reflexes do not wait for
+again only after it has recovered by 2 points.
+
+`source` on `steve.damaged` is `{"kind": "entity", "entity_type":
+"minecraft:zombie"}` when an entity hurt the bot within the last 3 seconds
+(`entity_type` is null if the attacker has despawned), `{"kind":
+"environment"}` otherwise (falls, fire, lava, drowning), or `{"kind":
+"unknown"}` if the server could not be asked. It is an inference from the
+server's last-attacker record, so a fall shortly after a mob hit is credited
+to the mob. These events are informational: the reflexes do not wait for
 anyone to read them.
 `SAFETY_PREEMPTED` means the action never reached the backend: inspect fresh
 state and use a new request ID to try again. `SAFETY_INTERRUPTED` means a
@@ -245,7 +254,8 @@ Each subscription receives events in journal order, one at a time, retried
 with doubling backoff until it answers 2xx or runs out of attempts (then the
 event is dead-lettered and the next one is sent). Delivery is at least once,
 and delivery state survives restarts: events journaled while the server was
-down are sent when it starts again. URLs must be HTTPS on port 443 and resolve
+down are sent when it starts again, as long as the journal still retains them
+(events pruned before delivery are dead-lettered). URLs must be HTTPS on port 443 and resolve
 to public addresses. Requests are signed: verify `X-Webhook-Signature`
 (`sha256=` + hex HMAC-SHA256 of `X-Webhook-Timestamp` + `.` + the raw body) and
 deduplicate on `X-Webhook-Delivery-Id`. See

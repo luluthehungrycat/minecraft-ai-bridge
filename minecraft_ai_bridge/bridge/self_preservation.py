@@ -265,7 +265,8 @@ class SelfPreservationLayer:
 
         # Step 2: damage source check — was the player hit by an entity?
         # This is the critical guard against reflex-on-falling-damage,
-        # reflex-on-cactus, etc.  Uses /data get entity @p LastHurtByEntity.
+        # reflex-on-cactus, etc.  True when an entity hurt the bot within the
+        # last 3 seconds (Paper 26.x ``last_hurt_by_mob``; see McpqClient).
         try:
             hurt_by_entity = await self._mc.get_hurt_by_entity()
         except Exception as exc:

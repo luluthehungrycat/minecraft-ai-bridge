@@ -13,11 +13,18 @@ import org.bukkit.Bukkit;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
 import org.bukkit.craftbukkit.CraftServer;
+import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.Listener;
+import org.bukkit.event.entity.PlayerDeathEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.jetbrains.annotations.NotNull;
 
 import java.net.InetAddress;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * A minimal Paper plugin that creates a fake player (bot) entity on the server.
@@ -27,12 +34,16 @@ import java.util.UUID;
  * Usage: /botsummon <name>
  * Note: This running Paper version must equal <api-version> for bot to work.
  */
-public class BotPlugin extends JavaPlugin {
+public class BotPlugin extends JavaPlugin implements Listener {
 
     private static final String OFFLINE_PLAYER_PREFIX = "OfflinePlayer:";
 
+    /** UUIDs of bots summoned by this plugin; they have no client to request a respawn. */
+    private final Set<UUID> bots = ConcurrentHashMap.newKeySet();
+
     @Override
     public void onEnable() {
+        getServer().getPluginManager().registerEvents(this, this);
         getLogger().info("MCPQ-Bot plugin enabled");
         getLogger().info("Server version: " + Bukkit.getMinecraftVersion());
         getLogger().info("Server Bukkit version: " + Bukkit.getVersion());
@@ -57,6 +68,19 @@ public class BotPlugin extends JavaPlugin {
             return true;
         }
 
+        Player existing = Bukkit.getPlayerExact(playerName);
+        if (existing != null) {
+            if (!bots.contains(existing.getUniqueId())) {
+                sender.sendMessage("Player already online: " + playerName);
+            } else if (existing.isDead()) {
+                respawnBot(existing);
+                sender.sendMessage("Respawned bot: " + playerName);
+            } else {
+                sender.sendMessage("Bot already online: " + playerName);
+            }
+            return true;
+        }
+
         try {
             summonBot(playerName);
             sender.sendMessage("Summoned bot: " + playerName);
@@ -67,6 +91,28 @@ public class BotPlugin extends JavaPlugin {
         }
 
         return true;
+    }
+
+    @EventHandler
+    public void onPlayerDeath(PlayerDeathEvent event) {
+        Player player = event.getPlayer();
+        if (!bots.contains(player.getUniqueId())) {
+            return;
+        }
+        // A real client would send the respawn request; the fake one never does.
+        Bukkit.getScheduler().runTaskLater(this, () -> respawnBot(player), 1L);
+    }
+
+    @EventHandler
+    public void onPlayerQuit(PlayerQuitEvent event) {
+        bots.remove(event.getPlayer().getUniqueId());
+    }
+
+    private void respawnBot(@NotNull Player player) {
+        if (player.isOnline() && player.isDead()) {
+            player.spigot().respawn();
+            getLogger().info("Respawned bot '" + player.getName() + "'");
+        }
     }
 
     /**
@@ -106,6 +152,7 @@ public class BotPlugin extends JavaPlugin {
         PlayerList playerList = craftServer.getHandle();
         playerList.placeNewPlayer(connection, player, cookie);
 
+        bots.add(uuid);
         getLogger().info("Bot '" + name + "' summoned at " +
                 player.getX() + ", " + player.getY() + ", " + player.getZ());
     }

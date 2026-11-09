@@ -9,6 +9,19 @@ takes into a small number of durable events a controller can poll:
   ``amount`` and ``hits`` cover every drop since the previous event.
 - ``steve.health_low`` — health fell below ``health_low_threshold``.
 - ``steve.hunger_low`` — hunger fell below ``hunger_low_threshold``.
+- ``steve.died`` — a backend death message, passed to
+  :meth:`ConditionEventDetector.record_death`; the message names the cause.
+- ``steve.respawned`` — the bot is alive (health above 0) again after dying.
+
+Each death yields one ``steve.died`` followed by one ``steve.respawned``,
+whatever order the two sources report it in: the bot plugin respawns the bot
+one tick after death, so an observation may show it alive again before the
+death message arrives (the respawn is then held for the message), or never
+show health 0 at all. Without death messages (:meth:`expect_death_messages`
+not called) an observed 0-then-alive transition emits ``steve.respawned``
+alone. The supervisor adds a damage ``source`` (see
+:func:`damage_source`) to ``steve.damaged`` before journaling it; deaths are
+not attributed that way because the respawn clears the attacker record.
 
 The low-value events are edge-triggered: each fires once when the value
 first crosses below its threshold (including on the first observation) and
@@ -24,16 +37,27 @@ the ``now`` timestamps, which makes it independent of wall-clock time.
 from __future__ import annotations
 
 import math
+from collections import deque
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from ..minecraft.observer import WorldState
 from .contracts import Event, EventSeverity
 
+if TYPE_CHECKING:
+    from ..minecraft.mc_api import LastAttacker
+
 DAMAGED_EVENT_TYPE = "steve.damaged"
 HEALTH_LOW_EVENT_TYPE = "steve.health_low"
 HUNGER_LOW_EVENT_TYPE = "steve.hunger_low"
+DIED_EVENT_TYPE = "steve.died"
+RESPAWNED_EVENT_TYPE = "steve.respawned"
 CONDITION_EVENT_SOURCE = "condition_monitor"
+# Live-after-death observations kept while their death messages are late.
+_MAX_HELD_RESPAWNS = 16
+# Event types that get a damage ``source`` before they are journaled.
+ATTRIBUTED_EVENT_TYPES = frozenset({DAMAGED_EVENT_TYPE})
 
 
 @dataclass(frozen=True)
@@ -99,18 +123,102 @@ class ConditionEventDetector:
         self._damage = _DamageState()
         self._health_low = _LowValueState(self.config.health_low_threshold, self.config.hysteresis)
         self._hunger_low = _LowValueState(self.config.hunger_low_threshold, self.config.hysteresis)
+        self._death_messages = False
+        # Observed health 0 and no live observation since.
+        self._observed_dead = False
+        # ``steve.died`` was emitted and its ``steve.respawned`` is still due.
+        self._awaiting_respawn = False
+        self._died_at: float | None = None
+        # Live observations after observed deaths, oldest first, each held
+        # until its death message arrives.
+        self._held_respawns: deque[dict[str, object]] = deque()
+        # Held respawns dropped for space: the oldest deaths, whose messages
+        # arrive first and get a null ``steve.respawned``.
+        self._dropped_respawns = 0
 
-    def observe(self, world: WorldState, now: float) -> list[Event]:
+    def expect_death_messages(self) -> None:
+        """Pair respawns with :meth:`record_death` instead of observations alone."""
+        self._death_messages = True
+
+    def record_death(self, message: str, now: float | None = None) -> list[Event]:
+        """Return the events for one backend death message.
+
+        Deaths and respawns strictly alternate: ``steve.died``, then a held
+        ``steve.respawned`` if the bot was already seen alive again after this
+        death. If the previous death's respawn was never observed (the bot
+        died again first), a ``steve.respawned`` with null ``health`` and
+        ``position`` closes it before this ``steve.died``.
+
+        ``now`` is when the message was received, on the clock of
+        :meth:`observe`'s ``started``. Only an observation that started after
+        it can count as the respawn: one already in flight may still show
+        the bot alive from before it died.
+        """
+        events: list[Event] = []
+        if self._awaiting_respawn:
+            events.append(self._respawned({"health": None, "position": None}))
+            self._awaiting_respawn = False
+        events.append(death_event(message, self.steve_id))
+        if self._dropped_respawns:
+            # The oldest deaths' respawns were dropped for space.
+            self._dropped_respawns -= 1
+            events.append(self._respawned({"health": None, "position": None}))
+        elif self._held_respawns:
+            # This message belongs to the oldest observed death and respawn.
+            events.append(self._respawned(self._held_respawns.popleft()))
+        else:
+            self._awaiting_respawn = True
+            self._died_at = now
+            self._observed_dead = False
+        return events
+
+    def _respawned(self, payload: dict[str, object]) -> Event:
+        return self._event(RESPAWNED_EVENT_TYPE, EventSeverity.INFO, payload)
+
+    def _observe_life(self, health: float, world: WorldState, started: float) -> Event | None:
+        if health <= 0:
+            self._observed_dead = True
+            return None
+        position = world.position
+        payload: dict[str, object] = {
+            "health": health,
+            "position": list(position) if position is not None else None,
+        }
+        if self._awaiting_respawn:
+            if self._died_at is not None and started <= self._died_at:
+                # Begun before the death was reported: it may predate the death.
+                return None
+            self._awaiting_respawn = False
+            self._observed_dead = False
+            return self._respawned(payload)
+        if not self._observed_dead:
+            return None
+        self._observed_dead = False
+        if not self._death_messages:
+            return self._respawned(payload)
+        # Seen dead and alive again, but the death message is still on its way.
+        if len(self._held_respawns) >= _MAX_HELD_RESPAWNS:
+            self._held_respawns.popleft()
+            self._dropped_respawns += 1
+        self._held_respawns.append(payload)
+        return None
+
+    def observe(self, world: WorldState, now: float, started: float | None = None) -> list[Event]:
         """Return the events this observation triggers (usually none).
 
-        ``now`` is a monotonic timestamp in seconds used only for the damage
-        cooldown.
+        ``now`` is a monotonic timestamp in seconds for when the observation
+        completed; it times the damage cooldown. ``started`` (default
+        ``now``) is when the observation began, which orders it against
+        :meth:`record_death`.
         """
         events: list[Event] = []
         health = _finite(world.health)
         hunger = _finite(world.hunger)
 
         if health is not None:
+            respawned = self._observe_life(health, world, now if started is None else started)
+            if respawned is not None:
+                events.append(respawned)
             damaged = self._observe_damage(health, now)
             if damaged is not None:
                 events.append(damaged)
@@ -187,6 +295,36 @@ class ConditionEventDetector:
         )
 
 
+def death_event(message: str, steve_id: str | None) -> Event:
+    """Build a ``steve.died`` event from a backend death message.
+
+    ``message`` is the server's death message, for example
+    ``"AIBot was blown up by Creeper"``.
+    """
+    return Event(
+        event_id=f"evt-{uuid4()}",
+        type=DIED_EVENT_TYPE,
+        severity=EventSeverity.CRITICAL,
+        steve_id=steve_id,
+        source=CONDITION_EVENT_SOURCE,
+        payload={"message": message[:500]},
+    )
+
+
+def damage_source(attacker: LastAttacker | None) -> dict[str, object]:
+    """Describe the likely damage source for an event payload.
+
+    ``{"kind": "entity", "entity_type": "minecraft:zombie"}`` when an entity
+    hurt the bot recently (``entity_type`` is None if it is no longer
+    loaded or the server does not record it), otherwise
+    ``{"kind": "environment"}``. This is an inference: an entity hit within
+    the last few seconds is credited even if a later fall did the damage.
+    """
+    if attacker is None:
+        return {"kind": "environment"}
+    return {"kind": "entity", "entity_type": attacker.entity_type}
+
+
 def _finite(value: float | int | None) -> float | None:
     if value is None or isinstance(value, bool):
         return None
@@ -195,10 +333,15 @@ def _finite(value: float | int | None) -> float | None:
 
 
 __all__ = [
+    "ATTRIBUTED_EVENT_TYPES",
     "CONDITION_EVENT_SOURCE",
     "DAMAGED_EVENT_TYPE",
+    "DIED_EVENT_TYPE",
     "HEALTH_LOW_EVENT_TYPE",
     "HUNGER_LOW_EVENT_TYPE",
+    "RESPAWNED_EVENT_TYPE",
     "ConditionEventConfig",
     "ConditionEventDetector",
+    "damage_source",
+    "death_event",
 ]

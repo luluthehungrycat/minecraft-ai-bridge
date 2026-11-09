@@ -8,12 +8,20 @@ import inspect
 import logging
 from collections import deque
 from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Protocol
 from uuid import uuid4
 
 from ..minecraft.actions import ActionResult, ActionType
 from ..minecraft.observer import WorldState
-from .condition_events import ConditionEventDetector
+from .condition_events import (
+    ATTRIBUTED_EVENT_TYPES,
+    ConditionEventDetector,
+    damage_source,
+)
 from .contracts import Event, EventSeverity
+
+if TYPE_CHECKING:
+    from ..minecraft.mc_api import LastAttacker
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +33,16 @@ _SAFETY_EVENT_ACTIONS = frozenset(
 # Condition events are rate-limited at the source (edge triggers and a damage
 # cooldown), so this only fills if the journal stalls for minutes.
 _MAX_PENDING_CONDITION_EVENTS = 64
+# Bound on each backend query made for condition events.
+_WORLD_EVENT_TIMEOUT_SECONDS = 2.0
+
+
+class ConditionWorldEvents(Protocol):
+    """Backend queries for death events and damage attribution."""
+
+    async def get_last_attacker(self, max_age_ticks: int = 60) -> LastAttacker | None: ...
+
+    async def get_death_messages(self) -> list[str]: ...
 
 
 class SafetySupervisor:
@@ -47,6 +65,7 @@ class SafetySupervisor:
         event_sink: Callable[[Event], int | Awaitable[int]] | None = None,
         steve_id: str | None = None,
         condition_events: ConditionEventDetector | None = None,
+        world_events: ConditionWorldEvents | None = None,
     ) -> None:
         if interval <= 0:
             raise ValueError("safety supervisor interval must be positive")
@@ -72,14 +91,37 @@ class SafetySupervisor:
         self._condition_queue: deque[Event] = deque()
         self._condition_writer: asyncio.Task[None] | None = None
         self._condition_dropped = 0
+        # Death events and damage sources; used only with condition events.
+        self._world_events = world_events if self._conditions is not None else None
+        if self._world_events is not None and self._conditions is not None:
+            self._conditions.expect_death_messages()
+        # At most one backend query of each kind at a time (see _query).
+        self._queries: dict[str, asyncio.Task[Any]] = {}
 
     async def run(self, stop_event: asyncio.Event) -> None:
         """Poll independently until asked to stop; isolate per-tick failures."""
 
+        # Death events are polled by their own task so a slow backend query
+        # never delays an observation or a reflex.
+        death_poller = (
+            asyncio.create_task(self._poll_death_events(stop_event))
+            if self._world_events is not None
+            else None
+        )
+        try:
+            await self._run_ticks(stop_event)
+        finally:
+            if death_poller is not None:
+                death_poller.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await death_poller
+
+    async def _run_ticks(self, stop_event: asyncio.Event) -> None:
         while not stop_event.is_set():
             try:
+                started = asyncio.get_running_loop().time()
                 world = await self._observe()
-                self._record_condition_events(world)
+                self._record_condition_events(world, started)
                 if stop_event.is_set():
                     break
                 result = await self._evaluate(world)
@@ -145,16 +187,81 @@ class SafetySupervisor:
         self._event_writes.add(write_task)
         write_task.add_done_callback(self._event_writes.discard)
 
-    def _record_condition_events(self, world: WorldState) -> None:
+    def _record_condition_events(self, world: WorldState, started: float) -> None:
         """Queue this observation's condition events without awaiting the journal."""
 
         if self._conditions is None:
             return
         try:
-            events = self._conditions.observe(world, asyncio.get_running_loop().time())
+            # Completion time for the damage cooldown, start time for
+            # ordering against death messages.
+            events = self._conditions.observe(
+                world, asyncio.get_running_loop().time(), started=started
+            )
         except Exception:
             logger.exception("Condition event detection failed")
             return
+        self._queue_condition_events(events)
+
+    async def _poll_death_events(self, stop_event: asyncio.Event) -> None:
+        while not stop_event.is_set():
+            await self._record_death_events()
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(stop_event.wait(), timeout=self._interval)
+
+    async def _record_death_events(self) -> None:
+        """Queue a ``steve.died`` event (and any held respawn) per death message."""
+
+        if self._world_events is None or self._conditions is None:
+            return
+        try:
+            finished, messages = await self._query(
+                "deaths", self._world_events.get_death_messages, reuse_late=True
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("Could not poll death events", exc_info=True)
+            return
+        if not finished:
+            return
+        for message in messages:
+            received = asyncio.get_running_loop().time()
+            self._queue_condition_events(self._conditions.record_death(message, received))
+
+    async def _query(
+        self, kind: str, start: Callable[[], Awaitable[Any]], *, reuse_late: bool
+    ) -> tuple[bool, Any]:
+        """Run one backend query of ``kind``, waiting at most the timeout.
+
+        Returns ``(True, result)``, or ``(False, None)`` if no current result
+        is available within the timeout. A query that timed out keeps running
+        in its worker thread and no other query of its kind starts until it
+        finishes, so a stalled server cannot pile up threads. With
+        ``reuse_late`` its eventual result is returned by the next call (death
+        messages must not be lost); otherwise it is discarded, since it
+        answered an earlier question (an attacker lookup for an earlier hit),
+        and calls return ``(False, None)`` without waiting while it runs.
+        Failures propagate.
+        """
+        task = self._queries.get(kind)
+        if task is not None and not reuse_late:
+            if not task.done():
+                return False, None
+            del self._queries[kind]
+            if not task.cancelled():
+                task.exception()  # retrieved, so a late failure is not logged as unhandled
+            task = None
+        if task is None:
+            task = asyncio.ensure_future(start())
+            self._queries[kind] = task
+        done, _ = await asyncio.wait({task}, timeout=_WORLD_EVENT_TIMEOUT_SECONDS)
+        if not done:
+            return False, None
+        del self._queries[kind]
+        return True, task.result()
+
+    def _queue_condition_events(self, events: list[Event]) -> None:
         for event in events:
             if len(self._condition_queue) >= _MAX_PENDING_CONDITION_EVENTS:
                 self._condition_queue.popleft()
@@ -171,7 +278,28 @@ class SafetySupervisor:
 
     async def _write_condition_events(self) -> None:
         while self._condition_queue:
-            await self._append_event(self._condition_queue.popleft())
+            event = self._condition_queue.popleft()
+            if event.type in ATTRIBUTED_EVENT_TYPES:
+                event = await self._attribute(event)
+            await self._append_event(event)
+
+    async def _attribute(self, event: Event) -> Event:
+        """Add the likely damage ``source``; ``{"kind": "unknown"}`` if the query fails."""
+
+        if self._world_events is None:
+            return event
+        source: dict[str, object]
+        try:
+            finished, attacker = await self._query(
+                "attacker", self._world_events.get_last_attacker, reuse_late=False
+            )
+            source = damage_source(attacker) if finished else {"kind": "unknown"}
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("Could not attribute %s event", event.type, exc_info=True)
+            source = {"kind": "unknown"}
+        return event.model_copy(update={"payload": {**event.payload, "source": source}})
 
     async def _write_events(self, event: Event) -> None:
         current: Event | None = event
@@ -248,6 +376,13 @@ class SafetySupervisor:
             await asyncio.gather(*list(self._event_writes))
         if self._condition_writer is not None:
             await self._condition_writer
+        # Stalled backend queries: stop waiting for them (their worker
+        # threads end with the call they are blocked in).
+        queries = list(self._queries.values())
+        self._queries.clear()
+        for task in queries:
+            task.cancel()
+        await asyncio.gather(*queries, return_exceptions=True)
 
     def take_nowait(self) -> ActionResult | None:
         """Return and clear the pending intervention, if one is available."""
