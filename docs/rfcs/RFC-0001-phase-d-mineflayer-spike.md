@@ -79,6 +79,8 @@ ControllerService ─▶ ActionService (policy, reach guard, idempotency, audit)
 - The shared `WorldAdapter` Protocol is narrowed to what both backends can honestly provide (position, health/food, inventory, block reads, time, players, chat, death/respawn events). Command methods (`run_as_player`, `run_command_blocking`, `set_block`, `teleport_player`) move to an MCPQ-only protocol. Code that needs them (observer NBT parsing, safety reflexes, chat commands) gets a per-backend path or reports the capability as missing.
 - `Capabilities` already has `backend=mineflayer`, `movement=physical`, `crafting=vanilla`. The Mineflayer adapter reports `world_edit=False`, `max_interaction_distance≈4.5` (survival reach), and `supported_versions` taken from the connected session.
 - Reach limits and authorization are unchanged and still enforced in Python before dispatch. Mineflayer adds the game's own limits on top (survival reach, needing the item in inventory, line of sight).
+- **Authorization stays conservative at first.** `classify_action` depends only on the `ActionType`. Physical Mineflayer moves, digs and places therefore keep their current class and still need the service's `admin:world` token plus the matching `steve:world:*` delegation scope. Relaxing that for physical actions (for example, a survival-only scope that does not need `admin:world`) is a separate, later decision that would make the classification backend-aware.
+- **Capabilities needs a schema extension.** Today it has no per-action field. Add `actions: dict[ActionType, SupportLevel]` (`supported` | `physical` | `unsupported`), which ControllerService checks before dispatch.
 
 ## 3. Capability parity matrix (controller-exposed actions)
 
@@ -89,7 +91,7 @@ ControllerService ─▶ ActionService (policy, reach guard, idempotency, audit)
 | scan / scan_entities | Block reads and selector tests | `bot.blockAt` in loaded chunks; `bot.entities` | Mineflayer only sees loaded, visible chunks |
 | chat | `post_to_chat` | `bot.chat` | Equivalent |
 | wait / done | Local | Local | Equivalent |
-| **walk_to** | A* plus stepwise teleports | `mineflayer-pathfinder` `goto` | **Physical**: can fail, fall or take damage; longer |
+| **walk_to** | A* plus stepwise teleports | `mineflayer-pathfinder` `goto`, with `Movements.canDig = false`, `allow1by1towers = false` and no scaffolding blocks | **Physical**: can fail, fall or take damage; longer. Pathfinder digs and builds by default, which would turn a movement grant into world edits; movement must never edit. |
 | move_to / teleport | `/tp` (privileged) | **Unsupported**, or mapped to `walk_to` within reach limits | Teleporting needs OP; do not grant it |
 | move_forward/back, turn, jump, sprint | Small teleports | Control states for a bounded time; `bot.look` | Physical |
 | **break_block** | `setblock air` (instant, any block) | `bot.dig(block)` | Takes time, needs a suitable tool, drops items, needs reach |
@@ -101,20 +103,35 @@ ControllerService ─▶ ActionService (policy, reach guard, idempotency, audit)
 | interact | `execute … run interact` | `bot.activateBlock` / `activateEntity` | Equivalent intent |
 | **stop** (gate) | No dedicated action; tasks cancel between steps | `pathfinder.setGoal(null)` (not `stop()`, which runs on to a safe node), `clearControlStates()`, `stopDigging()` | Needed for both backends: add a `stop` action to the controller API |
 
-Every action gets an explicit status per backend (supported, physical, unsupported) through `Capabilities`. An unsupported action is rejected with `ACTION_NOT_SUPPORTED` before dispatch, never silently mapped to a privileged path.
+Every action gets an explicit status per backend (supported, physical, unsupported) through the new `Capabilities.actions` field. An unsupported action is rejected with `ACTION_NOT_SUPPORTED` before dispatch, never silently mapped to a privileged path.
 
 ## 4. Sidecar protocol
 
 - **Transport:** the Python adapter spawns `node sidecar/index.js`, and the two exchange newline-delimited JSON-RPC 2.0 messages over stdin/stdout, with stderr used for logs. There is no port to secure, the OS process boundary does the authentication, and closing stdin ends the bot.
 - **Requests** (Python → sidecar): `connect{host, port, username, auth, version}`, `observe{}`, `block_at{x,y,z}`, `goto{x,y,z,range,timeout_ms}`, `dig{x,y,z,timeout_ms}`, `place{x,y,z,item,timeout_ms}`, `equip`, `consume`, `attack{entity_id}`, `chat{message}`, `stop{}`. Each request carries an `id` and a deadline. The sidecar answers with a result `{ok, data}` or a typed error (`TIMEOUT`, `NOT_REACHABLE`, `NO_ITEM`, `INTERRUPTED`, `NOT_CONNECTED`).
 - **Notifications** (sidecar → Python): `spawn`, `health{health, food}`, `hurt{attacker_type?}`, `death{message}`, `respawn`, `chat`, `kicked{reason}`, `end{reason}`, plus a `heartbeat` every second. These feed the existing condition detector and event journal (`steve.damaged` with a real attacker, `steve.died`, `steve.respawned`), replacing MCPQ's NBT polling with push events.
-- **One mutation at a time:** Python's ActionService already serializes dispatches. The sidecar rejects a second mutating request while one is running, except `stop`, which always preempts.
+- **One mutation at a time:** Python's ActionService already serializes dispatches. The sidecar also rejects a second mutating request while one is running.
+- **Stop does not go through the dispatch lock.** `ActionService.execute` holds `_dispatch_lock` for the whole handler, so a `stop` sent as an ordinary action would wait for the `goto` it is meant to end. Instead:
+  - `stop` is a ControllerService call with its own path. It needs the same session, generation and credential checks as an action, and is audited and journaled.
+  - It calls `adapter.interrupt()` directly, without taking the dispatch lock. That sends `stop{op_id}` to the sidecar for the in-flight operation.
+  - The in-flight handler then returns `INTERRUPTED`, which releases the lock. The stop itself is not a mutation and has no request-ID idempotency.
+  - The gate tests stop against a deliberately stalled `goto`.
 - **Versioning:** the first message is `hello{protocol: 1, mineflayer, minecraft_version}`, and Python refuses a mismatched protocol version.
 
 ## 5. Faults and safety
 
 - **Policies cannot be bypassed by faults:** authorization, reach limits, idempotency and audit all run in Python before a request is sent. A sidecar that crashes, hangs or behaves badly can only fail requests; it cannot widen what is allowed.
-- **Outcomes when the sidecar or network fails:** a mutating request that times out, or whose sidecar dies, finishes as `OUTCOME_UNKNOWN` and is never retried automatically. This is the same rule as the durable outcome store and task runner today.
+- **Outcomes when the sidecar or network fails:** a mutating request that times out, or whose sidecar dies, finishes as `OUTCOME_UNKNOWN` and is never retried automatically. Today's dispatcher cannot express that: `execute_action` turns handler exceptions into failed results, and ActionService records unsuccessful results as `failed`. So:
+  - the Mineflayer adapter raises a dedicated `BackendOutcomeUnknown`;
+  - `execute_action` re-raises it instead of converting it;
+  - ActionService records the existing `unknown` outcome status (as it already does for a dispatch cancelled midway) in memory and in the durable outcome store, so a replay returns `unknown` and never re-dispatches;
+  - ControllerService returns `INTERRUPTED` with reason code `OUTCOME_UNKNOWN`;
+  - the task runner checkpoints the step as `OUTCOME_UNKNOWN`, as it does for an in-flight step after a restart.
+- **Deadlines fence the outstanding work.** A sidecar can stay alive and answer pings while one operation runs past its deadline, so neither watchdog below would catch it. Therefore:
+  - every mutating request carries an `op_id` and `deadline_ms`, and the sidecar aborts the operation itself at the deadline;
+  - when Python's own deadline (sidecar deadline plus a margin) passes, the adapter records `OUTCOME_UNKNOWN`, sends `stop{op_id}`, and enters a **fenced** state that rejects every new mutation;
+  - it leaves the fenced state only when the sidecar acknowledges `stopped{op_id}` with no operation running. Without that acknowledgement within a few seconds, it kills the sidecar process;
+  - each sidecar process and connection gets a new `epoch`. Responses and notifications from an older epoch are dropped, so a late result from before a restart or reconnect cannot be mistaken for current state.
 - **Watchdogs:**
   - Python marks the adapter disconnected after 3 missed heartbeats and reports degraded capabilities.
   - The sidecar runs `stop` (clearing control states, stopping pathfinding and digging) when stdin closes or no Python request or ping arrives within 5 s. It quits the server if the parent is gone.
@@ -127,7 +144,7 @@ Every action gets an explicit status per backend (supported, physical, unsupport
 - **One live backend per Steve.** Migrating between backends is an explicit admin operation, never automatic.
 - **Offline-mode collision:** our bot plugin and an offline-mode Mineflayer login both derive the UUID from `OfflinePlayer:<name>`. A Mineflayer bot with the same name as a summoned fake player therefore has the same UUID, and the server refuses or kicks one of them ("already online"). Use a distinct username per backend, or make the adapter refuse to connect while a fake player with that name is online.
 - **Microsoft auth** (online-mode servers) needs a device-code login and token cache. That is a credential the operator provides, kept out of controller-visible config, and is out of scope for the gate.
-- **Offline mode trusts the username as identity.** That is acceptable for this loopback test server; it is the same caveat that applies to chat commands today.
+- **Offline mode trusts the username as identity.** That is acceptable for this isolated loopback test server and the gate experiment. It does not enable protected chat commands: those still require an explicitly asserted online-mode server, so they stay disabled with an offline Mineflayer login.
 
 ## 7. What the gate test looks like
 
@@ -136,6 +153,9 @@ The test mirrors `tests/test_phase_c_integration.py`: a live server and a Minefl
 - each action is audited and policy-checked;
 - an out-of-reach edit is still refused;
 - killing the sidecar while `goto` is running leaves an `OUTCOME_UNKNOWN` result, no further mutation, and a refused next request until reconnect;
+- a sidecar that stays alive but stalls an operation past its deadline is fenced: the result is `OUTCOME_UNKNOWN`, new mutations are refused until it acknowledges `stopped`, and it is killed if it never does;
+- `stop` ends a deliberately stalled `goto` without waiting for it;
+- a controller with `steve:world:move` but not `steve:world:edit` cannot cause a block change by walking into an obstacle;
 - a replayed request ID does not dig or place twice.
 
 ## Next steps
@@ -146,6 +166,6 @@ The test mirrors `tests/test_phase_c_integration.py`: a live server and a Minefl
    - look for upstream ViaBackwards and mineflayer reports.
    
    Until it is resolved, the live gate test must use a fresh player for each run, or option B.
-2. Refactor first, with no behaviour change: split `WorldAdapter` into the shared observation protocol and an MCPQ command protocol; select the handler table by backend; add a `stop` controller action; return `ACTION_NOT_SUPPORTED` per capability.
+2. Refactor first, with no behaviour change: split `WorldAdapter` into the shared observation protocol and an MCPQ command protocol; select the handler table by backend; add `Capabilities.actions` and return `ACTION_NOT_SUPPORTED` per action; add the `BackendOutcomeUnknown` path to ActionService; add the lock-free `stop` controller call.
 3. Sidecar and `MineflayerWorldAdapter` behind an optional extra (`[mineflayer]`), with unit tests that use a fake sidecar speaking the JSON-RPC protocol.
 4. Live gate test as described in section 7.
