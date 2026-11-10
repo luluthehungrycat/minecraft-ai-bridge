@@ -10,7 +10,7 @@ This document outlines the development priorities, completed work, and future pl
 ## 🎯 Current Status
 
 **Version**: 0.6.0 released 2026-11-02
-**Test Coverage**: 971 deterministic tests plus 14 live integration tests (Paper 26.2 build 123/MCPQ, an LLM provider for the agent loop)
+**Test Coverage**: 979 deterministic tests plus 15 live integration tests (Paper 26.2 build 123/MCPQ, an LLM provider for the agent loop)
 **Overall Health**: ✅ Built-in agent stable; RFC-0001 runtime and MCP controller surface landed through Phase B and most of Phase C
 
 ---
@@ -62,7 +62,7 @@ This document outlines the development priorities, completed work, and future pl
 - [x] Durable bounded task plans with pause/resume/cancel and restart recovery (#40)
 
 ### Testing
-- [x] 971 deterministic tests passing (MockMcpqClient-based, no server needed)
+- [x] 979 deterministic tests passing (MockMcpqClient-based, no server needed)
 - [x] Integration tests require Docker-provisioned pinned Paper 26.2 build 123/MCPQ and an LLM provider
 - [x] Goal-verification helpers (`actions_taken()`, `position_reached()`)
 
@@ -98,10 +98,12 @@ This document outlines the development priorities, completed work, and future pl
 ### P1: Finish RFC-0001 Phase C (Next)
 - [x] Condition events: `steve.damaged`, `steve.health_low`, `steve.hunger_low`
 - [x] Damage-source attribution on `steve.damaged`, `steve.died` (death message), `steve.respawned`; bot plugin auto-respawn
-- [ ] Unexpected world-change events
+- [ ] Unexpected world-change events — **deferred** (2026-11-10): block diffs around Steve cost about 10 ms per block on the test server, which runs at 10 TPS, so polling would add steady server load. Revisit after the server-speed issue below, or alongside RFC-0002 world versioning.
 - [x] Fix `scan_entities` on Paper 26.x (it tests `distance` from the console, not the bot, and expects `say` output in the command result), so the attack reflex can find its target
 - [x] Wire webhook subscriptions into admin config and run the sender from `minecraft-ai-bridge-mcp`
-- [ ] Live test for the Phase C gate: emergency response without an LLM answer, continuing across an MCP client disconnect; no duplicate mutations from replays across restarts
+- [x] Live test for the Phase C gate (`tests/test_phase_c_integration.py`): emergency response without an LLM answer, continuing across an MCP client disconnect; no duplicate mutations from replays across restarts. It also led to resuming still-leased controller sessions after a server restart.
+- [ ] Investigate test-server speed: Paper runs at about 10 TPS on the VPS (MSPT 110 ms average, spikes to 2.4 s), so a full observation takes about 2.4 s and safety reacts every ~2.5 s instead of every 0.25 s.
+- [ ] A freshly summoned bot starts at `(0, 0, 0)` inside the ground until the built-in agent's safe-spawn teleport. `minecraft-ai-bridge-mcp` does not summon or place the bot.
 
 ### P1: RFC-0001 Phase D — Mineflayer Backend
 - [ ] Design spike: backend capability parity matrix, sidecar protocol, `steve_id` to in-game identity mapping, Mineflayer version support vs Paper 26.2
@@ -229,7 +231,7 @@ This document outlines the development priorities, completed work, and future pl
 
 ## 🧪 Testing Strategy
 
-### Unit Tests (971 deterministic tests)
+### Unit Tests (979 deterministic tests)
 - **Run in CI**: ✅ Yes (on all pushes/PRs)
 - **Dependencies**: None (MockMcpqClient)
 - **Coverage**: Action handlers, NBT parsing, memory, goals, config, inventory, chat commands, pathfinding, orchestrator recovery, runtime gate, authorization, sessions, safety, events, tasks, webhooks, and the MCP adapter
@@ -271,7 +273,7 @@ This document outlines the development priorities, completed work, and future pl
 
 | Metric | Current | Target (v1.0) |
 |--------|---------|---------------|
-| Unit Test Coverage | 971 tests | Keep growing with features |
+| Unit Test Coverage | 979 tests | Keep growing with features |
 | Integration Tests | 14 tests | 30+ tests |
 | Bug Count | ~5 minor | 0 critical |
 | Documentation | 90% complete | 100% complete |
