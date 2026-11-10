@@ -12,6 +12,7 @@ import net.minecraft.server.players.PlayerList;
 import org.bukkit.Bukkit;
 import org.bukkit.HeightMap;
 import org.bukkit.Location;
+import org.bukkit.Material;
 import org.bukkit.World;
 import org.bukkit.block.Block;
 import org.bukkit.command.Command;
@@ -158,33 +159,74 @@ public class BotPlugin extends JavaPlugin implements Listener {
 
         bots.add(uuid);
         Player bot = player.getBukkitEntity();
-        // placeNewPlayer skips the login spawn search, so a new bot (no saved
-        // data) lands at (0, 0, 0), usually inside the ground. A bot whose
-        // saved position became buried also needs moving.
-        if (!bot.hasPlayedBefore() || isBuried(bot.getLocation())) {
-            bot.teleport(surfaceAtSpawn(bot.getWorld()));
+        // placeNewPlayer skips the login spawn search and this path loads no
+        // saved player data, so the bot would land at (0, 0, 0), usually inside
+        // the ground. Always move it to a checked spot near the world spawn.
+        Location safe = safeSpotNearSpawn(bot.getWorld());
+        if (safe != null) {
+            bot.teleport(safe);
+        } else {
+            getLogger().warning("No safe spot near the world spawn for bot '" + name
+                    + "'; it stays where the server placed it");
         }
         Location at = bot.getLocation();
         getLogger().info("Bot '" + name + "' summoned at " +
                 at.getX() + ", " + at.getY() + ", " + at.getZ());
     }
 
-    /** True if the feet or head block would suffocate a player, or it is below the world. */
-    private static boolean isBuried(@NotNull Location location) {
-        World world = location.getWorld();
-        if (world == null || location.getY() < world.getMinHeight()) {
-            return true;
+    /** How far from the world spawn column to look for a safe spot. */
+    private static final int SAFE_SPOT_RADIUS = 8;
+
+    /**
+     * The nearest safe standing spot to the world spawn, searching columns in
+     * rings out to {@link #SAFE_SPOT_RADIUS}, or null if there is none.
+     */
+    private static Location safeSpotNearSpawn(@NotNull World world) {
+        Location spawn = world.getSpawnLocation();
+        for (int r = 0; r <= SAFE_SPOT_RADIUS; r++) {
+            for (int dx = -r; dx <= r; dx++) {
+                for (int dz = -r; dz <= r; dz++) {
+                    if (Math.max(Math.abs(dx), Math.abs(dz)) != r) {
+                        continue;  // only this ring
+                    }
+                    Location spot = standingSpot(world, spawn.getBlockX() + dx, spawn.getBlockZ() + dz);
+                    if (spot != null) {
+                        return spot;
+                    }
+                }
+            }
         }
-        Block feet = location.getBlock();
-        Block head = feet.getRelative(0, 1, 0);
-        return !feet.isPassable() || !head.isPassable();
+        return null;
     }
 
-    /** The block above the highest solid block at the world spawn's column. */
-    private static @NotNull Location surfaceAtSpawn(@NotNull World world) {
-        Location spawn = world.getSpawnLocation();
-        Block top = world.getHighestBlockAt(
-                spawn.getBlockX(), spawn.getBlockZ(), HeightMap.MOTION_BLOCKING_NO_LEAVES);
-        return new Location(world, top.getX() + 0.5, top.getY() + 1, top.getZ() + 0.5);
+    /**
+     * The spot above the highest motion-blocking block (leaves included) of a
+     * column, if a player can stand there: solid, non-hazardous footing and
+     * two free, non-liquid blocks for feet and head below the build limit.
+     */
+    private static Location standingSpot(@NotNull World world, int x, int z) {
+        Block ground = world.getHighestBlockAt(x, z, HeightMap.MOTION_BLOCKING);
+        if (ground.getY() < world.getMinHeight() || ground.getY() + 2 >= world.getMaxHeight()) {
+            return null;
+        }
+        Material type = ground.getType();
+        if (!type.isSolid() || ground.isLiquid() || UNSAFE_FOOTING.contains(type)) {
+            return null;
+        }
+        Block feet = ground.getRelative(0, 1, 0);
+        Block head = ground.getRelative(0, 2, 0);
+        for (Block space : new Block[] {feet, head}) {
+            if (!space.isPassable() || space.isLiquid() || UNSAFE_SPACE.contains(space.getType())) {
+                return null;
+            }
+        }
+        return new Location(world, x + 0.5, feet.getY(), z + 0.5);
     }
+
+    private static final Set<Material> UNSAFE_FOOTING = Set.of(
+            Material.MAGMA_BLOCK, Material.CACTUS, Material.CAMPFIRE, Material.SOUL_CAMPFIRE,
+            Material.POWDER_SNOW, Material.POINTED_DRIPSTONE);
+    private static final Set<Material> UNSAFE_SPACE = Set.of(
+            Material.FIRE, Material.SOUL_FIRE, Material.SWEET_BERRY_BUSH, Material.WITHER_ROSE,
+            Material.COBWEB, Material.POWDER_SNOW);
 }
