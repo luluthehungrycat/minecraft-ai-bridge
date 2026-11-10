@@ -103,7 +103,7 @@ This document outlines the development priorities, completed work, and future pl
 - [x] Wire webhook subscriptions into admin config and run the sender from `minecraft-ai-bridge-mcp`
 - [x] Live test for the Phase C gate (`tests/test_phase_c_integration.py`): emergency response without an LLM answer, continuing across an MCP client disconnect; no duplicate mutations from replays across restarts. It also led to resuming still-leased controller sessions after a server restart.
 - [x] Investigate test-server speed (2026-11-10): settled, Paper runs at about 20 TPS on the VPS (average tick 13-15 ms, spikes to about 125 ms), a warm observation takes 0.5-0.8 s and an MCPQ command about 50 ms. The slow numbers came from the first minute after startup (single ticks up to 3.7 s), which the earlier measurements and live tests ran into. The JVM runs with the image's default 1 GB heap and uses about 1.5 cores when idle on a host shared with other workloads; raising `MEMORY` is an option if spikes matter later.
-- [x] A freshly summoned bot started at `(0, 0, 0)` inside the ground; `/botsummon` now moves the bot to the nearest safe spot to the world spawn
+- [x] A freshly summoned bot started at `(0, 0, 0)` inside the ground; `/botsummon` now moves the bot to a safe spot near the world spawn
 
 ### P1: RFC-0001 Phase D — Mineflayer Backend
 - [ ] Design spike: backend capability parity matrix, sidecar protocol, `steve_id` to in-game identity mapping, Mineflayer version support vs Paper 26.2

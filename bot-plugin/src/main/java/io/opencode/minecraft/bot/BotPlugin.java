@@ -178,8 +178,8 @@ public class BotPlugin extends JavaPlugin implements Listener {
     private static final int SAFE_SPOT_RADIUS = 8;
 
     /**
-     * The nearest safe standing spot to the world spawn, searching columns in
-     * rings out to {@link #SAFE_SPOT_RADIUS}, or null if there is none.
+     * The first safe standing spot in square rings of columns around the world
+     * spawn, out to {@link #SAFE_SPOT_RADIUS} on each axis, or null if there is none.
      */
     private static Location safeSpotNearSpawn(@NotNull World world) {
         Location spawn = world.getSpawnLocation();
