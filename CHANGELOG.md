@@ -51,6 +51,12 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
 
 ### Fixed
 
+- After `minecraft-ai-bridge-mcp` restarts, a controller can keep using its
+  still-leased session. Before, the restarted server did not know the
+  session, and opening a new one was refused as "already active" until the
+  lease ran out (5 minutes by default). Only the credential that opened the
+  session can resume it, and fenced, released or expired sessions are never
+  revived.
 - `scan_entities` finds mobs again on Paper 26.x: it measured distance from the
   server console's position and looked for `say` output the server never
   returns, so the attack reflex could never pick a target.

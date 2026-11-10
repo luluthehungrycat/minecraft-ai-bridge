@@ -365,7 +365,8 @@ minecraft-ai-bridge/
 │   ├── test_actions.py             # All 36 action handlers
 │   ├── test_*.py                   # Observer, memory, goals, runtime, MCP, ... (see AGENTS.md)
 │   ├── test_integration.py         # Full agent loop (real MCPQ + real LLM)
-│   └── test_mcp_integration.py     # MCP server end to end against live MCPQ
+│   ├── test_mcp_integration.py     # MCP server end to end against live MCPQ
+│   └── test_phase_c_integration.py # RFC-0001 Phase C gate against live MCPQ
 ├── docs/
 │   ├── ARCHITECTURE.md             # Deep architecture dive
 │   ├── SETUP.md                    # Detailed installation guide
@@ -423,12 +424,12 @@ pip install -e "."
 
 ## Testing
 
-The project has **971 deterministic tests** plus 14 live integration tests organized in two tiers:
+The project has **981 deterministic tests** plus 15 live integration tests organized in two tiers:
 
 | Tier | Count | Description | Dependencies |
 |------|-------|-------------|--------------|
-| **Deterministic** | 971 | Action handlers, NBT parsing, memory, goal fallbacks, config, chat commands, inventory manager, observer, orchestrator, runtime (action gate, authorization, sessions, safety, events, tasks, webhooks), and MCP adapter | `MockMcpqClient` / `MockLLMClient`; MCP tests need the `[mcp]` extra (in `[dev]`) |
-| **Integration** | 14 | Full think-act-observe loop with real MCPQ + real LLM (12), and `minecraft-ai-bridge-mcp` over stdio and HTTP (2) | Paper 26.2 build 123 + MCPQ v2.2 + bot plugin + OpenRouter API key |
+| **Deterministic** | 981 | Action handlers, NBT parsing, memory, goal fallbacks, config, chat commands, inventory manager, observer, orchestrator, runtime (action gate, authorization, sessions, safety, events, tasks, webhooks), and MCP adapter | `MockMcpqClient` / `MockLLMClient`; MCP tests need the `[mcp]` extra (in `[dev]`) |
+| **Integration** | 15 | Full think-act-observe loop with real MCPQ + real LLM (12), `minecraft-ai-bridge-mcp` over stdio and HTTP (2), and the RFC-0001 Phase C gate (1) | Paper 26.2 build 123 + MCPQ v2.2 + bot plugin + OpenRouter API key |
 
 ### Test Infrastructure
 

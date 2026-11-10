@@ -1098,6 +1098,42 @@ class AuthzService:
                 if owns_transaction and self._db.in_transaction:
                     self._db.execute("ROLLBACK")
 
+    def resume_session(
+        self, steve_id: str, session_id: str, credential_id: str
+    ) -> ControllerSession | None:
+        """Return the Steve's active session ``session_id`` if ``credential_id`` holds it.
+
+        Lets a restarted service pick up a session that is still leased
+        instead of locking its controller out until the lease expires. The
+        caller must already have authenticated ``credential_id``. Returns
+        None unless the session is the Steve's current one, belongs to that
+        credential, and passes :meth:`validate_session` (generation, lease,
+        ownership and credential checks), so it never revives a fenced,
+        expired, released or foreign session.
+        """
+        with self._lock:
+            row = self._db.execute(
+                "SELECT session,session_credential,generation,owner,session_expires "
+                "FROM steves WHERE id=?",
+                (steve_id,),
+            ).fetchone()
+            if (
+                row is None
+                or row["session"] != session_id
+                or row["session_credential"] != credential_id
+            ):
+                return None
+            expires = row["session_expires"]
+            session = ControllerSession(
+                session_id,
+                steve_id,
+                credential_id,
+                row["owner"],
+                row["generation"],
+                datetime.fromisoformat(expires) if expires is not None else None,
+            )
+            return session if self.validate_session(session) else None
+
     def try_validate_session(
         self,
         session: ControllerSession,
