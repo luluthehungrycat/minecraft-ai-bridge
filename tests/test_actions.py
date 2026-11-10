@@ -692,6 +692,28 @@ class TestCombat:
         assert "creeper" not in result.data["mobs_nearby"]
         assert "warden" in result.data["mobs_nearby"]
 
+    async def test_scan_entities_command_anchored_at_bot(self, mock_mc):
+        """Selectors are anchored at the bot, not the console, and never use say."""
+        await execute_action(mock_mc, ActionType.SCAN_ENTITIES, {"radius": 7})
+        cmds = [c for c in mock_mc.commands_ran if "if entity" in c]
+        assert cmds
+        for c in cmds:
+            assert c.startswith("execute at AIBot if entity @e[type=minecraft:")
+            assert "distance=..7" in c
+            assert "run say" not in c
+            assert "@p" not in c
+
+    async def test_scan_entities_failure_text_yields_no_mob(self, mock_mc, monkeypatch):
+        """Anything that is not a 'Test passed' result counts as absent."""
+
+        async def failed(command: str) -> str:
+            return "Test failed"
+
+        monkeypatch.setattr(mock_mc, "_run_command_blocking", failed)
+        result = await execute_action(mock_mc, ActionType.SCAN_ENTITIES, {})
+        assert result.data["mobs_nearby"] == []
+        assert not any(result.data["mobs"].values())
+
     async def test_scan_entities_custom_radius(self, mock_mc):
         """Custom radius is reflected in the response."""
         result = await execute_action(mock_mc, ActionType.SCAN_ENTITIES, {"radius": 8})

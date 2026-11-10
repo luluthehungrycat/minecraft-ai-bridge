@@ -242,19 +242,16 @@ class MockMcpqClient:
             return f"{self._time}"
         if cmd.startswith("weather query"):
             return self._weather
-        if cmd.startswith("execute if entity @e[type=minecraft:"):
-            # scan_entities-style query — extract the mob type and check
-            # whether the mock has it configured as present. The
-            # command is "execute if entity @e[type=minecraft:<mob>,
-            # distance=..N,limit=1] run say __mob_<mob>__".
+        if cmd.startswith("execute at ") and " if entity @e[type=minecraft:" in cmd:
+            # scan_entities-style query, answered like the real server:
+            # "Test passed. Count: N" when matched, else "Test failed".
             try:
-                mob = cmd.split("type=minecraft:", 1)[1].split(",", 1)[0]
+                mob = cmd.split("type=minecraft:", 1)[1].split(",", 1)[0].rstrip("]")
             except (IndexError, ValueError):
                 return ""
-            marker = f"__mob_{mob}__"
             if mob in self._hostile_mobs:
-                return f"[Server] {marker}"
-            return ""
+                return "Test passed. Count: 1"
+            return "Test failed"
         if cmd.startswith("execute positioned"):
             return "Located biome plains at [0, 65, 0]"
         if "give" in cmd and ("aibot" in cmd or "@p" in cmd):
