@@ -106,7 +106,9 @@ This document outlines the development priorities, completed work, and future pl
 - [ ] A freshly summoned bot starts at `(0, 0, 0)` inside the ground until the built-in agent's safe-spawn teleport. `minecraft-ai-bridge-mcp` does not summon or place the bot.
 
 ### P1: RFC-0001 Phase D — Mineflayer Backend
-- [ ] Design spike: backend capability parity matrix, sidecar protocol, `steve_id` to in-game identity mapping, Mineflayer version support vs Paper 26.2
+- [x] Design spike ([docs/rfcs/RFC-0001-phase-d-mineflayer-spike.md](docs/rfcs/RFC-0001-phase-d-mineflayer-spike.md)): capability parity matrix, stdio JSON-RPC sidecar protocol, `steve_id` to in-game identity mapping, fault model. Mineflayer 4.39 supports up to 26.1, not 26.2
+- [ ] Live compatibility check: a 26.1 Mineflayer bot through ViaBackwards on the Paper 26.2 test server (spawn, observe, goto, dig, place, attack)
+- [ ] Split `WorldAdapter` into a shared observation protocol and an MCPQ command protocol; choose action handlers by backend; add a `stop` controller action
 - [ ] Optional Node.js sidecar behind `WorldAdapter`; observe/move/dig/place/stop through the same `ActionService`
 
 ### P2: Medium Priority
