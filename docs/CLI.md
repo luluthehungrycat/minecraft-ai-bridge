@@ -166,7 +166,13 @@ Tools: `minecraft_get_capabilities`, `minecraft_get_state`,
 `minecraft_open_session`, `minecraft_renew_session`, `minecraft_close_session`,
 and `minecraft_submit_action` (`session_id`, `generation`, `request_id`,
 `action`, `params`). Reuse a `request_id` only to retry the same action; the
-retry never runs it twice.
+retry never runs it twice. A retry returns the original result only within
+the session that sent it; from a new session the request ID is refused
+(`POLICY_REJECTED`), still without running it again.
+
+If the server restarts, keep using your session: while its lease lasts, the
+restarted server resumes it for the credential that opened it, with the same
+`session_id` and `generation`.
 
 `minecraft_get_events` (`limit`, `reset_expired`) returns this bot's next
 unacknowledged events with their cursors, and `minecraft_ack_events`

@@ -409,8 +409,13 @@ class ControllerService:
     ) -> ActionResultSchema:
         """Internal task entry: caller identity comes from a trusted Authz session."""
         request = self._revalidate(request)
+        # Looked up before the sweep, so an expired cached session still gets
+        # its specific rejection; only a session this service never cached
+        # (for example after a restart) is resumed from Authz.
         session = self._sessions.get(request.controller_session_id)
         self._drop_expired()
+        if session is None:
+            session = await self._cached_or_resumed(request.controller_session_id, credential_id)
         rejection = self._envelope_rejection(credential_id, request, session)
         if rejection is not None:
             return self._result(credential_id, request, ActionStatus.REJECTED, *rejection)
@@ -702,9 +707,51 @@ class ControllerService:
 
     async def _owned_session(self, token: str, session_id: str) -> AuthzControllerSession:
         session = self._sessions.get(session_id)
+        if session is None:
+            try:
+                credential = await asyncio.to_thread(self._authz.authenticate, token)
+            except PermissionError:
+                credential = None
+            if credential is not None:
+                session = await self._cached_or_resumed(session_id, credential.credential_id)
         if session is None or not await asyncio.to_thread(self._token_owns, token, session):
             raise PermissionError("controller session is not open for this credential")
         return session
+
+    async def _cached_or_resumed(
+        self, session_id: str, credential_id: str
+    ) -> AuthzControllerSession | None:
+        """Return the cached session, or resume one this credential still holds.
+
+        Sessions are cached in memory, so after a restart a still-leased
+        session is unknown here while Authz keeps it active, which would lock
+        its controller out until the lease expires. Authz only resumes the
+        Steve's current session for the credential that holds it, after the
+        same validation every request gets; it never revives a fenced,
+        expired or released session. ``credential_id`` must already be
+        authenticated.
+        """
+        session = self._sessions.get(session_id)
+        if session is not None:
+            return session
+        try:
+            resumed = await asyncio.to_thread(
+                self._authz.resume_session, self._steve_id, session_id, credential_id
+            )
+        except sqlite3.Error:
+            logger.exception("Could not look up controller session %s", session_id)
+            return None
+        if resumed is None:
+            return None
+        self._publish(resumed)
+        logger.info(
+            "Resumed controller session steve_id=%s credential_id=%s generation=%d",
+            resumed.steve_id,
+            resumed.credential_id,
+            resumed.generation,
+        )
+        # A newer cached generation wins in _publish; only return what is cached.
+        return self._sessions.get(session_id)
 
     async def _require_observer(self, token: str) -> None:
         def allowed() -> bool:
