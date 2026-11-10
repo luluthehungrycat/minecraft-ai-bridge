@@ -158,3 +158,44 @@ async def test_request_id_replays_within_the_resumed_session(setup, tmp_path):
     assert replay.status is original.status is ActionStatus.SUCCEEDED
     assert replay.action_id == original.action_id
     assert setup.world.chat_messages_sent == ["once"]
+
+
+async def test_a_late_resume_does_not_undo_a_renewal(setup, monkeypatch):
+    """Two requests resume at once; the slower one must keep the renewed lease."""
+    import threading
+
+    session = await setup.service().open_session(setup.controller)
+    restarted = _restarted(setup)
+    real_resume = setup.auth.resume_session
+    started, release = threading.Event(), threading.Event()
+    calls = 0
+
+    def slow_first_resume(*args):
+        nonlocal calls
+        calls += 1
+        snapshot = real_resume(*args)
+        if calls == 1:
+            started.set()
+            release.wait(5)
+        return snapshot
+
+    monkeypatch.setattr(setup.auth, "resume_session", slow_first_resume)
+    slow = asyncio.create_task(
+        restarted.submit_action(
+            setup.controller, _request(session, ActionType.CHAT, {"message": "slow"}, "r-slow")
+        )
+    )
+    await asyncio.to_thread(started.wait, 5)
+    await asyncio.sleep(0.01)  # the renewed lease must differ from the snapshot's
+    renewed = await restarted.renew_session(setup.controller, session.session_id)
+    release.set()
+
+    result = await slow
+    assert result.status is ActionStatus.SUCCEEDED, result
+    # The renewed lease is still the cached one: later calls keep working.
+    again = await restarted.renew_session(setup.controller, session.session_id)
+    assert again.expires_at >= renewed.expires_at
+    ok = await restarted.submit_action(
+        setup.controller, _request(session, ActionType.CHAT, {"message": "after"}, "r-after")
+    )
+    assert ok.status is ActionStatus.SUCCEEDED, ok

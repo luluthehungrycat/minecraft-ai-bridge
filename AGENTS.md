@@ -115,7 +115,7 @@ examples and the conventions block at the top.
 - **config.yaml volume mount**: Mounted read-only at `/app/config.yaml`. Changes require `docker compose restart bridge`.
 
 ### Code Quality
-- **Tests**: 994 tests collected in total — 979 deterministic unit tests plus 15 integration tests (12 agent-loop, 2 MCP end-to-end, 1 Phase C gate). The 64 MCP adapter unit tests and both MCP end-to-end tests need the `mcp` extra (included in `[dev]`) and skip without it. Unit tests use `MockMcpqClient` for deterministic MCPQ simulation. Integration tests use a real MCPQ server + real LLM (OpenRouter `openai/gpt-oss-20b`, or Requesty `runware/gpt-oss-120b` when only `REQUESTY_API_KEY` is set; override with `INTEGRATION_LLM_MODEL`) for end-to-end validation. The stack uses pinned Paper 26.2 build 123. Run with `pytest tests/`.
+- **Tests**: 995 tests collected in total — 980 deterministic unit tests plus 15 integration tests (12 agent-loop, 2 MCP end-to-end, 1 Phase C gate). The 64 MCP adapter unit tests and both MCP end-to-end tests need the `mcp` extra (included in `[dev]`) and skip without it. Unit tests use `MockMcpqClient` for deterministic MCPQ simulation. Integration tests use a real MCPQ server + real LLM (OpenRouter `openai/gpt-oss-20b`, or Requesty `runware/gpt-oss-120b` when only `REQUESTY_API_KEY` is set; override with `INTEGRATION_LLM_MODEL`) for end-to-end validation. The stack uses pinned Paper 26.2 build 123. Run with `pytest tests/`.
 - **Mypy**: runs in CI on every push and PR (`mypy minecraft_ai_bridge/ --ignore-missing-imports`) and must pass.
 - **gRPC stubs are synchronous**: MCPQ generated stubs block; dispatched via `asyncio.to_thread`. Not ideal but works.
 - **RCON client is unmaintained**: Since the MCPQ migration, `rcon.py` isn't tested. Consider removing or marking deprecated.
@@ -141,7 +141,7 @@ Some LLMs (especially smaller/local ones) can't reliably output structured JSON 
 
 ### P0: None (Testing Complete)
 The 0.5.0 release completed the testing milestone:
-- **Unit tests** (979): MockMcpqClient covers all 36 actions, observer parsing, memory, goal fallback plans, config, inventory manager, chat commands, pathfinding, the runtime action gate, the safety supervisor, the event journal, webhook delivery, and the local authorization service
+- **Unit tests** (980): MockMcpqClient covers all 36 actions, observer parsing, memory, goal fallback plans, config, inventory manager, chat commands, pathfinding, the runtime action gate, the safety supervisor, the event journal, webhook delivery, and the local authorization service
 - **Integration tests** (12): Full think-act-observe loop with real MCPQ server + real LLM inference (OpenRouter `openai/gpt-oss-20b`). Covers teleport, exploration, disconnect handling, fallback decomposition, failure counting, memory recording, chat command stop, and inventory creation.
 - **Goal-verification assertions**: Integration tests verify agent behavior via:
   - `action_taken(orch, *names) → bool` — checks if the agent performed a specific action (parses `MemoryEntry.raw`)
@@ -218,7 +218,7 @@ The 0.5.0 release completed the testing milestone:
 | `docker-compose.yml` | Paper server + bridge services |
 | `docs/*.md` | Full documentation set |
 | `tests/conftest.py` | MockMcpqClient, MockLLMClient, test fixtures |
-| `tests/test_*.py` | Unit + integration tests (994 total: 979 unit + 15 integration) |
+| `tests/test_*.py` | Unit + integration tests (995 total: 980 unit + 15 integration) |
 | `AGENTS.md` | This file |
 
 ## Environment Info
@@ -271,7 +271,7 @@ Helpers in `tests/test_integration.py`:
 | `tests/test_controller_service.py` | 33 | Phase B controller API gate: exclusive sessions, observers, privileged and internal actions |
 | `tests/test_reach_limits.py` | 37 | Reach limits for external controllers' targeted edits and moves; finite limits; walk_to stays a walk |
 | `tests/test_reach_bypass.py` | 15 | No reach bypass via handler coercion: malformed targets refused, edits measured to the truncated block |
-| `tests/test_session_resume.py` | 8 | A restarted ControllerService resumes a still-leased session only for its holder; released, fenced and expired sessions are not revived; generation still enforced; request-ID replay within the resumed session |
+| `tests/test_session_resume.py` | 9 | A restarted ControllerService resumes a still-leased session only for its holder; released, fenced and expired sessions are not revived; generation still enforced; request-ID replay within the resumed session; a late concurrent resume never undoes a renewal |
 | `tests/test_session_pruning.py` | 15 | ControllerService drops fenced, expired, and replaced sessions; bounded across open/expire cycles; late open/renew responses never evict a newer session, pruning during a renewal never loses it, and a close that loses to a renewal keeps it (#36) |
 | `tests/test_controller_events.py` | 13 | ControllerService event polling: `events:read` bound to the Steve, per-credential cursors, other Steves' events skipped, expiry/reset, `controller.changed` events |
 | `tests/test_reach_races.py` | 4 | Reach checked at dispatch under concurrency; replays and request-ID reuse |

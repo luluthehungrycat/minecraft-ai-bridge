@@ -743,6 +743,11 @@ class ControllerService:
             return None
         if resumed is None:
             return None
+        cached = self._sessions.get(session_id)
+        if cached is not None:
+            # A concurrent request resumed it first and may have renewed it
+            # since; this snapshot's lease is older and must not replace it.
+            return cached
         self._publish(resumed)
         logger.info(
             "Resumed controller session steve_id=%s credential_id=%s generation=%d",

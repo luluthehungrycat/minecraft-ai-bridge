@@ -261,12 +261,21 @@ def _vec(x: int, y: int, z: int):
 
 @pytest.fixture(autouse=True)
 def _no_leftover_servers():
-    """Fail loudly if a test left an MCP server process behind."""
+    """Fail loudly if a test left an MCP server process behind.
+
+    Compares against the processes running before the test, so an unrelated
+    server already running does not fail it.
+    """
+
+    def running() -> set[int]:
+        found = subprocess.run(
+            ["pgrep", "-f", "minecraft_ai_bridge.transport.mcp_main"],
+            capture_output=True,
+            text=True,
+        ).stdout.split()
+        return {int(pid) for pid in found} - {os.getpid()}
+
+    before = running()
     yield
-    leftovers = subprocess.run(
-        ["pgrep", "-f", "minecraft_ai_bridge.transport.mcp_main"],
-        capture_output=True,
-        text=True,
-    ).stdout.split()
-    leftovers = [pid for pid in leftovers if int(pid) != os.getpid()]
-    assert not leftovers, f"MCP server processes left running: {leftovers}"
+    leftovers = running() - before
+    assert not leftovers, f"MCP server processes left running: {sorted(leftovers)}"
