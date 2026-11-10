@@ -51,6 +51,7 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
 
 ### Fixed
 
+- Bot plugin: a summoned bot no longer starts at `(0, 0, 0)` inside the ground. `placeNewPlayer` skips the login spawn search, so `/botsummon` now moves a new bot, or one whose saved position is buried, onto the surface at the world spawn.
 - After `minecraft-ai-bridge-mcp` restarts, a controller can keep using its
   still-leased session. Before, the restarted server did not know the
   session, and opening a new one was refused as "already active" until the

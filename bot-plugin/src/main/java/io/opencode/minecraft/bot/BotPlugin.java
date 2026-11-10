@@ -10,6 +10,10 @@ import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.server.network.CommonListenerCookie;
 import net.minecraft.server.players.PlayerList;
 import org.bukkit.Bukkit;
+import org.bukkit.HeightMap;
+import org.bukkit.Location;
+import org.bukkit.World;
+import org.bukkit.block.Block;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
 import org.bukkit.craftbukkit.CraftServer;
@@ -153,7 +157,34 @@ public class BotPlugin extends JavaPlugin implements Listener {
         playerList.placeNewPlayer(connection, player, cookie);
 
         bots.add(uuid);
+        Player bot = player.getBukkitEntity();
+        // placeNewPlayer skips the login spawn search, so a new bot (no saved
+        // data) lands at (0, 0, 0), usually inside the ground. A bot whose
+        // saved position became buried also needs moving.
+        if (!bot.hasPlayedBefore() || isBuried(bot.getLocation())) {
+            bot.teleport(surfaceAtSpawn(bot.getWorld()));
+        }
+        Location at = bot.getLocation();
         getLogger().info("Bot '" + name + "' summoned at " +
-                player.getX() + ", " + player.getY() + ", " + player.getZ());
+                at.getX() + ", " + at.getY() + ", " + at.getZ());
+    }
+
+    /** True if the feet or head block would suffocate a player, or it is below the world. */
+    private static boolean isBuried(@NotNull Location location) {
+        World world = location.getWorld();
+        if (world == null || location.getY() < world.getMinHeight()) {
+            return true;
+        }
+        Block feet = location.getBlock();
+        Block head = feet.getRelative(0, 1, 0);
+        return !feet.isPassable() || !head.isPassable();
+    }
+
+    /** The block above the highest solid block at the world spawn's column. */
+    private static @NotNull Location surfaceAtSpawn(@NotNull World world) {
+        Location spawn = world.getSpawnLocation();
+        Block top = world.getHighestBlockAt(
+                spawn.getBlockX(), spawn.getBlockZ(), HeightMap.MOTION_BLOCKING_NO_LEAVES);
+        return new Location(world, top.getX() + 0.5, top.getY() + 1, top.getZ() + 0.5);
     }
 }
