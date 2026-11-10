@@ -111,10 +111,11 @@ Every action gets an explicit status per backend (supported, physical, unsupport
 - **Requests** (Python → sidecar): `connect{host, port, username, auth, version}`, `observe{}`, `block_at{x,y,z}`, `goto{x,y,z,range,timeout_ms}`, `dig{x,y,z,timeout_ms}`, `place{x,y,z,item,timeout_ms}`, `equip`, `consume`, `attack{entity_id}`, `chat{message}`, `stop{}`. Each request carries an `id` and a deadline. The sidecar answers with a result `{ok, data}` or a typed error (`TIMEOUT`, `NOT_REACHABLE`, `NO_ITEM`, `INTERRUPTED`, `NOT_CONNECTED`).
 - **Notifications** (sidecar → Python): `spawn`, `health{health, food}`, `hurt{attacker_type?}`, `death{message}`, `respawn`, `chat`, `kicked{reason}`, `end{reason}`, plus a `heartbeat` every second. These feed the existing condition detector and event journal (`steve.damaged` with a real attacker, `steve.died`, `steve.respawned`), replacing MCPQ's NBT polling with push events.
 - **One mutation at a time:** Python's ActionService already serializes dispatches. The sidecar also rejects a second mutating request while one is running.
-- **Stop does not go through the dispatch lock.** `ActionService.execute` holds `_dispatch_lock` for the whole handler, so a `stop` sent as an ordinary action would wait for the `goto` it is meant to end. Instead:
-  - `stop` is a ControllerService call with its own path. It needs the same session, generation and credential checks as an action, and is audited and journaled.
-  - It calls `adapter.interrupt()` directly, without taking the dispatch lock. That sends `stop{op_id}` to the sidecar for the in-flight operation.
-  - The in-flight handler then returns `INTERRUPTED`, which releases the lock. The stop itself is not a mutation and has no request-ID idempotency.
+- **Stop does not wait for the dispatch lock, but still goes through ActionService.** `ActionService.execute` holds `_dispatch_lock` for the whole handler, so a `stop` dispatched as an ordinary action would wait for the `goto` it is meant to end. Instead:
+  - ActionService gets a second entry point, `interrupt(request)`, that never takes the dispatch lock. It runs the same steps as `execute` except dispatch serialization: the identity scope and policy hook (a `stop` action class that a session holder may always use), the audit trace, and the journal. It then calls `adapter.interrupt(op_id)` for the operation that is currently dispatched. If nothing is dispatched, it records a no-op.
+  - ControllerService's `stop` validates the session, generation and credential like any action, then delegates to `ActionService.interrupt`. It never calls the adapter directly.
+  - The adapter sends `stop{op_id}` to the sidecar. The in-flight handler then returns `INTERRUPTED`, which releases the lock.
+  - `stop` is not a mutation and has no request-ID idempotency; a repeated stop is harmless.
   - The gate tests stop against a deliberately stalled `goto`.
 - **Versioning:** the first message is `hello{protocol: 1, mineflayer, minecraft_version}`, and Python refuses a mismatched protocol version.
 
@@ -164,7 +165,7 @@ The test mirrors `tests/test_phase_c_integration.py`: a live server and a Minefl
    - run the same client against a native Paper 26.1 server;
    - delete the bot's saved player data before each login;
    - look for upstream ViaBackwards and mineflayer reports.
-   
+
    Until it is resolved, the live gate test must use a fresh player for each run, or option B.
 2. Refactor first, with no behaviour change: split `WorldAdapter` into the shared observation protocol and an MCPQ command protocol; select the handler table by backend; add `Capabilities.actions` and return `ACTION_NOT_SUPPORTED` per action; add the `BackendOutcomeUnknown` path to ActionService; add the lock-free `stop` controller call.
 3. Sidecar and `MineflayerWorldAdapter` behind an optional extra (`[mineflayer]`), with unit tests that use a fake sidecar speaking the JSON-RPC protocol.
