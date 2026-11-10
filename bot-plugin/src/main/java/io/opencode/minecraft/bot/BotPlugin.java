@@ -10,6 +10,11 @@ import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.server.network.CommonListenerCookie;
 import net.minecraft.server.players.PlayerList;
 import org.bukkit.Bukkit;
+import org.bukkit.HeightMap;
+import org.bukkit.Location;
+import org.bukkit.Material;
+import org.bukkit.World;
+import org.bukkit.block.Block;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
 import org.bukkit.craftbukkit.CraftServer;
@@ -153,7 +158,75 @@ public class BotPlugin extends JavaPlugin implements Listener {
         playerList.placeNewPlayer(connection, player, cookie);
 
         bots.add(uuid);
+        Player bot = player.getBukkitEntity();
+        // placeNewPlayer skips the login spawn search and this path loads no
+        // saved player data, so the bot would land at (0, 0, 0), usually inside
+        // the ground. Always move it to a checked spot near the world spawn.
+        Location safe = safeSpotNearSpawn(bot.getWorld());
+        if (safe != null) {
+            bot.teleport(safe);
+        } else {
+            getLogger().warning("No safe spot near the world spawn for bot '" + name
+                    + "'; it stays where the server placed it");
+        }
+        Location at = bot.getLocation();
         getLogger().info("Bot '" + name + "' summoned at " +
-                player.getX() + ", " + player.getY() + ", " + player.getZ());
+                at.getX() + ", " + at.getY() + ", " + at.getZ());
     }
+
+    /** How far from the world spawn column to look for a safe spot. */
+    private static final int SAFE_SPOT_RADIUS = 8;
+
+    /**
+     * The first safe standing spot in square rings of columns around the world
+     * spawn, out to {@link #SAFE_SPOT_RADIUS} on each axis, or null if there is none.
+     */
+    private static Location safeSpotNearSpawn(@NotNull World world) {
+        Location spawn = world.getSpawnLocation();
+        for (int r = 0; r <= SAFE_SPOT_RADIUS; r++) {
+            for (int dx = -r; dx <= r; dx++) {
+                for (int dz = -r; dz <= r; dz++) {
+                    if (Math.max(Math.abs(dx), Math.abs(dz)) != r) {
+                        continue;  // only this ring
+                    }
+                    Location spot = standingSpot(world, spawn.getBlockX() + dx, spawn.getBlockZ() + dz);
+                    if (spot != null) {
+                        return spot;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * The spot above the highest motion-blocking block (leaves included) of a
+     * column, if a player can stand there: solid, non-hazardous footing and
+     * two free, non-liquid blocks for feet and head below the build limit.
+     */
+    private static Location standingSpot(@NotNull World world, int x, int z) {
+        Block ground = world.getHighestBlockAt(x, z, HeightMap.MOTION_BLOCKING);
+        if (ground.getY() < world.getMinHeight() || ground.getY() + 2 >= world.getMaxHeight()) {
+            return null;
+        }
+        Material type = ground.getType();
+        if (!type.isSolid() || ground.isLiquid() || UNSAFE_FOOTING.contains(type)) {
+            return null;
+        }
+        Block feet = ground.getRelative(0, 1, 0);
+        Block head = ground.getRelative(0, 2, 0);
+        for (Block space : new Block[] {feet, head}) {
+            if (!space.isPassable() || space.isLiquid() || UNSAFE_SPACE.contains(space.getType())) {
+                return null;
+            }
+        }
+        return new Location(world, x + 0.5, feet.getY(), z + 0.5);
+    }
+
+    private static final Set<Material> UNSAFE_FOOTING = Set.of(
+            Material.MAGMA_BLOCK, Material.CACTUS, Material.CAMPFIRE, Material.SOUL_CAMPFIRE,
+            Material.POWDER_SNOW, Material.POINTED_DRIPSTONE);
+    private static final Set<Material> UNSAFE_SPACE = Set.of(
+            Material.FIRE, Material.SOUL_FIRE, Material.SWEET_BERRY_BUSH, Material.WITHER_ROSE,
+            Material.COBWEB, Material.POWDER_SNOW);
 }
