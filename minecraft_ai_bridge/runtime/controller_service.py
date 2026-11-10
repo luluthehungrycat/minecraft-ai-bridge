@@ -627,10 +627,22 @@ class ControllerService:
         on every acquisition and fence, so ``session`` has fenced every lower
         generation. Open and renew responses can arrive out of order; if a
         higher generation is already cached, ``session`` is already fenced
-        and must not displace it.
+        and must not displace it. Renewals keep the generation, so within one
+        session the later lease wins: a late renew (or resume) response must
+        not replace a lease that Authz has since extended.
         """
-        if all(cached.generation <= session.generation for cached in self._sessions.values()):
-            self._sessions = {session.session_id: session}
+        if not all(cached.generation <= session.generation for cached in self._sessions.values()):
+            return
+        cached = self._sessions.get(session.session_id)
+        if (
+            cached is not None
+            and cached.generation == session.generation
+            and cached.expires_at is not None
+            and session.expires_at is not None
+            and cached.expires_at > session.expires_at
+        ):
+            return
+        self._sessions = {session.session_id: session}
 
     def _drop_expired(self) -> None:
         """Forget sessions whose lease has passed; Authz never revives them."""

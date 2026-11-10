@@ -199,3 +199,45 @@ async def test_a_late_resume_does_not_undo_a_renewal(setup, monkeypatch):
         setup.controller, _request(session, ActionType.CHAT, {"message": "after"}, "r-after")
     )
     assert ok.status is ActionStatus.SUCCEEDED, ok
+
+
+async def test_a_late_renewal_does_not_undo_a_newer_lease(setup, monkeypatch):
+    """A renewal that returns late must not replace a lease renewed since."""
+    import threading
+
+    service = setup.service()
+    session = await service.open_session(setup.controller)
+    real_renew = setup.auth.renew_session
+    started, release = threading.Event(), threading.Event()
+    calls = 0
+
+    def slow_first_renew(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        renewed = real_renew(*args, **kwargs)
+        if calls == 1:
+            started.set()
+            release.wait(5)
+        return renewed
+
+    monkeypatch.setattr(setup.auth, "renew_session", slow_first_renew)
+    late = asyncio.create_task(service.renew_session(setup.controller, session.session_id))
+    await asyncio.to_thread(started.wait, 5)
+    # A request with the old lease is refused and prunes the cache...
+    stale = await service.submit_action(
+        setup.controller, _request(session, ActionType.CHAT, {"message": "old"}, "r-old")
+    )
+    assert stale.status is ActionStatus.REJECTED
+    assert service._sessions == {}
+    # ...then another renewal resumes the session and extends it again.
+    await asyncio.sleep(0.01)
+    newer = await service.renew_session(setup.controller, session.session_id)
+    release.set()
+    await late
+
+    assert service._sessions[session.session_id].expires_at == newer.expires_at
+    ok = await service.submit_action(
+        setup.controller, _request(session, ActionType.CHAT, {"message": "after"}, "r-after")
+    )
+    assert ok.status is ActionStatus.SUCCEEDED, ok
+    await service.renew_session(setup.controller, session.session_id)
