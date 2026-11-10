@@ -6,7 +6,9 @@
 
 ## Summary
 
-1. **Mineflayer cannot connect to Paper 26.2 natively today.** The newest supported version is 26.1. 26.2 support has been open upstream since July 2026 and is unreleased; 26.3 work has already started. The practical path is a bot that speaks **26.1** through **ViaBackwards** on the server. A short live experiment must confirm that before any implementation (see [Next steps](#next-steps)).
+1. **Mineflayer cannot connect to Paper 26.2 natively today.** The newest supported version is 26.1. 26.2 support has been open upstream since July 2026 and is unreleased; 26.3 work has already started. A live check of a 26.1 bot through **ViaBackwards** ([section 1.1](#11-live-compatibility-check-2026-11-10)) found:
+   - spawn, observe, dig, place, attack and stop work;
+   - movement works for a new player, but a **returning player is pulled back by the server**, so movement through ViaBackwards is not reliable yet.
 2. **Our `WorldAdapter` seam is shaped around server commands**, not a player's actions. Action handlers build commands (`setblock`, `tp`, `execute as … run …`) and send them through `run_as_player`/`run_command_blocking`/`set_block`/`teleport_player`. A Mineflayer bot is an ordinary, non-operator player and must stay one (RFC-0001: no OP commands on controller keys). So Phase D needs **backend-specific action handlers** behind the same `ActionService`, not just a second `WorldAdapter` implementation.
 3. **Sidecar protocol:** a Node.js child process speaking newline-delimited JSON-RPC 2.0 over stdio. No network port; its lifetime is tied to the Python process. Policy, authorization, idempotency and the event journal all stay in Python.
 
@@ -20,7 +22,7 @@ Checked 2026-11-10 against the npm registry and the PrismarineJS repositories.
 | minecraft-protocol | 1.68.0 (2026-08-27). `defaultVersion` is `26.1`. |
 | minecraft-data | 3.119.0 (2026-10-29). 26.2 data PRs are still open. |
 | 26.2 tracking | [mineflayer#3952](https://github.com/PrismarineJS/mineflayer/issues/3952); PRs mineflayer#3926/#4192/#3958, node-minecraft-protocol#1496/#1550, minecraft-data#1219/#1344. One report has a patched bot working on 26.2 (the key fix is the new `fluidCount` u16 in 26.x chunk sections). |
-| ViaVersion / ViaBackwards | 5.12.2 (2026-10-27). Its release notes include 26.2 → 26.1 translation fixes. **Untested here.** |
+| ViaVersion / ViaBackwards | 5.12.2 (2026-10-27). Its release notes include 26.2 → 26.1 translation fixes. Tested live, see [section 1.1](#11-live-compatibility-check-2026-11-10). |
 | Node.js | mineflayer 4.39 requires Node ≥ 22. The VPS has Node 22.23. |
 | mineflayer-pathfinder | npm 2.4.5 (2023), with repository commits through 2026-10. It works with mineflayer, but behaviour on 26.x is unverified. |
 | mineflayer-pvp | Effectively unmaintained (npm 2022). Not used; attacks use the built-in `bot.attack`. |
@@ -35,7 +37,32 @@ Options for the version gap:
 | C. Carry the unmerged upstream 26.2 patches | Maintaining a fork | Breaks on every upstream change |
 | D. Wait for upstream 26.2 support | None | Unbounded delay; upstream already lags by one version |
 
-Recommendation: try **A**, design so that switching to native 26.2 later only changes the sidecar's `version` setting, and fall back to **B** if A breaks digging, placing or movement.
+Recommendation: design so that switching to native 26.2 later only changes the sidecar's `version` setting.
+- **A** is usable for development once the returning-player movement problem below is understood or worked around.
+- **B** is the fallback if movement cannot be made reliable through ViaBackwards.
+
+### 1.1 Live compatibility check (2026-11-10)
+
+Setup:
+- ViaVersion and ViaBackwards 5.12.2 were added temporarily to the Paper 26.2 build 123 test server and removed afterwards. ViaVersion detected "server version 26.2 (776)".
+- Client: mineflayer 4.39.0 and mineflayer-pathfinder 2.4.5 on Node 22.23, offline auth, `version: '26.1'`.
+- Five bounded server windows, each a separate login.
+
+| Step | Result |
+|------|--------|
+| Login, spawn | Works. Survival mode; ViaVersion detected the server as 26.2. |
+| Observe | Works: position, health, food, time, players, inventory, `blockAt`. |
+| Dig | Works: `grass_block -> air` (by hand), and the server agreed. |
+| Place | Works: dirt placed on a reference block 2 away. One attempt directly beside the bot's own hitbox was refused by the server. |
+| Attack | Works: one punch took a NoAI zombie (at night) from 20.0 to 19.06 health. |
+| Stop | Works: `pathfinder.setGoal(null)` + `clearControlStates()` gave a drift of 0.00 over 1.5 s. `pathfinder.stop()` alone keeps moving until a safe node. |
+| Movement, new player | Works: the first session's pathfinder `goto` reached its goal, and a never-seen username walked 31 blocks with 3 forced moves after spawn. |
+| **Movement, returning player** | **Fails**: the same username in later sessions was snapped back (41 `forcedMove` packets in about 8 s; `goto` timed out 4 of 4 times). The server logged no "moved wrongly" or "moved too quickly". |
+
+The returning-player failure matches the server never accepting the client's teleport confirmation and so repeatedly resending its position. The difference is saved player data, which suggests something in the restored player state is translated wrongly between 26.2 and 26.1. **Not confirmed:**
+- deleting the saved data was not tried;
+- the same client was not tried against a native 26.1 server;
+- the upstream issues were not checked for this symptom.
 
 ## 2. Architecture
 
@@ -72,7 +99,7 @@ ControllerService ─▶ ActionService (policy, reach guard, idempotency, audit)
 | eat / heal | Effects and commands (heal is privileged) | `bot.consume`; heal **unsupported** | No cheat healing |
 | attack | `damage` command | `bot.attack(entity)` | 26.x attack packet is still changing upstream |
 | interact | `execute … run interact` | `bot.activateBlock` / `activateEntity` | Equivalent intent |
-| **stop** (gate) | No dedicated action; tasks cancel between steps | `pathfinder.stop()`, `clearControlStates()`, `stopDigging()` | Needed for both backends: add a `stop` action to the controller API |
+| **stop** (gate) | No dedicated action; tasks cancel between steps | `pathfinder.setGoal(null)` (not `stop()`, which runs on to a safe node), `clearControlStates()`, `stopDigging()` | Needed for both backends: add a `stop` action to the controller API |
 
 Every action gets an explicit status per backend (supported, physical, unsupported) through `Capabilities`. An unsupported action is rejected with `ACTION_NOT_SUPPORTED` before dispatch, never silently mapped to a privileged path.
 
@@ -113,13 +140,12 @@ The test mirrors `tests/test_phase_c_integration.py`: a live server and a Minefl
 
 ## Next steps
 
-1. **Live compatibility check (needs approval: third-party code).** In a bounded server window:
-   - add ViaVersion and ViaBackwards 5.12.2 to the test server temporarily;
-   - install mineflayer 4.39.0 and mineflayer-pathfinder 2.4.5 into a scratch directory;
-   - connect an offline-mode bot as version `26.1`, and check spawn, observe, `goto`, `dig`, `place` and `attack`;
-   - remove the plugins afterwards.
+1. **Done:** the live compatibility check ([section 1.1](#11-live-compatibility-check-2026-11-10)). **Open:** why a returning player is pulled back through ViaBackwards. Ways to narrow it down:
+   - run the same client against a native Paper 26.1 server;
+   - delete the bot's saved player data before each login;
+   - look for upstream ViaBackwards and mineflayer reports.
    
-   Result: option A confirmed, or fall back to B.
+   Until it is resolved, the live gate test must use a fresh player for each run, or option B.
 2. Refactor first, with no behaviour change: split `WorldAdapter` into the shared observation protocol and an MCPQ command protocol; select the handler table by backend; add a `stop` controller action; return `ACTION_NOT_SUPPORTED` per capability.
 3. Sidecar and `MineflayerWorldAdapter` behind an optional extra (`[mineflayer]`), with unit tests that use a fake sidecar speaking the JSON-RPC protocol.
 4. Live gate test as described in section 7.
