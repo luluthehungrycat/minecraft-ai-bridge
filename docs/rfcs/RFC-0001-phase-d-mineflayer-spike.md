@@ -68,11 +68,15 @@ Four more bounded windows narrowed the movement failure down. Saved player data 
 | Returning player vs a new one in the same window | The returning player walked with **0** resets; the new one got **24**, all putting it back at the same spot |
 | Sending `tick_end` after every physics tick | No change (48 forced moves). mineflayer 4.39.0 never sends it; master does since [mineflayer#4137](https://github.com/PrismarineJS/mineflayer/pull/4137) (2026-10-03). It is what 26.3 servers kick for ([ViaBackwards#1362](https://github.com/ViaVersion/ViaBackwards/issues/1362), [mineflayer#4189](https://github.com/PrismarineJS/mineflayer/issues/4189)), but not this. |
 | Bot's view vs the server's (MCPQ `getBlock`), 100 blocks around each reset spot | Block names match exactly. Block states such as stair or slab orientation were not compared. |
+| mineflayer master ([5a252e6](https://github.com/PrismarineJS/mineflayer/commit/5a252e6d258882b042e60e21c37d552cdf3b3380), sends `tick_end`), same three players and spots | Still reset: 21, 37 and 24 forced moves |
+| Native Paper 26.1.2 build 74 server, no ViaVersion/ViaBackwards (throwaway container), three new players, mineflayer 4.39.0 | **Also reset**, less often: 11, 6 and 6 forced moves for the same walk |
 
-So the server rejects the bot's moves at particular spots. The likely cause is that the bot's physics and the server's disagree, either because of how ViaBackwards translates movement or because of block shapes/states that weren't compared. **Remaining checks:**
-- the same walk with mineflayer master instead of the 4.39.0 release;
-- the same client against a native Paper 26.1 server, without ViaBackwards;
-- comparing full block states, not just names, at a reset spot.
+So the server rejects some of the bot's moves **even on a native 26.1 server**: Mineflayer's client-side physics (prismarine-physics) already disagrees with the 26.x server. Through ViaBackwards on 26.2 it happens about 3–5 times as often. A walking client should normally get no forced moves at all. Neither Mineflayer master nor `tick_end` fixes it. **Remaining checks:**
+- find or file the upstream prismarine-physics/mineflayer issue for 26.x movement corrections, with this reproduction;
+- compare full block states, not just names, at a reset spot;
+- check whether pathfinder's `goto` still reaches its goal despite resets (it recomputes when stuck) or whether the backend needs its own retry and progress check.
+
+Until movement is reliable, the Mineflayer gate test cannot rely on `walk_to`; option B (a native 26.1 server) does not help either.
 
 ## 2. Architecture
 
@@ -172,7 +176,7 @@ The test mirrors `tests/test_phase_c_integration.py`: a live server and a Minefl
 
 ## Next steps
 
-1. **Done:** the live compatibility check ([section 1.1](#11-live-compatibility-check-2026-11-10)). **Open:** why the server pulls the walking bot back through ViaBackwards; the remaining checks are in [section 1.2](#12-follow-up-the-snap-back-2026-11-11). Until it is resolved, movement through ViaBackwards cannot pass the gate, so the live gate test needs option B or a fix.
+1. **Done:** the live compatibility check ([section 1.1](#11-live-compatibility-check-2026-11-10)). **Open:** why the server pulls the walking bot back through ViaBackwards; the remaining checks are in [section 1.2](#12-follow-up-the-snap-back-2026-11-11). Until it is resolved, movement through ViaBackwards cannot pass the gate, and option B does not avoid it (section 1.2).
 2. Refactor first, with no behaviour change: split `WorldAdapter` into the shared observation protocol and an MCPQ command protocol; select the handler table by backend; add `Capabilities.actions` and return `ACTION_NOT_SUPPORTED` per action; add the `BackendOutcomeUnknown` path to ActionService; add the lock-free `stop` controller call.
 3. Sidecar and `MineflayerWorldAdapter` behind an optional extra (`[mineflayer]`), with unit tests that use a fake sidecar speaking the JSON-RPC protocol.
 4. Live gate test as described in section 7.
