@@ -30,6 +30,7 @@ from ..minecraft.actions import (
     _HOSTILE_MOBS,
     ActionResult,
     ActionType,
+    BackendOutcomeUnknownError,
     _is_food,
     _should_attack,
     execute_action,
@@ -1056,13 +1057,34 @@ class ActionService:
             # after it is treated as an interrupted dispatch with unknown
             # outcome.
             self._dispatch_started.add(request_id)
-        if preemptible and self._safety_preemption_enabled:
-            # Multi-step handlers stop between steps once a reflex is waiting
-            # for the dispatch lock, so a long walk cannot delay it.
-            with safety_interrupt_scope(self._safety_intervention_pending):
+        try:
+            if preemptible and self._safety_preemption_enabled:
+                # Multi-step handlers stop between steps once a reflex is waiting
+                # for the dispatch lock, so a long walk cannot delay it.
+                with safety_interrupt_scope(self._safety_intervention_pending):
+                    result = await execute_action(self._world, request.action, dict(request.params))
+            else:
                 result = await execute_action(self._world, request.action, dict(request.params))
-        else:
-            result = await execute_action(self._world, request.action, dict(request.params))
+        except BackendOutcomeUnknownError as exc:
+            # The request reached the backend, which cannot say whether it
+            # took effect. Record it like a dispatch interrupted midway: the
+            # outcome is unknown and the request ID never re-dispatches.
+            message = (
+                f"Backend outcome unknown: {exc}. The same request_id will not re-dispatch."
+                if str(exc)
+                else "Backend outcome unknown. The same request_id will not re-dispatch."
+            )
+            result = ActionResult(success=False, action=request.action, message=message)
+            result.data["correlation_id"] = request.correlation_id
+            result.data["reason_code"] = "OUTCOME_UNKNOWN"
+            self._record(
+                request,
+                allowed=True,
+                succeeded=False,
+                reason="backend outcome unknown",
+                request_id=request_id,
+            )
+            return ActionOutcome(result=result, status="unknown", allowed=True)
         self._record(
             request,
             allowed=True,

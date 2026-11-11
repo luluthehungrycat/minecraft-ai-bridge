@@ -70,6 +70,7 @@ from .contracts import (
     Event,
     EventSeverity,
     SessionStatus,
+    SupportLevel,
     Task,
 )
 from .event_journal import (
@@ -130,6 +131,12 @@ _EXPOSED_ACTIONS = frozenset(
 _EXPOSABLE_CLASSES = frozenset(
     {ActionClass.OBSERVATION, ActionClass.SURVIVAL, ActionClass.PRIVILEGED_SIMULATED}
 )
+
+
+def _exposed(action: ActionType) -> bool:
+    return action in _EXPOSED_ACTIONS and classify_action(action) in _EXPOSABLE_CLASSES
+
+
 _OBSERVE_SCOPES = ("steve:observe:self", "steve:control")
 _EVENTS_SCOPE = "events:read"
 # Journal pages read per poll while skipping events this Steve may not see,
@@ -327,7 +334,11 @@ class ControllerService:
 
     async def get_capabilities(self, token: str) -> Capabilities:
         await self._require_observer(token)
-        return self._world.capabilities
+        capabilities = self._world.capabilities
+        # Report only actions a controller may request; internal and
+        # lifecycle actions stay unlisted.
+        actions = {a: level for a, level in capabilities.actions.items() if _exposed(a)}
+        return capabilities.model_copy(update={"actions": actions})
 
     async def get_state(self, token: str) -> dict[str, Any]:
         """Return a world-state snapshot as a JSON-compatible mapping."""
@@ -442,6 +453,11 @@ class ControllerService:
         elif result.data.get("interrupted") is True:
             status = ActionStatus.INTERRUPTED
             reason_code = "SAFETY_INTERRUPTED"
+        elif result.data.get("reason_code") == "OUTCOME_UNKNOWN":
+            # The backend got the request but cannot say whether it took
+            # effect (also when replayed); the request ID never re-dispatches.
+            status = ActionStatus.INTERRUPTED
+            reason_code = "OUTCOME_UNKNOWN"
         elif isinstance(result.data.get("reason_code"), str):
             # A dispatch-guard refusal (e.g. OUT_OF_REACH) or a safety
             # preemption (SAFETY_PREEMPTED), including when replayed from
@@ -613,11 +629,15 @@ class ControllerService:
             return "SESSION_NOT_OWNED", "controller session belongs to another credential"
         if request.generation != session.generation:
             return "STALE_GENERATION", "request generation does not match the session"
-        if (
-            request.action not in _EXPOSED_ACTIONS
-            or classify_action(request.action) not in _EXPOSABLE_CLASSES
-        ):
+        if not _exposed(request.action):
             return "ACTION_NOT_EXPOSED", f"{request.action.value} is not a controller action"
+        support = self._world.capabilities.actions.get(request.action, SupportLevel.UNSUPPORTED)
+        if support is SupportLevel.UNSUPPORTED:
+            # Never mapped to another (for example privileged) path.
+            return (
+                "ACTION_NOT_SUPPORTED",
+                f"{request.action.value} is not supported by this Steve's backend",
+            )
         return None
 
     def _publish(self, session: AuthzControllerSession) -> None:

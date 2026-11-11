@@ -21,7 +21,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
-from .contracts import BackendKind, Capabilities, CraftingMode, MovementMode
+from ..minecraft.actions import handler_table
+from .contracts import BackendKind, Capabilities, CraftingMode, MovementMode, SupportLevel
 
 if TYPE_CHECKING:
     from ..minecraft.mc_api import LastAttacker, McpqClient
@@ -125,6 +126,8 @@ class McpqWorldAdapter:
             supported_versions=[],
             dimensions=[],
             hazard_sensors=False,
+            # Every action with an MCPQ handler, in the modes reported above.
+            actions=dict.fromkeys(handler_table(BackendKind.MCPQ.value), SupportLevel.SUPPORTED),
         )
 
     async def get_player_pos(self) -> tuple[float, float, float] | None:

@@ -43,6 +43,7 @@ from .contracts import (
     MovementMode,
     SessionStatus,
     SteveIdentity,
+    SupportLevel,
     Task,
     TaskStatus,
 )
@@ -100,6 +101,7 @@ __all__ = [
     "SessionStatus",
     "SafetySupervisor",
     "SteveIdentity",
+    "SupportLevel",
     "SqliteTaskStore",
     "Task",
     "TaskStatus",
