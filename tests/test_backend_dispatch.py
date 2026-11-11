@@ -13,7 +13,7 @@ from minecraft_ai_bridge.minecraft.actions import (
 )
 from minecraft_ai_bridge.runtime import ActionStatus, AuthzService, ControllerService
 from minecraft_ai_bridge.runtime.action_outcomes import SqliteActionOutcomeStore
-from minecraft_ai_bridge.runtime.action_service import ActionService
+from minecraft_ai_bridge.runtime.action_service import ActionService, PolicyDecision
 from minecraft_ai_bridge.runtime.contracts import BackendKind, Capabilities, SupportLevel
 from minecraft_ai_bridge.runtime.world_adapter import McpqWorldAdapter
 from tests.conftest import MockMcpqClient
@@ -44,6 +44,11 @@ def _unknown_chat(chats: list[str]):
         raise BackendOutcomeUnknownError("connection lost after send")
 
     return handler
+
+
+def _same_identity(_request):
+    # One identity across both services, so the restart replays the record.
+    return PolicyDecision(True, identity_scope=("controller", "a"))
 
 
 @pytest.fixture
@@ -104,7 +109,11 @@ async def test_unknown_outcome_is_recorded_and_never_redispatched(tmp_path, monk
     chats: list[str] = []
     monkeypatch.setitem(actions._HANDLERS, ActionType.CHAT, _unknown_chat(chats))
     store = SqliteActionOutcomeStore(tmp_path / "outcomes.sqlite3")
-    service = ActionService(McpqWorldAdapter(MockMcpqClient()), outcome_store=store)  # type: ignore[arg-type]
+    service = ActionService(
+        McpqWorldAdapter(MockMcpqClient()),  # type: ignore[arg-type]
+        policy=_same_identity,
+        outcome_store=store,
+    )
 
     first = await service.execute(ActionType.CHAT, {"message": "hi"}, request_id="r1")
     await service.flush()
@@ -119,9 +128,13 @@ async def test_unknown_outcome_is_recorded_and_never_redispatched(tmp_path, monk
     assert record.allowed and not record.succeeded
 
     # A fresh process sharing the database must not dispatch it again either.
-    restarted = ActionService(McpqWorldAdapter(MockMcpqClient()), outcome_store=store)  # type: ignore[arg-type]
+    restarted = ActionService(
+        McpqWorldAdapter(MockMcpqClient()),  # type: ignore[arg-type]
+        policy=_same_identity,
+        outcome_store=store,
+    )
     again = await restarted.execute(ActionType.CHAT, {"message": "hi"}, request_id="r1")
-    assert not again.success
+    assert again.data["reason_code"] == "OUTCOME_UNKNOWN"
     assert chats == ["hi"]
     store.close()
 
