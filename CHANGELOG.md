@@ -32,8 +32,11 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
   `move_forward`, `move_back`, `sprint`) stop at their next step and return
   `interrupted` with reason `STOP_REQUESTED`; single-command actions and
   `wait` finish normally, and safety reflexes are never stopped. It needs the
-  current controller session and also works while a task runs, which pauses
-  the task. See docs/CLI.md.
+  current controller session and is accepted while a task runs, but it does
+  not pause the task (no task step is a multi-step move, so the step
+  finishes and the task goes on). Use the task pause and cancel tools to stop
+  a task. Unlike other actions, `stop` is not deduplicated by `request_id`. See
+  docs/CLI.md.
 - `minecraft_get_capabilities` now lists how the backend supports each
   controller action (`actions`: `supported`, `physical` or `unsupported`).
   An action the backend does not support is refused with

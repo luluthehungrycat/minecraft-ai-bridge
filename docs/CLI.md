@@ -217,9 +217,12 @@ actions running at that moment without waiting for them: multi-step actions
 (`walk_to`, `move_forward`, `move_back`, `sprint`) stop at their next step and
 return `interrupted` with `STOP_REQUESTED`. Single-command actions finish
 normally, `wait` runs out its time, and safety reflexes are never stopped. It
-needs the current controller session, works while a task runs (the task's
-step is interrupted and the task pauses), never affects an action started
-after it, and is harmless to repeat.
+needs the current controller session and never affects an action started
+after it. It is accepted while a task runs, but it does not pause the task:
+none of today's task steps is a multi-step move, so the step finishes and the
+task goes on. Use `minecraft_pause_task` or `minecraft_cancel_task` to stop a
+task. Unlike other actions, `stop` is not deduplicated by `request_id`: each
+call stops whatever is running at that moment, so do not retry it blindly.
 
 Tasks run a plan of up to 100 steps without holding the MCP request open:
 `minecraft_create_task` (`session_id`, `generation`, `request_id`, `title`,

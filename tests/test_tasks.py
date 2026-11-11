@@ -688,24 +688,37 @@ async def test_a_cancelled_resume_still_launches_the_worker(runtime, setup, monk
     assert setup.world.chat_messages_sent == []
 
 
-async def test_stop_is_not_blocked_by_a_running_task(runtime, setup):
+async def test_stop_is_accepted_during_a_task_but_does_not_pause_it(runtime, setup, monkeypatch):
+    from minecraft_ai_bridge.minecraft import actions
     from minecraft_ai_bridge.minecraft.actions import ActionType
     from minecraft_ai_bridge.runtime import ActionStatus
     from tests.test_controller_service import _request
 
+    started, release = asyncio.Event(), asyncio.Event()
+    original = actions._HANDLERS[ActionType.CHAT]
+
+    async def held_chat(mc, params):
+        if params.get("message") == "one":
+            started.set()
+            await release.wait()
+        return await original(mc, params)
+
+    monkeypatch.setitem(actions._HANDLERS, ActionType.CHAT, held_chat)
     session = await runtime.open_session(setup.controller)
     task = await runtime.create_task(
         setup.controller,
         session.session_id,
         session.generation,
-        "wait-stop",
+        "chat-stop",
         "test",
-        [{"action": "wait", "params": {"seconds": 30}}],
+        [
+            {"action": "chat", "params": {"message": "one"}},
+            {"action": "chat", "params": {"message": "two"}},
+        ],
     )
-    await finished(runtime, setup.controller, task.task_id, TaskStatus.RUNNING)
+    await asyncio.wait_for(started.wait(), 3)
     result = await runtime.submit_action(setup.controller, _request(session, ActionType.STOP))
     assert result.status is ActionStatus.SUCCEEDED
-    await runtime.cancel_task(
-        setup.controller, session.session_id, session.generation, task.task_id
-    )
-    await finished(runtime, setup.controller, task.task_id, TaskStatus.CANCELLED)
+    release.set()
+    await finished(runtime, setup.controller, task.task_id, TaskStatus.SUCCEEDED)
+    assert setup.world.chat_messages_sent == ["one", "two"]
