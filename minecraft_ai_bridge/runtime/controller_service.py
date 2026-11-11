@@ -106,6 +106,8 @@ _EXPOSED_ACTIONS = frozenset(
         ActionType.CHAT,
         ActionType.WAIT,
         ActionType.DONE,
+        # Ends running actions without waiting for them (ActionService.interrupt)
+        ActionType.STOP,
         # Privileged-simulated on MCPQ; still require admin:world from policy
         ActionType.MOVE_TO,
         ActionType.MOVE_FORWARD,
@@ -452,7 +454,11 @@ class ControllerService:
             reason_code = None
         elif result.data.get("interrupted") is True:
             status = ActionStatus.INTERRUPTED
-            reason_code = "SAFETY_INTERRUPTED"
+            reason_code = (
+                "STOP_REQUESTED"
+                if result.data.get("interrupt_reason") == "stop"
+                else "SAFETY_INTERRUPTED"
+            )
         elif result.data.get("reason_code") == "OUTCOME_UNKNOWN":
             # The backend got the request but cannot say whether it took
             # effect (also when replayed); the request ID never re-dispatches.

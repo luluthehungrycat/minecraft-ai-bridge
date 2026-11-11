@@ -212,6 +212,15 @@ state and use a new request ID to try again. `SAFETY_INTERRUPTED` means a
 multi-step action stopped after partial progress; inspect state before
 planning the next action. Reflexes stop when the server exits.
 
+`stop` (through `minecraft_submit_action`, with any `request_id`) ends the
+actions running at that moment without waiting for them: multi-step actions
+(`walk_to`, `move_forward`, `move_back`, `sprint`) stop at their next step and
+return `interrupted` with `STOP_REQUESTED`. Single-command actions finish
+normally, `wait` runs out its time, and safety reflexes are never stopped. It
+needs the current controller session, works while a task runs (the task's
+step is interrupted and the task pauses), never affects an action started
+after it, and is harmless to repeat.
+
 Tasks run a plan of up to 100 steps without holding the MCP request open:
 `minecraft_create_task` (`session_id`, `generation`, `request_id`, `title`,
 `steps` as `[{"action": ..., "params": {...}}]`), then `minecraft_get_task`

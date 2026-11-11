@@ -686,3 +686,26 @@ async def test_a_cancelled_resume_still_launches_the_worker(runtime, setup, monk
     )
     await finished(runtime, setup.controller, task.task_id, TaskStatus.CANCELLED)
     assert setup.world.chat_messages_sent == []
+
+
+async def test_stop_is_not_blocked_by_a_running_task(runtime, setup):
+    from minecraft_ai_bridge.minecraft.actions import ActionType
+    from minecraft_ai_bridge.runtime import ActionStatus
+    from tests.test_controller_service import _request
+
+    session = await runtime.open_session(setup.controller)
+    task = await runtime.create_task(
+        setup.controller,
+        session.session_id,
+        session.generation,
+        "wait-stop",
+        "test",
+        [{"action": "wait", "params": {"seconds": 30}}],
+    )
+    await finished(runtime, setup.controller, task.task_id, TaskStatus.RUNNING)
+    result = await runtime.submit_action(setup.controller, _request(session, ActionType.STOP))
+    assert result.status is ActionStatus.SUCCEEDED
+    await runtime.cancel_task(
+        setup.controller, session.session_id, session.generation, task.task_id
+    )
+    await finished(runtime, setup.controller, task.task_id, TaskStatus.CANCELLED)

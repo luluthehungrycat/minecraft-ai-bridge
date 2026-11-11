@@ -27,6 +27,13 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
 
 ### Added
 
+- Controllers can send a `stop` action that ends the actions running at that
+  moment without waiting for them. Multi-step moves (`walk_to`,
+  `move_forward`, `move_back`, `sprint`) stop at their next step and return
+  `interrupted` with reason `STOP_REQUESTED`; single-command actions and
+  `wait` finish normally, and safety reflexes are never stopped. It needs the
+  current controller session and also works while a task runs, which pauses
+  the task. See docs/CLI.md.
 - `minecraft_get_capabilities` now lists how the backend supports each
   controller action (`actions`: `supported`, `physical` or `unsupported`).
   An action the backend does not support is refused with
