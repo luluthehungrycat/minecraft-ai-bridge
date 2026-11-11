@@ -68,7 +68,7 @@ def setup(tmp_path):
 
 def test_mcpq_profile_lists_every_mcpq_handler_as_supported():
     profile = _mcpq_profile()
-    assert set(profile.actions) == set(handler_table(BackendKind.MCPQ.value))
+    assert set(profile.actions) == {*handler_table(BackendKind.MCPQ.value), ActionType.STOP}
     assert set(profile.actions.values()) == {SupportLevel.SUPPORTED}
 
 

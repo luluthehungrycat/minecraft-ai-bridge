@@ -28,6 +28,8 @@ from uuid import uuid4
 
 from ..minecraft.actions import (
     _HOSTILE_MOBS,
+    _INTERRUPTED_MESSAGE,
+    STOP_INTERRUPTED_MESSAGE,
     ActionResult,
     ActionType,
     BackendOutcomeUnknownError,
@@ -118,7 +120,7 @@ _INTERNAL_CONTROL_ACTIONS = frozenset(
 _LIFECYCLE_INTERNAL_ACTIONS = frozenset({ActionType.PROVISION_BOT, ActionType.PREPARE_SAFE_SPAWN})
 # Actions with no world effect beyond chat. A new ActionType must be added to
 # exactly one set; unlisted actions fail closed instead of defaulting here.
-_SURVIVAL_ACTIONS = frozenset({ActionType.CHAT, ActionType.WAIT, ActionType.DONE})
+_SURVIVAL_ACTIONS = frozenset({ActionType.CHAT, ActionType.WAIT, ActionType.DONE, ActionType.STOP})
 _PRIVILEGED_AUTHORIZATION_CLASSES = frozenset(
     {
         ActionClass.PRIVILEGED_SIMULATED,
@@ -416,6 +418,10 @@ class ActionService:
         # cancellation-stored one), so a later reuse of the same ID starts
         # with clean dispatch state.
         self._dispatch_started: set[str] = set()
+        # Raised by interrupt(); a dispatch stops between steps once it differs
+        # from the value it started with, so a stop never ends a later action.
+        self._stop_generation = 0
+        self._running_dispatches = 0
         self.audit_records: deque[ActionAuditRecord] = deque(maxlen=1024)
 
     async def execute(
@@ -445,6 +451,11 @@ class ActionService:
         mutation of the original mapping cannot change what the policy sees,
         what is dispatched, or what the fingerprint covers.
         """
+
+        if action is ActionType.STOP:
+            # Stop must not wait behind the dispatch it is meant to end, and it
+            # is not a mutation, so it has no request-ID idempotency.
+            return await self.interrupt(correlation_id=correlation_id)
 
         preemption_generation = self._preemption_generation
         if preemptive and self._safety_preemption_enabled:
@@ -698,6 +709,40 @@ class ActionService:
 
     def _safety_intervention_pending(self) -> bool:
         return self._preemption_generation != self._acknowledged_preemption_generation
+
+    async def interrupt(self, *, correlation_id: str | None = None) -> ActionResult:
+        """Ask every running dispatch to stop, without taking the dispatch lock.
+
+        Runs the policy hook (``stop`` is a survival action, so any holder of
+        a valid controller session may use it) and records an audit entry,
+        but never dispatches to the backend itself. Dispatches running when it
+        is called stop at their next step and return an interrupted result;
+        single-command actions finish normally, and ``wait`` runs out its
+        bounded time. A dispatch that starts afterwards is not affected. With
+        nothing running it is a recorded no-op.
+        """
+        request = ActionRequest(
+            action=ActionType.STOP,
+            params={},
+            correlation_id=correlation_id or str(uuid4()),
+        )
+        _decision, denied = await self._evaluate_policy(request, request_id=None)
+        if denied is not None:
+            return denied.result
+        running = self._running_dispatches
+        self._stop_generation += 1
+        message = (
+            f"Stop requested for {running} running action(s)"
+            if running
+            else "Nothing was running; stop had no effect"
+        )
+        self._record(request, allowed=True, succeeded=True, reason=message)
+        return ActionResult(
+            success=True,
+            action=ActionType.STOP,
+            message=message,
+            data={"correlation_id": request.correlation_id, "running": running},
+        )
 
     @property
     def safety_generation(self) -> int:
@@ -1057,13 +1102,22 @@ class ActionService:
             # after it is treated as an interrupted dispatch with unknown
             # outcome.
             self._dispatch_started.add(request_id)
+        stop_generation = self._stop_generation
+        safety_preemptible = preemptible and self._safety_preemption_enabled
+
+        def safety_pending() -> bool:
+            return safety_preemptible and self._safety_intervention_pending()
+
+        def stop_requested() -> bool:
+            # A controller's stop never cuts a safety reflex short.
+            return not request.trusted_safety and self._stop_generation != stop_generation
+
+        self._running_dispatches += 1
         try:
-            if preemptible and self._safety_preemption_enabled:
-                # Multi-step handlers stop between steps once a reflex is waiting
-                # for the dispatch lock, so a long walk cannot delay it.
-                with safety_interrupt_scope(self._safety_intervention_pending):
-                    result = await execute_action(self._world, request.action, dict(request.params))
-            else:
+            # Multi-step handlers stop between steps once a reflex is waiting
+            # for the dispatch lock, so a long walk cannot delay it, or once
+            # interrupt() was called after this dispatch started.
+            with safety_interrupt_scope(lambda: safety_pending() or stop_requested()):
                 result = await execute_action(self._world, request.action, dict(request.params))
         except BackendOutcomeUnknownError as exc:
             # The request reached the backend, which cannot say whether it
@@ -1085,6 +1139,11 @@ class ActionService:
                 request_id=request_id,
             )
             return ActionOutcome(result=result, status="unknown", allowed=True)
+        finally:
+            self._running_dispatches -= 1
+        if result.data.get("interrupted") is True and stop_requested() and not safety_pending():
+            result.data["interrupt_reason"] = "stop"
+            result.message = result.message.replace(_INTERRUPTED_MESSAGE, STOP_INTERRUPTED_MESSAGE)
         self._record(
             request,
             allowed=True,

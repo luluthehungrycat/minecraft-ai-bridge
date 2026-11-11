@@ -165,7 +165,8 @@ minecraft-ai-bridge-mcp --transport http --port 8765
 Tools: `minecraft_get_capabilities`, `minecraft_get_state`,
 `minecraft_open_session`, `minecraft_renew_session`, `minecraft_close_session`,
 and `minecraft_submit_action` (`session_id`, `generation`, `request_id`,
-`action`, `params`). Reuse a `request_id` only to retry the same action; the
+`action`, `params`). Except for `stop` (see below), reuse a `request_id` only
+to retry the same action; the
 retry never runs it twice. A retry returns the original result only within
 the session that sent it; from a new session the request ID is refused
 (`POLICY_REJECTED`), still without running it again.
@@ -211,6 +212,18 @@ anyone to read them.
 state and use a new request ID to try again. `SAFETY_INTERRUPTED` means a
 multi-step action stopped after partial progress; inspect state before
 planning the next action. Reflexes stop when the server exits.
+
+`stop` (through `minecraft_submit_action`, with any `request_id`) ends the
+actions running at that moment without waiting for them: multi-step actions
+(`walk_to`, `move_forward`, `move_back`, `sprint`) stop at their next step and
+return `interrupted` with `STOP_REQUESTED`. Single-command actions finish
+normally, `wait` runs out its time, and safety reflexes are never stopped. It
+needs the current controller session and never affects an action started
+after it. It is accepted while a task runs, but it does not pause the task:
+none of today's task steps is a multi-step move, so the step finishes and the
+task goes on. Use `minecraft_pause_task` or `minecraft_cancel_task` to stop a
+task. Unlike other actions, `stop` is not deduplicated by `request_id`: each
+call stops whatever is running at that moment, so do not retry it blindly.
 
 Tasks run a plan of up to 100 steps without holding the MCP request open:
 `minecraft_create_task` (`session_id`, `generation`, `request_id`, `title`,

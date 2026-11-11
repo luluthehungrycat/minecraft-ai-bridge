@@ -10,6 +10,7 @@ import sqlite3
 from collections.abc import Coroutine
 from typing import TYPE_CHECKING, Any
 
+from ..minecraft.actions import ActionType
 from .action_service import ActionRequest, PolicyDecision
 from .authz import ControllerSession
 from .contracts import ActionRequestSchema, ActionStatus, Task, TaskStatus, TaskStep
@@ -209,7 +210,9 @@ class TaskRunner:
         self._worker = asyncio.create_task(self._run(session), context=contextvars.Context())
 
     def guard(self, request: ActionRequest) -> PolicyDecision | None:
-        if request.trusted_safety:
+        if request.trusted_safety or request.action is ActionType.STOP:
+            # A session holder may always stop. It does not pause the task (no task
+            # step is a multi-step move); pause or cancel the task for that.
             return None
         if self._worker is None or self._worker.done():
             return None

@@ -89,6 +89,9 @@ class ActionType(StrEnum):
     # ── Meta ────────────────────────────────────────────────────────
     WAIT = "wait"
     DONE = "done"  # signal sub-goal / goal completion
+    # Controller-only: ends running actions through ActionService.interrupt,
+    # never through a handler or the dispatch lock. Not offered to the LLM.
+    STOP = "stop"
 
 
 @dataclass
@@ -700,6 +703,7 @@ _SAFETY_INTERRUPT: ContextVar[Callable[[], bool] | None] = ContextVar(
     "safety_interrupt", default=None
 )
 _INTERRUPTED_MESSAGE = "interrupted by safety intervention"
+STOP_INTERRUPTED_MESSAGE = "interrupted by stop request"
 
 
 @contextlib.contextmanager
