@@ -211,7 +211,8 @@ class TaskRunner:
 
     def guard(self, request: ActionRequest) -> PolicyDecision | None:
         if request.trusted_safety or request.action is ActionType.STOP:
-            # A session holder may always stop; stopping a task's step pauses it.
+            # A session holder may always stop. It does not pause the task (no task
+            # step is a multi-step move); pause or cancel the task for that.
             return None
         if self._worker is None or self._worker.done():
             return None
