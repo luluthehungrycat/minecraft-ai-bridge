@@ -33,13 +33,13 @@ Options for the version gap:
 | Option | Cost | Risk |
 |--------|------|------|
 | **A. ViaVersion + ViaBackwards on the server, bot speaks 26.1** (recommended to try first) | Two server plugins | A translation layer; chunk, entity and inventory quirks are possible |
-| B. Run a separate Paper 26.1 test server for the Mineflayer track | A second server, and a world that diverges from MCPQ's | MCPQ and the bot plugin are built against 26.2 |
+| B. Run a separate Paper 26.1 test server for the Mineflayer track | A second server, and a world that diverges from MCPQ's | MCPQ and the bot plugin are built against 26.2. Tested in section 1.2: movement corrections happen there too, so it is not a movement workaround |
 | C. Carry the unmerged upstream 26.2 patches | Maintaining a fork | Breaks on every upstream change |
 | D. Wait for upstream 26.2 support | None | Unbounded delay; upstream already lags by one version |
 
 Recommendation: design so that switching to native 26.2 later only changes the sidecar's `version` setting.
 - **A** is usable for development once the movement snap-back below is understood or worked around.
-- **B** is the fallback if movement cannot be made reliable through ViaBackwards.
+- **B** was tested (section 1.2) and also shows the snap-back, so it is not a demonstrated movement workaround.
 
 ### 1.1 Live compatibility check (2026-11-10)
 
@@ -56,11 +56,11 @@ Setup:
 | Place | Works: dirt placed on a reference block 2 away. One attempt directly beside the bot's own hitbox was refused by the server. |
 | Attack | Works: one punch took a NoAI zombie (at night) from 20.0 to 19.06 health. |
 | Stop | Works: `pathfinder.setGoal(null)` + `clearControlStates()` gave a drift of 0.00 over 1.5 s. `pathfinder.stop()` alone keeps moving until a safe node. |
-| **Movement** | **Unreliable**: the first session's pathfinder `goto` reached its goal and a never-seen username walked 31 blocks, but in other sessions the bot was snapped back (up to 48 `forcedMove` packets in about 8 s; `goto` timed out 4 of 4 times). The server logged no "moved wrongly" or "moved too quickly". |
+| **Movement** | **Unreliable**: the first session's pathfinder `goto` reached its goal and a never-seen username walked 31 blocks, but in other sessions the bot was snapped back (41 `forcedMove` packets in about 8 s; `goto` timed out 4 of 4 times). The server logged no "moved wrongly" or "moved too quickly". |
 
 ### 1.2 Follow-up: the snap-back (2026-11-11)
 
-Four more bounded windows narrowed the movement failure down. Saved player data is **not** the cause, as section 1.1 first suggested:
+Four more bounded windows narrowed the movement failure down. The initial saved-player-data hypothesis did not explain the follow-up results:
 
 | Test | Result |
 |------|--------|
@@ -71,7 +71,7 @@ Four more bounded windows narrowed the movement failure down. Saved player data 
 | mineflayer master ([5a252e6](https://github.com/PrismarineJS/mineflayer/commit/5a252e6d258882b042e60e21c37d552cdf3b3380), sends `tick_end`), same three players and spots | Still reset: 21, 37 and 24 forced moves |
 | Native Paper 26.1.2 build 74 server, no ViaVersion/ViaBackwards (throwaway container), three new players, mineflayer 4.39.0 | **Also reset**, less often: 11, 6 and 6 forced moves for the same walk |
 
-So the server rejects some of the bot's moves **even on a native 26.1 server**: Mineflayer's client-side physics (prismarine-physics) already disagrees with the 26.x server. Through ViaBackwards on 26.2 it happens about 3–5 times as often. A walking client should normally get no forced moves at all. Neither Mineflayer master nor `tick_end` fixes it. **Remaining checks:**
+So the snap-back **reproduces on a native 26.1 server**: ViaBackwards is not needed to cause it, though it does not isolate the faulty component. A mismatch between Mineflayer's client-side physics (prismarine-physics) and the 26.x server is suspected, not established, while full block states are still uncompared. In these probes the native runs showed fewer corrections; the runs were not matched closely enough to put a number on the difference. A walking client should normally get no forced moves at all. Neither Mineflayer master nor `tick_end` fixes it. **Remaining checks:**
 - find or file the upstream prismarine-physics/mineflayer issue for 26.x movement corrections, with this reproduction;
 - compare full block states, not just names, at a reset spot;
 - check whether pathfinder's `goto` still reaches its goal despite resets (it recomputes when stuck) or whether the backend needs its own retry and progress check.
