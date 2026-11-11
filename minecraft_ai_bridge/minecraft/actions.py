@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from .observer import InventorySlot
 
-from .world_types import WorldAdapter
+from .world_types import McpqCommandAdapter, WorldAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -414,7 +414,7 @@ def _is_artificial(block_id: str) -> bool:
 
 
 async def _can_move_to(
-    mc: WorldAdapter,
+    mc: McpqCommandAdapter,
     x: int,
     y: int,
     z: int,
@@ -446,7 +446,7 @@ async def _can_move_to(
 
 
 async def _walk_toward(
-    mc: WorldAdapter,
+    mc: McpqCommandAdapter,
     target_x: float,
     target_z: float,
     step_size: float = 0.5,
@@ -668,10 +668,10 @@ class BackendOutcomeUnknownError(Exception):
 
 # ── Individual action handlers ─────────────────────────────────────────
 
-Handler = Callable[[WorldAdapter, dict[str, Any]], Awaitable[ActionResult]]
+Handler = Callable[[McpqCommandAdapter, dict[str, Any]], Awaitable[ActionResult]]
 
 
-async def _cmd(mc: WorldAdapter, cmd: str) -> str:
+async def _cmd(mc: McpqCommandAdapter, cmd: str) -> str:
     """Run a command as the configured player and return stripped response.
 
     Substitutes ``@p`` with the actual player name so commands always
@@ -795,7 +795,7 @@ def _sanitize_amount(value: object) -> int:
 # ── Movement ────────────────────────────────────────────────────────────
 
 
-async def _move_to(mc: WorldAdapter, params: dict) -> ActionResult:
+async def _move_to(mc: McpqCommandAdapter, params: dict) -> ActionResult:
     try:
         x, y, z = (_finite_coordinate(params.get(axis, 0), axis) for axis in ("x", "y", "z"))
     except ValueError as exc:
@@ -809,7 +809,7 @@ async def _move_to(mc: WorldAdapter, params: dict) -> ActionResult:
     )
 
 
-async def _move_forward(mc: WorldAdapter, params: dict) -> ActionResult:
+async def _move_forward(mc: McpqCommandAdapter, params: dict) -> ActionResult:
     """Move forward in small steps with collision detection.
 
     Uses caret-relative teleport for small (0.5 block) steps, checking
@@ -888,7 +888,7 @@ async def _move_forward(mc: WorldAdapter, params: dict) -> ActionResult:
     )
 
 
-async def _move_back(mc: WorldAdapter, params: dict) -> ActionResult:
+async def _move_back(mc: McpqCommandAdapter, params: dict) -> ActionResult:
     """Move backward in small steps with collision detection."""
     steps = params.get("steps", 2)
     step_size = 0.5
@@ -943,7 +943,7 @@ async def _move_back(mc: WorldAdapter, params: dict) -> ActionResult:
     )
 
 
-async def _sprint(mc: WorldAdapter, params: dict) -> ActionResult:
+async def _sprint(mc: McpqCommandAdapter, params: dict) -> ActionResult:
     """Sprint forward — faster forward movement with 1.0-block steps.
 
     Uses larger steps than ``move_forward``, ideal for open terrain.
@@ -1004,7 +1004,7 @@ async def _sprint(mc: WorldAdapter, params: dict) -> ActionResult:
     )
 
 
-async def _walk_to(mc: WorldAdapter, params: dict) -> ActionResult:
+async def _walk_to(mc: McpqCommandAdapter, params: dict) -> ActionResult:
     """Walk to a target coordinate step-by-step with collision detection.
 
     For short-to-medium distances (up to ~50 blocks), this uses
@@ -1069,7 +1069,7 @@ async def _walk_to(mc: WorldAdapter, params: dict) -> ActionResult:
     )
 
 
-async def _turn_left(mc: WorldAdapter, params: dict) -> ActionResult:
+async def _turn_left(mc: McpqCommandAdapter, params: dict) -> ActionResult:
     """Turn left by 15 degrees (gradual rotation).
 
     The space after the third ``~`` is critical — without it Minecraft
@@ -1085,7 +1085,7 @@ async def _turn_left(mc: WorldAdapter, params: dict) -> ActionResult:
     )
 
 
-async def _turn_right(mc: WorldAdapter, params: dict) -> ActionResult:
+async def _turn_right(mc: McpqCommandAdapter, params: dict) -> ActionResult:
     """Turn right by 15 degrees (gradual rotation)."""
     resp = await _cmd(mc, "tp @p ~ ~ ~ ~15 ~")
     return ActionResult(
@@ -1096,7 +1096,7 @@ async def _turn_right(mc: WorldAdapter, params: dict) -> ActionResult:
     )
 
 
-async def _jump(mc: WorldAdapter, params: dict) -> ActionResult:
+async def _jump(mc: McpqCommandAdapter, params: dict) -> ActionResult:
     """Jump up one block (teleport-based)."""
     resp = await _cmd(mc, "tp @p ~ ~1 ~")
     return ActionResult(
@@ -1107,12 +1107,12 @@ async def _jump(mc: WorldAdapter, params: dict) -> ActionResult:
     )
 
 
-async def _teleport(mc: WorldAdapter, params: dict) -> ActionResult:
+async def _teleport(mc: McpqCommandAdapter, params: dict) -> ActionResult:
     """Instant teleport to coordinates (bypasses collision)."""
     return await _move_to(mc, params)
 
 
-async def _follow_teleport(mc: WorldAdapter, params: dict) -> ActionResult:
+async def _follow_teleport(mc: McpqCommandAdapter, params: dict) -> ActionResult:
     """Teleport the bot alongside its `!follow` target.
 
     The orchestrator performs the distance check and passes only a
@@ -1145,7 +1145,7 @@ async def _follow_teleport(mc: WorldAdapter, params: dict) -> ActionResult:
     )
 
 
-async def _provision_bot(mc: WorldAdapter, params: dict) -> ActionResult:
+async def _provision_bot(mc: McpqCommandAdapter, params: dict) -> ActionResult:
     """Summon the bot entity via the MCPQ-Bot plugin's `/botsummon` command.
 
     The orchestrator is the only caller; this internal action exists so the
@@ -1178,7 +1178,7 @@ async def _provision_bot(mc: WorldAdapter, params: dict) -> ActionResult:
     )
 
 
-async def _prepare_safe_spawn(mc: WorldAdapter, params: dict) -> ActionResult:
+async def _prepare_safe_spawn(mc: McpqCommandAdapter, params: dict) -> ActionResult:
     """Teleport the bot to its startup spawn point and place a 3x3 platform.
 
     Internal startup-only action: see the ActionService docstring for why
@@ -1231,7 +1231,7 @@ async def _prepare_safe_spawn(mc: WorldAdapter, params: dict) -> ActionResult:
 # ── Interaction ─────────────────────────────────────────────────────────
 
 
-async def _goto_teleport(mc: WorldAdapter, params: dict) -> ActionResult:
+async def _goto_teleport(mc: McpqCommandAdapter, params: dict) -> ActionResult:
     """Teleport the bot to a named player (!goto chat command).
 
     Internal chat-command action: the target comes from untrusted chat
@@ -1264,7 +1264,7 @@ async def _goto_teleport(mc: WorldAdapter, params: dict) -> ActionResult:
     )
 
 
-async def _come_teleport(mc: WorldAdapter, params: dict) -> ActionResult:
+async def _come_teleport(mc: McpqCommandAdapter, params: dict) -> ActionResult:
     """Teleport the chat sender to the bot (!come chat command).
 
     Internal chat-command action: the sender name is parsed from an
@@ -1298,7 +1298,7 @@ async def _come_teleport(mc: WorldAdapter, params: dict) -> ActionResult:
     )
 
 
-async def _break_block(mc: WorldAdapter, params: dict) -> ActionResult:
+async def _break_block(mc: McpqCommandAdapter, params: dict) -> ActionResult:
     x = params.get("x")
     y = params.get("y")
     z = params.get("z")
@@ -1318,7 +1318,7 @@ async def _break_block(mc: WorldAdapter, params: dict) -> ActionResult:
     )
 
 
-async def _place_block(mc: WorldAdapter, params: dict) -> ActionResult:
+async def _place_block(mc: McpqCommandAdapter, params: dict) -> ActionResult:
     x = params.get("x")
     y = params.get("y")
     z = params.get("z")
@@ -1341,7 +1341,7 @@ async def _place_block(mc: WorldAdapter, params: dict) -> ActionResult:
         return ActionResult(success=False, action=ActionType.PLACE_BLOCK, message=str(exc))
 
 
-async def _interact(mc: WorldAdapter, params: dict) -> ActionResult:
+async def _interact(mc: McpqCommandAdapter, params: dict) -> ActionResult:
     # Use /execute as @p run interact — works on Paper
     resp = await _cmd(mc, "execute as @p at @p run interact")
     return ActionResult(
@@ -1355,7 +1355,7 @@ async def _interact(mc: WorldAdapter, params: dict) -> ActionResult:
 # ── Inventory / Items ───────────────────────────────────────────────────
 
 
-async def _check_inventory(mc: WorldAdapter, params: dict) -> ActionResult:
+async def _check_inventory(mc: McpqCommandAdapter, params: dict) -> ActionResult:
     resp = await _cmd(mc, "data get entity @p Inventory")
     success = not _command_failed(resp)
     return ActionResult(
@@ -1366,7 +1366,7 @@ async def _check_inventory(mc: WorldAdapter, params: dict) -> ActionResult:
     )
 
 
-async def _equip_item(mc: WorldAdapter, params: dict) -> ActionResult:
+async def _equip_item(mc: McpqCommandAdapter, params: dict) -> ActionResult:
     slot = params.get("slot", 0)
     if isinstance(slot, bool) or not isinstance(slot, int) or not 0 <= slot <= 8:
         return ActionResult(
@@ -1392,7 +1392,7 @@ async def _equip_item(mc: WorldAdapter, params: dict) -> ActionResult:
     )
 
 
-async def _equip_best_weapon(mc: WorldAdapter, params: dict) -> ActionResult:
+async def _equip_best_weapon(mc: McpqCommandAdapter, params: dict) -> ActionResult:
     """Equip the strongest supported weapon already in the hotbar."""
     from .observer import _parse_inventory_nbt
 
@@ -1461,7 +1461,7 @@ async def _equip_best_weapon(mc: WorldAdapter, params: dict) -> ActionResult:
     )
 
 
-async def _craft_item(mc: WorldAdapter, params: dict) -> ActionResult:
+async def _craft_item(mc: McpqCommandAdapter, params: dict) -> ActionResult:
     """Give items to the player (creative-mode /give).
 
     NOTE: This uses /give under the hood, which requires OP permissions or
@@ -1490,7 +1490,7 @@ async def _craft_item(mc: WorldAdapter, params: dict) -> ActionResult:
         )
 
 
-async def _drop_item(mc: WorldAdapter, params: dict) -> ActionResult:
+async def _drop_item(mc: McpqCommandAdapter, params: dict) -> ActionResult:
     """Drop items from inventory as entities in the world.
 
     Uses /replaceitem to clear the slot and /summon to create the item
@@ -1542,7 +1542,7 @@ async def _drop_item(mc: WorldAdapter, params: dict) -> ActionResult:
 # ── Eating ─────────────────────────────────────────────────────────────
 
 
-async def _eat(mc: WorldAdapter, params: dict) -> ActionResult:
+async def _eat(mc: McpqCommandAdapter, params: dict) -> ActionResult:
     """Eat a food item from the player's inventory.
 
     Parameters (from ``params``):
@@ -1630,7 +1630,7 @@ async def _eat(mc: WorldAdapter, params: dict) -> ActionResult:
     )
 
 
-async def _consume_one_item(mc: WorldAdapter, item: str) -> bool:
+async def _consume_one_item(mc: McpqCommandAdapter, item: str) -> bool:
     """Consume one item only when the server confirms the inventory change."""
     response = await _cmd(mc, f"clear @p minecraft:{item} 1")
     return bool(
@@ -1643,7 +1643,7 @@ async def _consume_one_item(mc: WorldAdapter, item: str) -> bool:
 # ── Healing ─────────────────────────────────────────────────────────────
 
 
-async def _heal(mc: WorldAdapter, params: dict) -> ActionResult:
+async def _heal(mc: McpqCommandAdapter, params: dict) -> ActionResult:
     """Apply healing effects to restore health.
 
     Uses ``/effect give @p regeneration`` and optionally
@@ -1932,7 +1932,7 @@ def _should_attack(mob_type: str) -> bool:
     return _get_threat_level(mob_type) != "critical"
 
 
-async def _scan_entities(mc: WorldAdapter, params: dict) -> ActionResult:
+async def _scan_entities(mc: McpqCommandAdapter, params: dict) -> ActionResult:
     """Detect hostile mobs near the player.
 
     Iterates over a curated list of common hostile mob types and runs
@@ -2019,7 +2019,7 @@ async def _scan_entities(mc: WorldAdapter, params: dict) -> ActionResult:
     )
 
 
-async def _attack(mc: WorldAdapter, params: dict) -> ActionResult:
+async def _attack(mc: McpqCommandAdapter, params: dict) -> ActionResult:
     """Attack a target entity using ``/damage``.
 
     Paper 26.x broke ``execute as @p at @p run attack`` (throws
@@ -2139,7 +2139,7 @@ async def _attack(mc: WorldAdapter, params: dict) -> ActionResult:
 # ── Information ─────────────────────────────────────────────────────────
 
 
-async def _scan(mc: WorldAdapter, params: dict) -> ActionResult:
+async def _scan(mc: McpqCommandAdapter, params: dict) -> ActionResult:
     radius = min(params.get("radius", 5), 16)  # cap at 16 to avoid spam
 
     # Get player position first
@@ -2210,7 +2210,7 @@ async def _scan(mc: WorldAdapter, params: dict) -> ActionResult:
     )
 
 
-async def _check_time(mc: WorldAdapter, params: dict) -> ActionResult:
+async def _check_time(mc: McpqCommandAdapter, params: dict) -> ActionResult:
     resp = await mc.get_time()
     return ActionResult(
         success=True,
@@ -2220,7 +2220,7 @@ async def _check_time(mc: WorldAdapter, params: dict) -> ActionResult:
     )
 
 
-async def _check_weather(mc: WorldAdapter, params: dict) -> ActionResult:
+async def _check_weather(mc: McpqCommandAdapter, params: dict) -> ActionResult:
     resp = await _cmd(mc, "weather query")
     return ActionResult(
         success=True,
@@ -2254,7 +2254,7 @@ def _parse_health_response(raw: str | None) -> float | None:
     return value if math.isfinite(value) and value >= 0 else None
 
 
-async def _check_health(mc: WorldAdapter, params: dict) -> ActionResult:
+async def _check_health(mc: McpqCommandAdapter, params: dict) -> ActionResult:
     """Check the player's health.
 
     Uses ``/data get entity @p Health`` first, which works for real players.
@@ -2318,7 +2318,7 @@ async def _check_health(mc: WorldAdapter, params: dict) -> ActionResult:
     )
 
 
-async def _check_hunger(mc: WorldAdapter, params: dict) -> ActionResult:
+async def _check_hunger(mc: McpqCommandAdapter, params: dict) -> ActionResult:
     """Check the player's hunger (foodLevel, 0-20).
 
     Uses ``/data get entity @p foodLevel`` first. Falls back to
@@ -2380,7 +2380,7 @@ async def _check_hunger(mc: WorldAdapter, params: dict) -> ActionResult:
     )
 
 
-async def _check_position(mc: WorldAdapter, params: dict) -> ActionResult:
+async def _check_position(mc: McpqCommandAdapter, params: dict) -> ActionResult:
     pos = await mc.get_player_pos()
     if pos:
         msg = f"Position: ({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f})"
@@ -2395,7 +2395,7 @@ async def _check_position(mc: WorldAdapter, params: dict) -> ActionResult:
     )
 
 
-async def _list_players(mc: WorldAdapter, params: dict) -> ActionResult:
+async def _list_players(mc: McpqCommandAdapter, params: dict) -> ActionResult:
     players = await mc.get_players_online()
     msg = f"Online players ({len(players)}): {', '.join(players)}"
     return ActionResult(
@@ -2406,7 +2406,7 @@ async def _list_players(mc: WorldAdapter, params: dict) -> ActionResult:
     )
 
 
-async def _chat(mc: WorldAdapter, params: dict) -> ActionResult:
+async def _chat(mc: McpqCommandAdapter, params: dict) -> ActionResult:
     message = params.get("message", "")
     if message:
         await mc.post_to_chat(message)
@@ -2418,7 +2418,7 @@ async def _chat(mc: WorldAdapter, params: dict) -> ActionResult:
     )
 
 
-async def _wait(mc: WorldAdapter, params: dict) -> ActionResult:
+async def _wait(mc: McpqCommandAdapter, params: dict) -> ActionResult:
     import asyncio as _asyncio
 
     seconds = params.get("seconds", 2.0)
@@ -2431,7 +2431,7 @@ async def _wait(mc: WorldAdapter, params: dict) -> ActionResult:
     )
 
 
-async def _done(mc: WorldAdapter, params: dict) -> ActionResult:
+async def _done(mc: McpqCommandAdapter, params: dict) -> ActionResult:
     message = params.get("message", "Task complete")
     return ActionResult(
         success=True,
@@ -2485,9 +2485,12 @@ _HANDLERS: dict[ActionType, Handler] = {
 # Handler tables keyed by ``Capabilities.backend`` value. Only MCPQ exists so
 # far; another backend registers its own table instead of reusing MCPQ's
 # command-based handlers.
-_HANDLERS_BY_BACKEND: dict[str, dict[ActionType, Handler]] = {"mcpq": _HANDLERS}
+# Each table's handlers take that backend's adapter type (MCPQ's take a
+# McpqCommandAdapter), so the shared signature is untyped in the adapter.
+BackendHandler = Callable[[Any, dict[str, Any]], Awaitable[ActionResult]]
+_HANDLERS_BY_BACKEND: dict[str, Mapping[ActionType, BackendHandler]] = {"mcpq": _HANDLERS}
 
 
-def handler_table(backend: str) -> Mapping[ActionType, Handler]:
+def handler_table(backend: str) -> Mapping[ActionType, BackendHandler]:
     """Return the action handlers for ``backend`` (empty if it has none)."""
     return MappingProxyType(_HANDLERS_BY_BACKEND.get(backend, {}))

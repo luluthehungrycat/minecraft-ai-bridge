@@ -10,7 +10,7 @@ This document outlines the development priorities, completed work, and future pl
 ## 🎯 Current Status
 
 **Version**: 0.6.0 released 2026-11-02
-**Test Coverage**: 1004 deterministic tests plus 15 live integration tests (Paper 26.2 build 123/MCPQ, an LLM provider for the agent loop)
+**Test Coverage**: 1008 deterministic tests plus 15 live integration tests (Paper 26.2 build 123/MCPQ, an LLM provider for the agent loop)
 **Overall Health**: ✅ Built-in agent stable; RFC-0001 runtime and MCP controller surface landed through Phase B and most of Phase C
 
 ---
@@ -62,7 +62,7 @@ This document outlines the development priorities, completed work, and future pl
 - [x] Durable bounded task plans with pause/resume/cancel and restart recovery (#40)
 
 ### Testing
-- [x] 1004 deterministic tests passing (MockMcpqClient-based, no server needed)
+- [x] 1008 deterministic tests passing (MockMcpqClient-based, no server needed)
 - [x] Integration tests require Docker-provisioned pinned Paper 26.2 build 123/MCPQ and an LLM provider
 - [x] Goal-verification helpers (`actions_taken()`, `position_reached()`)
 
@@ -111,7 +111,7 @@ This document outlines the development priorities, completed work, and future pl
 - [ ] Find out why the server pulls a walking Mineflayer bot back through ViaBackwards. Findings (2026-11-11): it reproduces with fresh players; adding `tick_end` and testing mineflayer master did not resolve it; sampled block names matched. A native 26.1 server also resets the bot, so ViaBackwards is not needed to cause it; a Mineflayer physics mismatch on 26.x is suspected. Next: upstream issue, full block states
 - [x] Choose action handlers by backend; per-action support in `Capabilities.actions` (`ACTION_NOT_SUPPORTED`); backend `OUTCOME_UNKNOWN` results
 - [x] Controller `stop` that never waits for the dispatch lock (`ActionService.interrupt()`)
-- [ ] Split `WorldAdapter` into a shared observation protocol and an MCPQ command protocol
+- [x] Split `WorldAdapter` into a shared observation protocol and an MCPQ command protocol (`McpqCommandAdapter`)
 - [ ] Optional Node.js sidecar behind `WorldAdapter`; observe/move/dig/place/stop through the same `ActionService`
 
 ### P2: Medium Priority
@@ -236,7 +236,7 @@ This document outlines the development priorities, completed work, and future pl
 
 ## 🧪 Testing Strategy
 
-### Unit Tests (1004 deterministic tests)
+### Unit Tests (1008 deterministic tests)
 - **Run in CI**: ✅ Yes (on all pushes/PRs)
 - **Dependencies**: None (MockMcpqClient)
 - **Coverage**: Action handlers, NBT parsing, memory, goals, config, inventory, chat commands, pathfinding, orchestrator recovery, runtime gate, authorization, sessions, safety, events, tasks, webhooks, and the MCP adapter
@@ -278,7 +278,7 @@ This document outlines the development priorities, completed work, and future pl
 
 | Metric | Current | Target (v1.0) |
 |--------|---------|---------------|
-| Unit Test Coverage | 1004 tests | Keep growing with features |
+| Unit Test Coverage | 1008 tests | Keep growing with features |
 | Integration Tests | 14 tests | 30+ tests |
 | Bug Count | ~5 minor | 0 critical |
 | Documentation | 90% complete | 100% complete |

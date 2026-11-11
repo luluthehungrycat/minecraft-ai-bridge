@@ -7,10 +7,12 @@ can be expressed against a normalized world surface instead of the concrete
 delegates to an existing connected ``McpqClient`` — it holds no connection
 state of its own and adds no new backend or dependency.
 
-The adapter covers only the methods the runtime currently consumes
-(position/info reads, hurt-source check, chat event polling, run-as-player and
-blocking commands, teleport, block get/set, chat post, time, online players,
-biome, and connection state). The orchestrator keeps the raw ``McpqClient``
+``WorldAdapter`` covers what every backend can honestly provide: position and
+player-info reads, attacker and death events, chat events and posting, block
+reads, time, online players, biome, capabilities, and connection state.
+``McpqCommandAdapter`` adds the MCPQ-only server commands, teleport, and block
+edits that MCPQ's action handlers are built on; ``McpqWorldAdapter`` implements
+both. The orchestrator keeps the raw ``McpqClient``
 solely for connection lifecycle (connect/disconnect).
 
 The protocol is intentionally *not* a full backend contract (Mineflayer or
@@ -27,7 +29,7 @@ from .contracts import BackendKind, Capabilities, CraftingMode, MovementMode, Su
 if TYPE_CHECKING:
     from ..minecraft.mc_api import LastAttacker, McpqClient
 
-__all__ = ["McpqWorldAdapter", "WorldAdapter"]
+__all__ = ["McpqCommandAdapter", "McpqWorldAdapter", "WorldAdapter"]
 
 
 @runtime_checkable
@@ -61,21 +63,9 @@ class WorldAdapter(Protocol):
 
     async def get_chat_events(self) -> list[Any]: ...
 
-    # ── Commands ───────────────────────────────────────────────────
-
-    async def run_as_player(self, command: str) -> str: ...
-
-    async def run_command_blocking(self, command: str) -> str: ...
-
-    # ── Movement ───────────────────────────────────────────────────
-
-    async def teleport_player(self, x: float, y: float, z: float) -> None: ...
-
     # ── World ──────────────────────────────────────────────────────
 
     async def get_block(self, x: int, y: int, z: int) -> str: ...
-
-    async def set_block(self, block_type: str, x: int, y: int, z: int) -> None: ...
 
     # ── Chat post ──────────────────────────────────────────────────
 
@@ -88,6 +78,24 @@ class WorldAdapter(Protocol):
     async def get_players_online(self) -> list[str]: ...
 
     async def get_biome(self, x: int, y: int, z: int) -> str: ...
+
+
+@runtime_checkable
+class McpqCommandAdapter(WorldAdapter, Protocol):
+    """MCPQ-only extension of ``WorldAdapter``: server commands and world edits.
+
+    Only MCPQ's command-based action handlers use these methods. A backend
+    that acts as a player (Mineflayer) implements ``WorldAdapter`` alone and
+    gets its own handler table instead (RFC-0001 Phase D spike, section 2).
+    """
+
+    async def run_as_player(self, command: str) -> str: ...
+
+    async def run_command_blocking(self, command: str) -> str: ...
+
+    async def teleport_player(self, x: float, y: float, z: float) -> None: ...
+
+    async def set_block(self, block_type: str, x: int, y: int, z: int) -> None: ...
 
 
 class McpqWorldAdapter:

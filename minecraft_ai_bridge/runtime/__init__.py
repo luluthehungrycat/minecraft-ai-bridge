@@ -59,7 +59,7 @@ from .webhooks import (
     WebhookSubscription,
     webhook_subscriptions,
 )
-from .world_adapter import McpqWorldAdapter, WorldAdapter
+from .world_adapter import McpqCommandAdapter, McpqWorldAdapter, WorldAdapter
 
 __all__ = [
     "ActionAuditRecord",
@@ -93,6 +93,7 @@ __all__ = [
     "EventPage",
     "EventRecord",
     "EventSeverity",
+    "McpqCommandAdapter",
     "McpqWorldAdapter",
     "MovementMode",
     "PeerGrantAuditEntry",
