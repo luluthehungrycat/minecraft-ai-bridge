@@ -52,6 +52,7 @@ __all__ = [
     "MovementMode",
     "SessionStatus",
     "SteveIdentity",
+    "SupportLevel",
     "Task",
     "TaskStatus",
 ]
@@ -184,6 +185,19 @@ class CraftingMode(StrEnum):
     UNSUPPORTED = "unsupported"
 
 
+class SupportLevel(StrEnum):
+    """How a backend supports one action (RFC-0001 Phase D spike, section 3).
+
+    ``supported``: implemented as the backend's movement and crafting modes
+    describe. ``physical``: performed as a player would, so it can take
+    time, fail, or cause damage. ``unsupported``: refused before dispatch.
+    """
+
+    SUPPORTED = "supported"
+    PHYSICAL = "physical"
+    UNSUPPORTED = "unsupported"
+
+
 class ActionStatus(StrEnum):
     """Action lifecycle states distinguished by RFC-0001 section 6."""
 
@@ -282,6 +296,9 @@ class Capabilities(ContractModel):
     supported_versions: list[str] = Field(default_factory=list)
     dimensions: list[str] = Field(default_factory=list)
     hazard_sensors: bool = False
+    # Per-action support. An action missing from the mapping is treated as
+    # unsupported, so a backend must list every action it can perform.
+    actions: dict[ActionType, SupportLevel] = Field(default_factory=dict)
 
 
 class ActionRequestSchema(ContractModel):

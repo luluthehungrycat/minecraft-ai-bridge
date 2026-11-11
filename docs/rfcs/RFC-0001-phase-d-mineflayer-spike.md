@@ -138,7 +138,7 @@ Every action gets an explicit status per backend (supported, physical, unsupport
 
 - **Policies cannot be bypassed by faults:** authorization, reach limits, idempotency and audit all run in Python before a request is sent. A sidecar that crashes, hangs or behaves badly can only fail requests; it cannot widen what is allowed.
 - **Outcomes when the sidecar or network fails:** a mutating request that times out, or whose sidecar dies, finishes as `OUTCOME_UNKNOWN` and is never retried automatically. Today's dispatcher cannot express that: `execute_action` turns handler exceptions into failed results, and ActionService records unsuccessful results as `failed`. So:
-  - the Mineflayer adapter raises a dedicated `BackendOutcomeUnknown`;
+  - the Mineflayer adapter raises a dedicated `BackendOutcomeUnknownError`;
   - `execute_action` re-raises it instead of converting it;
   - ActionService records the existing `unknown` outcome status (as it already does for a dispatch cancelled midway) in memory and in the durable outcome store, so a replay returns `unknown` and never re-dispatches;
   - ControllerService returns `INTERRUPTED` with reason code `OUTCOME_UNKNOWN`;
@@ -177,6 +177,6 @@ The test mirrors `tests/test_phase_c_integration.py`: a live server and a Minefl
 ## Next steps
 
 1. **Done:** the live compatibility check ([section 1.1](#11-live-compatibility-check-2026-11-10)). **Open:** why the server pulls the walking bot back through ViaBackwards; the remaining checks are in [section 1.2](#12-follow-up-the-snap-back-2026-11-11). Until it is resolved, movement through ViaBackwards cannot pass the gate, and option B does not avoid it (section 1.2).
-2. Refactor first, with no behaviour change: split `WorldAdapter` into the shared observation protocol and an MCPQ command protocol; select the handler table by backend; add `Capabilities.actions` and return `ACTION_NOT_SUPPORTED` per action; add the `BackendOutcomeUnknown` path to ActionService; add the lock-free `stop` controller call.
+2. Refactor first, with no behaviour change. **Done** (#54): select the handler table by backend; add `Capabilities.actions` and return `ACTION_NOT_SUPPORTED` per action; add the `BackendOutcomeUnknownError` path to ActionService. **Open:** split `WorldAdapter` into the shared observation protocol and an MCPQ command protocol; add the lock-free `stop` controller call.
 3. Sidecar and `MineflayerWorldAdapter` behind an optional extra (`[mineflayer]`), with unit tests that use a fake sidecar speaking the JSON-RPC protocol.
 4. Live gate test as described in section 7.

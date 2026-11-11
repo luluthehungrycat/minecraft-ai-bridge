@@ -10,10 +10,11 @@ import contextlib
 import logging
 import math
 import re
-from collections.abc import Awaitable, Callable, Iterable, Iterator
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import StrEnum
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -617,15 +618,20 @@ async def execute_action(
     params : action-specific parameters (see each handler)
     """
     params = params or {}
-    handler = _HANDLERS.get(action_type)
-    if handler is None:
-        return ActionResult(
-            success=False,
-            action=action_type,
-            message=f"No handler registered for {action_type.value}",
-        )
     try:
+        mc = _as_world(mc)
+        handler = handler_table(str(mc.capabilities.backend)).get(action_type)
+        if handler is None:
+            return ActionResult(
+                success=False,
+                action=action_type,
+                message=f"No handler registered for {action_type.value}",
+            )
         return await handler(mc, params)
+    except BackendOutcomeUnknownError:
+        # The backend cannot tell whether the action took effect. Callers
+        # must record an unknown outcome, never a plain failure.
+        raise
     except Exception as exc:
         logger.exception("Action %s failed", action_type.value)
         return ActionResult(
@@ -633,6 +639,28 @@ async def execute_action(
             action=action_type,
             message=f"Error: {exc}",
         )
+
+
+def _as_world(mc: WorldAdapter) -> WorldAdapter:
+    """Wrap a bare ``McpqClient`` (callers predating WorldAdapter) in its adapter."""
+    from .mc_api import McpqClient
+
+    if isinstance(mc, McpqClient):
+        from ..runtime.world_adapter import McpqWorldAdapter
+
+        return McpqWorldAdapter(mc)
+    return mc
+
+
+class BackendOutcomeUnknownError(Exception):
+    """A backend cannot tell whether a dispatched action took effect.
+
+    Raised by a world adapter, for example when its connection dies or an
+    operation overruns its deadline after the request was sent.
+    ``execute_action`` re-raises it instead of turning it into a failed
+    result, so ActionService records the outcome as unknown and never
+    re-dispatches the same request ID.
+    """
 
 
 # ── Individual action handlers ─────────────────────────────────────────
@@ -2449,3 +2477,13 @@ _HANDLERS: dict[ActionType, Handler] = {
     ActionType.WAIT: _wait,
     ActionType.DONE: _done,
 }
+
+# Handler tables keyed by ``Capabilities.backend`` value. Only MCPQ exists so
+# far; another backend registers its own table instead of reusing MCPQ's
+# command-based handlers.
+_HANDLERS_BY_BACKEND: dict[str, dict[ActionType, Handler]] = {"mcpq": _HANDLERS}
+
+
+def handler_table(backend: str) -> Mapping[ActionType, Handler]:
+    """Return the action handlers for ``backend`` (empty if it has none)."""
+    return MappingProxyType(_HANDLERS_BY_BACKEND.get(backend, {}))

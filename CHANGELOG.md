@@ -27,6 +27,17 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
 
 ### Added
 
+- `minecraft_get_capabilities` now lists how the backend supports each
+  controller action (`actions`: `supported`, `physical` or `unsupported`).
+  An action the backend does not support is refused with
+  `ACTION_NOT_SUPPORTED` before it reaches the backend. On MCPQ every
+  controller action is supported, so nothing is refused today.
+- If a backend reports that it cannot tell whether an action took effect,
+  the action result is `interrupted` with reason `OUTCOME_UNKNOWN`, and the
+  same request ID is not dispatched again within the idempotency window
+  (durable with an outcome store, process-local and bounded without one). No current backend reports
+  this yet; it is groundwork for the Mineflayer backend (RFC-0001 Phase D).
+
 - The bot's condition is now journaled as events that controllers can poll
   with `minecraft_get_events`: `steve.damaged` (health dropped by at least
   1.5 HP; at most one every 2 s, with damage in between added to the next

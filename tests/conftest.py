@@ -12,6 +12,8 @@ import pytest
 import pytest_asyncio
 
 from minecraft_ai_bridge.minecraft.observer import InventorySlot, WorldState
+from minecraft_ai_bridge.runtime.contracts import Capabilities
+from minecraft_ai_bridge.runtime.world_adapter import McpqWorldAdapter
 
 # ── Mock MCPQ Client ──────────────────────────────────────────────────────
 
@@ -40,6 +42,11 @@ class MockMcpqClient:
         self._hurt_by_entity: bool = True  # default: yes, was hurt by an entity
         self._attacker_type: str | None = "minecraft:zombie"
         self._death_messages: list[str] = []
+
+    @property
+    def capabilities(self) -> Capabilities:
+        """Report the MCPQ adapter's profile, as when wrapped in McpqWorldAdapter."""
+        return McpqWorldAdapter(self).capabilities  # type: ignore[arg-type]
 
     # ── Pre-configuration helpers ─────────────────────────────────────
 
