@@ -107,8 +107,8 @@ This document outlines the development priorities, completed work, and future pl
 
 ### P1: RFC-0001 Phase D — Mineflayer Backend
 - [x] Design spike ([docs/rfcs/RFC-0001-phase-d-mineflayer-spike.md](docs/rfcs/RFC-0001-phase-d-mineflayer-spike.md)): capability parity matrix, stdio JSON-RPC sidecar protocol, `steve_id` to in-game identity mapping, fault model. Mineflayer 4.39 supports up to 26.1, not 26.2
-- [x] Live compatibility check (2026-11-10): a 26.1 Mineflayer bot through ViaBackwards on Paper 26.2 can spawn, observe, dig, place, attack and stop; movement works for a new player only
-- [ ] Find out why a returning Mineflayer player is pulled back by the server through ViaBackwards (try a native 26.1 server, deleting the saved player data, upstream reports)
+- [x] Live compatibility check (2026-11-10): a 26.1 Mineflayer bot through ViaBackwards on Paper 26.2 can spawn, observe, dig, place, attack and stop; movement is unreliable (the server pulls the bot back at some spots)
+- [ ] Find out why the server pulls a walking Mineflayer bot back through ViaBackwards. Ruled out (2026-11-11): saved player data, `tick_end`, block-name mismatches. Next: mineflayer master, a native 26.1 server, full block states
 - [ ] Split `WorldAdapter` into a shared observation protocol and an MCPQ command protocol; choose action handlers by backend; add a `stop` controller action
 - [ ] Optional Node.js sidecar behind `WorldAdapter`; observe/move/dig/place/stop through the same `ActionService`
 

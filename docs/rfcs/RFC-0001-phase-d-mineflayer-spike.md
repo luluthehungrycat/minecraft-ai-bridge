@@ -8,7 +8,7 @@
 
 1. **Mineflayer cannot connect to Paper 26.2 natively today.** The newest supported version is 26.1. 26.2 support has been open upstream since July 2026 and is unreleased; 26.3 work has already started. A live check of a 26.1 bot through **ViaBackwards** ([section 1.1](#11-live-compatibility-check-2026-11-10)) found:
    - spawn, observe, dig, place, attack and stop work;
-   - movement works for a new player, but a **returning player is pulled back by the server**, so movement through ViaBackwards is not reliable yet.
+   - movement is **unreliable**: at some spots the server keeps pulling the walking bot back, for new and returning players alike (see [section 1.2](#12-follow-up-the-snap-back-2026-11-11)).
 2. **Our `WorldAdapter` seam is shaped around server commands**, not a player's actions. Action handlers build commands (`setblock`, `tp`, `execute as … run …`) and send them through `run_as_player`/`run_command_blocking`/`set_block`/`teleport_player`. A Mineflayer bot is an ordinary, non-operator player and must stay one (RFC-0001: no OP commands on controller keys). So Phase D needs **backend-specific action handlers** behind the same `ActionService`, not just a second `WorldAdapter` implementation.
 3. **Sidecar protocol:** a Node.js child process speaking newline-delimited JSON-RPC 2.0 over stdio. No network port; its lifetime is tied to the Python process. Policy, authorization, idempotency and the event journal all stay in Python.
 
@@ -38,7 +38,7 @@ Options for the version gap:
 | D. Wait for upstream 26.2 support | None | Unbounded delay; upstream already lags by one version |
 
 Recommendation: design so that switching to native 26.2 later only changes the sidecar's `version` setting.
-- **A** is usable for development once the returning-player movement problem below is understood or worked around.
+- **A** is usable for development once the movement snap-back below is understood or worked around.
 - **B** is the fallback if movement cannot be made reliable through ViaBackwards.
 
 ### 1.1 Live compatibility check (2026-11-10)
@@ -56,13 +56,23 @@ Setup:
 | Place | Works: dirt placed on a reference block 2 away. One attempt directly beside the bot's own hitbox was refused by the server. |
 | Attack | Works: one punch took a NoAI zombie (at night) from 20.0 to 19.06 health. |
 | Stop | Works: `pathfinder.setGoal(null)` + `clearControlStates()` gave a drift of 0.00 over 1.5 s. `pathfinder.stop()` alone keeps moving until a safe node. |
-| Movement, new player | Works: the first session's pathfinder `goto` reached its goal, and a never-seen username walked 31 blocks with 3 forced moves after spawn. |
-| **Movement, returning player** | **Fails**: the same username in later sessions was snapped back (41 `forcedMove` packets in about 8 s; `goto` timed out 4 of 4 times). The server logged no "moved wrongly" or "moved too quickly". |
+| **Movement** | **Unreliable**: the first session's pathfinder `goto` reached its goal and a never-seen username walked 31 blocks, but in other sessions the bot was snapped back (up to 48 `forcedMove` packets in about 8 s; `goto` timed out 4 of 4 times). The server logged no "moved wrongly" or "moved too quickly". |
 
-The returning-player failure matches the server never accepting the client's teleport confirmation and so repeatedly resending its position. The difference is saved player data, which suggests something in the restored player state is translated wrongly between 26.2 and 26.1. **Not confirmed:**
-- deleting the saved data was not tried;
-- the same client was not tried against a native 26.1 server;
-- the upstream issues were not checked for this symptom.
+### 1.2 Follow-up: the snap-back (2026-11-11)
+
+Four more bounded windows narrowed the movement failure down. Saved player data is **not** the cause, as section 1.1 first suggested:
+
+| Test | Result |
+|------|--------|
+| Same returning player, three logins (the second with `tick_end`, see below) | 0.00, 0.00 and 6.18 blocks net, with 40, 48 and 34 forced moves |
+| Returning player vs a new one in the same window | The returning player walked with **0** resets; the new one got **24**, all putting it back at the same spot |
+| Sending `tick_end` after every physics tick | No change (48 forced moves). mineflayer 4.39.0 never sends it; master does since [mineflayer#4137](https://github.com/PrismarineJS/mineflayer/pull/4137) (2026-10-03). It is what 26.3 servers kick for ([ViaBackwards#1362](https://github.com/ViaVersion/ViaBackwards/issues/1362), [mineflayer#4189](https://github.com/PrismarineJS/mineflayer/issues/4189)), but not this. |
+| Bot's view vs the server's (MCPQ `getBlock`), 100 blocks around each reset spot | Block names match exactly. Block states such as stair or slab orientation were not compared. |
+
+So the server rejects the bot's moves at particular spots. The likely cause is that the bot's physics and the server's disagree, either because of how ViaBackwards translates movement or because of block shapes/states that weren't compared. **Remaining checks:**
+- the same walk with mineflayer master instead of the 4.39.0 release;
+- the same client against a native Paper 26.1 server, without ViaBackwards;
+- comparing full block states, not just names, at a reset spot.
 
 ## 2. Architecture
 
@@ -162,12 +172,7 @@ The test mirrors `tests/test_phase_c_integration.py`: a live server and a Minefl
 
 ## Next steps
 
-1. **Done:** the live compatibility check ([section 1.1](#11-live-compatibility-check-2026-11-10)). **Open:** why a returning player is pulled back through ViaBackwards. Ways to narrow it down:
-   - run the same client against a native Paper 26.1 server;
-   - delete the bot's saved player data before each login;
-   - look for upstream ViaBackwards and mineflayer reports.
-
-   Until it is resolved, the live gate test must use a fresh player for each run, or option B.
+1. **Done:** the live compatibility check ([section 1.1](#11-live-compatibility-check-2026-11-10)). **Open:** why the server pulls the walking bot back through ViaBackwards; the remaining checks are in [section 1.2](#12-follow-up-the-snap-back-2026-11-11). Until it is resolved, movement through ViaBackwards cannot pass the gate, so the live gate test needs option B or a fix.
 2. Refactor first, with no behaviour change: split `WorldAdapter` into the shared observation protocol and an MCPQ command protocol; select the handler table by backend; add `Capabilities.actions` and return `ACTION_NOT_SUPPORTED` per action; add the `BackendOutcomeUnknown` path to ActionService; add the lock-free `stop` controller call.
 3. Sidecar and `MineflayerWorldAdapter` behind an optional extra (`[mineflayer]`), with unit tests that use a fake sidecar speaking the JSON-RPC protocol.
 4. Live gate test as described in section 7.
