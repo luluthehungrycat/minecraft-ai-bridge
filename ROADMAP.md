@@ -107,9 +107,10 @@ This document outlines the development priorities, completed work, and future pl
 
 ### P1: RFC-0001 Phase D — Mineflayer Backend
 - [x] Design spike ([docs/rfcs/RFC-0001-phase-d-mineflayer-spike.md](docs/rfcs/RFC-0001-phase-d-mineflayer-spike.md)): capability parity matrix, stdio JSON-RPC sidecar protocol, `steve_id` to in-game identity mapping, fault model. Mineflayer 4.39 supports up to 26.1, not 26.2
-- [x] Live compatibility check (2026-11-10): a 26.1 Mineflayer bot through ViaBackwards on Paper 26.2 can spawn, observe, dig, place, attack and stop; movement works for a new player only
-- [ ] Find out why a returning Mineflayer player is pulled back by the server through ViaBackwards (try a native 26.1 server, deleting the saved player data, upstream reports)
-- [ ] Split `WorldAdapter` into a shared observation protocol and an MCPQ command protocol; choose action handlers by backend; add a `stop` controller action
+- [x] Live compatibility check (2026-11-10): a 26.1 Mineflayer bot through ViaBackwards on Paper 26.2 can spawn, observe, dig, place, attack and stop; movement is unreliable (the server pulls the bot back at some spots)
+- [ ] Find out why the server pulls a walking Mineflayer bot back through ViaBackwards. Findings (2026-11-11): it reproduces with fresh players; adding `tick_end` and testing mineflayer master did not resolve it; sampled block names matched. A native 26.1 server also resets the bot, so ViaBackwards is not needed to cause it; a Mineflayer physics mismatch on 26.x is suspected. Next: upstream issue, full block states
+- [x] Choose action handlers by backend; per-action support in `Capabilities.actions` (`ACTION_NOT_SUPPORTED`); backend `OUTCOME_UNKNOWN` results
+- [ ] Split `WorldAdapter` into a shared observation protocol and an MCPQ command protocol; add a `stop` controller action
 - [ ] Optional Node.js sidecar behind `WorldAdapter`; observe/move/dig/place/stop through the same `ActionService`
 
 ### P2: Medium Priority
