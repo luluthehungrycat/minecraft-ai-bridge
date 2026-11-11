@@ -208,3 +208,25 @@ async def test_capabilities_list_only_controller_actions(setup):
     assert ActionType.WALK_TO in capabilities.actions
     for internal in (ActionType.PROVISION_BOT, ActionType.FOLLOW_TELEPORT):
         assert internal not in capabilities.actions
+
+
+async def test_capability_lookup_failure_becomes_a_failed_result():
+    class Broken(_ReportingAdapter):
+        @property
+        def capabilities(self) -> Capabilities:
+            raise RuntimeError("adapter not ready")
+
+    world = MockMcpqClient()
+    result = await execute_action(Broken(world, _mcpq_profile()), ActionType.CHAT, {"message": "x"})
+
+    assert not result.success
+    assert "adapter not ready" in result.message
+    assert world.chat_messages_sent == []
+
+
+async def test_a_bare_mcpq_client_still_dispatches():
+    from minecraft_ai_bridge.minecraft.mc_api import McpqClient
+
+    result = await execute_action(McpqClient(), ActionType.DONE, {})  # type: ignore[arg-type]
+
+    assert result.success

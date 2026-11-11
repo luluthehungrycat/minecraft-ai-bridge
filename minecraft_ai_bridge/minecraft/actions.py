@@ -618,14 +618,15 @@ async def execute_action(
     params : action-specific parameters (see each handler)
     """
     params = params or {}
-    handler = handler_table(str(mc.capabilities.backend)).get(action_type)
-    if handler is None:
-        return ActionResult(
-            success=False,
-            action=action_type,
-            message=f"No handler registered for {action_type.value}",
-        )
     try:
+        mc = _as_world(mc)
+        handler = handler_table(str(mc.capabilities.backend)).get(action_type)
+        if handler is None:
+            return ActionResult(
+                success=False,
+                action=action_type,
+                message=f"No handler registered for {action_type.value}",
+            )
         return await handler(mc, params)
     except BackendOutcomeUnknownError:
         # The backend cannot tell whether the action took effect. Callers
@@ -638,6 +639,17 @@ async def execute_action(
             action=action_type,
             message=f"Error: {exc}",
         )
+
+
+def _as_world(mc: WorldAdapter) -> WorldAdapter:
+    """Wrap a bare ``McpqClient`` (callers predating WorldAdapter) in its adapter."""
+    from .mc_api import McpqClient
+
+    if isinstance(mc, McpqClient):
+        from ..runtime.world_adapter import McpqWorldAdapter
+
+        return McpqWorldAdapter(mc)
+    return mc
 
 
 class BackendOutcomeUnknownError(Exception):

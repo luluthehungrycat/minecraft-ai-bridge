@@ -34,7 +34,8 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
   controller action is supported, so nothing is refused today.
 - If a backend reports that it cannot tell whether an action took effect,
   the action result is `interrupted` with reason `OUTCOME_UNKNOWN`, and the
-  same request ID is never dispatched again. No current backend reports
+  same request ID is not dispatched again within the idempotency window
+  (durable with an outcome store, process-local and bounded without one). No current backend reports
   this yet; it is groundwork for the Mineflayer backend (RFC-0001 Phase D).
 
 - The bot's condition is now journaled as events that controllers can poll
