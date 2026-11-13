@@ -74,8 +74,34 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
   entity hurt the bot in the last 3 seconds, otherwise `environment`, or
   `unknown` if the server could not be asked (#18).
 
+### Changed
+
+- `WorldAdapter` (the transport-independent backend protocol) no longer
+  declares `run_as_player`, `run_command_blocking`, `teleport_player` or
+  `set_block`. They moved to the MCPQ-only `McpqCommandAdapter`, which
+  `McpqWorldAdapter` implements alongside `WorldAdapter`. Code that typed
+  against `WorldAdapter` and called those methods must use
+  `McpqCommandAdapter` instead; new backends no longer implement them.
+- `walk_to` walks on the current height only. A `y` more than 0.5 blocks from
+  the current height is now refused before moving
+  (`vertical_target_unsupported` in the result data) instead of reporting a
+  horizontal arrival as success. Omitting `y` keeps the old behaviour. The
+  teleport fallback beyond 50 blocks still uses `y`.
+
 ### Fixed
 
+- `walk_to` now walks its whole advertised 50-block range. Its step budget
+  follows the route, including A* detours, instead of a fixed 50 half-block
+  steps that stopped at 25 blocks; routes longer than 100 blocks are refused
+  before moving. Running out of steps is reported as `budget_exhausted`, and
+  results carry `steps_taken` so a failed walk that moved is not mistaken for
+  a no-op.
+- `walk_to` checks footing at half-block heights in the right cell: standing
+  on bottom slabs or stairs works, and floating at a fractional height is
+  refused. Other fractional heights are refused rather than guessed, since
+  block IDs carry no collision shape.
+- `McpqClient.get_player_pos()` returns `None` (and logs a warning) when the
+  position command fails, as before the fresh-read change, instead of raising.
 - MCP action results now preserve JSON `data` (including inventory/scan readback)
   through the controller envelope and request-ID replay. Tool discovery documents
   action parameter names and nested task-step `params` instead of leaving external

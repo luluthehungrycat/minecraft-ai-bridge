@@ -60,6 +60,8 @@ def main() -> None:
             ],
             check=True,
         )
+    # `profile create` already writes the wrapper; this regenerates it when the
+    # template is applied to an existing profile (--configure-existing).
     subprocess.run(["hermes", "profile", "alias", "steve-player"], check=True)
     print("Template applied. Set MAB_MCP_URL and MAB_CONTROLLER_TOKEN in the profile secret scope.")
     print("Authenticate Codex with Hermes and Claude with the official Claude CLI if needed.")

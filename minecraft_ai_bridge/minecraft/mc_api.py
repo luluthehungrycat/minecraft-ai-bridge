@@ -155,7 +155,14 @@ class McpqClient:
             return None
         if not re.fullmatch(r"[A-Za-z0-9_]{1,16}", self._player_name):
             return None
-        raw = await self.run_command_blocking(f"data get entity {self._player_name} Pos")
+        try:
+            raw = await self.run_command_blocking(f"data get entity {self._player_name} Pos")
+        except Exception:
+            # A read-only query: failure has no side effect to hide, and
+            # callers treat None as "position unknown". CancelledError is a
+            # BaseException and still propagates.
+            logger.warning("Position read for %s failed", self._player_name, exc_info=True)
+            return None
         match = re.search(r"has the following entity data:\s*\[([^\]]*)\]\s*$", raw)
         if match is None:
             return None

@@ -32,6 +32,26 @@ async def test_position_reads_bypass_mcpq_cached_player_properties():
     assert await client.get_player_pos() == (1.5, 65, 0.5)
 
 
+@pytest.mark.parametrize(
+    "response",
+    [
+        RuntimeError("grpc unavailable"),
+        "No entity was found",
+        "Steve2 has the following entity data: [nan, 65.0d, 0.5d]",
+    ],
+)
+async def test_position_read_failure_returns_none(response):
+    class World:
+        def runCommandBlocking(self, command):  # noqa: N802 - mcpq API
+            if isinstance(response, Exception):
+                raise response
+            return response
+
+    client = McpqClient(host="localhost", port=1789, player_name="Steve2")
+    client._mc = World()  # type: ignore[assignment]
+    assert await client.get_player_pos() is None
+
+
 class _FakeMinecraft:
     def __init__(self, *, fail: bool = False) -> None:
         self.cleanups = 0

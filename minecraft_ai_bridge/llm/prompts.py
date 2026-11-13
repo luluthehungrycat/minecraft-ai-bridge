@@ -77,7 +77,7 @@ You MUST respond with a valid JSON object containing these fields:
 
 == AVAILABLE ACTIONS ==
 - move_to: {{"x": number, "y": number, "z": number}} — instant teleport to coords
-- walk_to: {{"x": number, "z": number, "y": number (optional)}} — walk step-by-step to coords (uses A* pathfinding, avoids walls/hazards, max ~50 blocks before falling back to teleport)
+- walk_to: {{"x": number, "z": number, "y": number (optional)}} — walk step-by-step to coords on the current height (uses A* pathfinding, avoids walls/hazards, cannot climb or descend; a y more than 0.5 from the current height is refused; beyond ~50 blocks it falls back to teleport)
 - move_forward: {{"steps": number}} — walk forward in small steps with collision detection
 - move_back: {{"steps": number}} — walk backward with collision detection
 - sprint: {{"steps": number}} — sprint forward with 1-block steps (faster, less collision checking)
