@@ -181,11 +181,54 @@ Commands:
 MC_API_PLAYER_NAME=SmokeSteve .venv/bin/python -m pytest \
   tests/test_mcp_integration.py tests/test_phase_c_integration.py -q
 .venv/bin/ruff check minecraft_ai_bridge tests profiles/steve-player/install.py \
-  scripts/smoke-hermes-player.py
+  scripts/smoke-hermes-player.py scripts/reset-smoke-arena.py
 .venv/bin/ruff format --check minecraft_ai_bridge tests profiles/steve-player/install.py \
-  scripts/smoke-hermes-player.py
+  scripts/smoke-hermes-player.py scripts/reset-smoke-arena.py
 .venv/bin/mypy minecraft_ai_bridge --ignore-missing-imports
 ```
+
+## Post-merge verification (2026-11-13)
+
+After PR #57 merged (`45546fc`), the `walk_to` review fixes were checked live on
+the same disposable Paper 26.2 world. The unit-test count at the merge was 1049.
+
+- **Operator MCP probe (PASS):** a temporary `minecraft-ai-bridge-mcp` on the
+  merged code (its own throwaway credentials and stores, move limit 50) drove
+  `walk_to` in a corridor built in the void outside the arena. Every position was
+  read back independently over MCPQ:
+
+  | Case | Result |
+  |---|---|
+  | 40-block walk (previously capped near 25 by a fixed 50-step budget) | `succeeded`, 80 steps, ended at (40.5, 101, 40.5) |
+  | `y` two blocks above the current height | `failed` with `vertical_target_unsupported`, 0 steps, did not move |
+  | Walk along bottom-slab tops at y=101.5 | `succeeded`, 12 steps, ended at (6.5, 101.5, 44.5) |
+
+  The corridor was verified empty before use, cleared back to air afterwards,
+  and the bot returned to its start.
+- **Profile navigation trial, first attempt (INCONCLUSIVE, retained):** ten
+  seconds after the probe ended, `SmokeSteve was blown up by Creeper`. The world
+  had been left on **easy** (most likely by the earlier Phase C gate run). The
+  bot plugin respawned the bot at (99.5, 144, -35.5) with an empty inventory, and
+  the blast left two holes in the arena floor. The agent noticed the position and
+  inventory did not match the prompt and correctly refused to move.
+- **Profile navigation trial after an arena reset (PASS):** with
+  `mab-steve-player` restarted on the merged code and the world back on peaceful,
+  every `walk_to` leg ended with `remaining: 0.0`. The 17-block direct leg was
+  refused with `OUT_OF_REACH` (deployment move limit 16) and the agent used an
+  intermediate point. An operator readback afterwards confirmed
+  (0.5, 101, 0.5) at peaceful. The 40-block and slab cases are not reachable
+  through this profile (move limit 16), so only the operator probe covers them.
+
+The creeper incident led to `scripts/reset-smoke-arena.py` (reset plus
+independent readback; difficulty changes only on request) and to the runner's
+peaceful preflight before the trials a hostile mob would disrupt. A live check
+confirmed that the reset passed verification at peaceful and at easy, and that
+at easy the runner refused `navigation` before calling the profile.
+
+Follow-ups found during review: block-ID passability in body cells
+([#58](https://github.com/luluthehungrycat/minecraft-ai-bridge/issues/58)) and
+per-step MCPQ round trips
+([#59](https://github.com/luluthehungrycat/minecraft-ai-bridge/issues/59)).
 
 ## Local evidence and operation
 
@@ -205,6 +248,11 @@ Raw evidence is deliberately outside the repository at
 - `review-fix-unit-tests.log`, `review-fix-live-integration.log`,
   `review-fix-phase-c-retry.log`, `review-fix-collection.log`: post-review checks,
   including the retained first live failure and the successful retry.
+- `post-merge-walk-probe.py`, `post-merge-walk-probe.json`/`.log`: the post-merge
+  operator MCP probe; `post-merge-trials-attempt1-inconclusive/` (creeper) and
+  `post-merge-trials/` (pass): the post-merge navigation trials;
+  `arena-reset-post-merge.log`, `arena-tooling-check/`: the arena reset after the
+  creeper and the live check of the reset script and peaceful preflight.
 - `blocked-walk-unit-tests.log`: incomplete initial full-suite attempt;
   `blocked-walk-unit-diagnostic.log`: bounded passing full-suite rerun;
   `blocked-walk-collection.log`: updated collection counts after the final fix.

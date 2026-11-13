@@ -103,13 +103,28 @@ sandbox. This provider entry does not authorize the player to delegate work.
 ## Bounded gameplay trials
 
 Prepare the disposable arena described by the runner (stone y=100, bedrock
-perimeter x/z +/-12, logs at x=3/z=0/y=101..103, supplied inventory). Confirm its
-initial state independently. Then:
+perimeter x/z +/-12, logs at x=3/z=0/y=101..103, supplied inventory) with the
+operator-only reset script, which also reads the arena back and exits non-zero
+on any mismatch. Then run the trials:
 
 ```sh
+python scripts/reset-smoke-arena.py --difficulty peaceful \
+  --log /path/to/private/evidence/arena-reset.json
 python scripts/smoke-hermes-player.py --output /path/to/private/evidence \
   wall navigation gather_craft task_lifecycle policy containment
 ```
+
+Both scripts read `MC_API_HOST`/`MC_API_PORT` (default `127.0.0.1:1789`); the
+reset script also reads `MC_API_PLAYER_NAME` (default `SmokeSteve`). Run them
+only against a disposable world: the reset issues privileged fill/teleport/clear
+commands. Without `--difficulty`, the reset leaves the difficulty unchanged.
+
+Trials that a hostile mob would disrupt (`wall`, `navigation`, `gather_craft`,
+`task_lifecycle`) need peaceful difficulty: the runner checks before each one and
+stops the batch otherwise, since a death or explosion invalidates their fixture
+checks. `policy` and `containment` make no successful mutation and do not depend
+on the bot's position, so they run at any difficulty. The Phase C integration
+gate needs a hostile mob; reset to peaceful again before the next trial batch.
 
 The runner gives unique cross-session request-ID prefixes, limits each query to
 45 turns, and preserves JSONL, stderr, prompts and summaries. It executes real
