@@ -88,6 +88,38 @@ async def test_only_one_controller_session_per_steve(setup):
     assert second.generation > first.generation
 
 
+@pytest.mark.parametrize(
+    ("start_x", "target_x", "obstacle_x"),
+    [(0.5, 1.9, 2), (-0.5, -1.9, -3)],
+)
+async def test_blocked_walk_remains_failed_on_controller_replay(
+    setup, start_x, target_x, obstacle_x
+):
+    setup.world.set_position(start_x, 65, 0.5)
+    for x in range(-6, 7):
+        await setup.world.set_block("stone", x, 64, 0)
+    await setup.world.set_block("bedrock", obstacle_x, 65, 0)
+    service = setup.service(world_admin=True)
+    session = await service.open_session(setup.delegated)
+    try:
+        request = _request(session, ActionType.WALK_TO, {"x": target_x, "z": 0.5})
+        first = await service.submit_action(setup.delegated, request)
+        assert first.status is ActionStatus.FAILED
+        assert first.reason_code == "ACTION_FAILED"
+        assert first.data["blocked"] is True
+        commands = list(setup.world.commands_ran)
+        replay = await service.submit_action(setup.delegated, request)
+        assert replay.status is ActionStatus.FAILED
+        assert replay.reason_code == "ACTION_FAILED"
+        assert replay.action_id == first.action_id
+        assert replay.message == first.message
+        assert replay.data["blocked"] is True
+        assert replay.data["replayed"] is True
+        assert setup.world.commands_ran == commands
+    finally:
+        await service.close_session(setup.delegated, session.session_id)
+
+
 async def test_observer_reads_but_cannot_control(setup):
     service = setup.service()
     capabilities = await service.get_capabilities(setup.observer)

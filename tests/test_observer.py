@@ -73,6 +73,21 @@ class TestObserver:
         state = await obs.observe()
         assert state.hunger == 12
 
+    async def test_observe_hunger_from_live_command_envelope(self, mock_mc, monkeypatch):
+        """Paper's successful /data output must reach the observer as a number."""
+        from minecraft_ai_bridge.minecraft.observer import Observer
+
+        original = mock_mc._run_command_blocking
+
+        async def live_hunger(command: str) -> str:
+            if command.startswith("data get entity AIBot foodLevel"):
+                return "SmokeSteve has the following entity data: 7"
+            return await original(command)
+
+        monkeypatch.setattr(mock_mc, "_run_command_blocking", live_hunger)
+        state = await Observer(mock_mc).observe()
+        assert state.hunger == 7
+
     async def test_observe_hunger_default(self, mock_mc):
         """Hunger should default to a sane value when NBT is unavailable."""
         from minecraft_ai_bridge.minecraft.observer import Observer

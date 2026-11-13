@@ -115,7 +115,7 @@ examples and the conventions block at the top.
 - **config.yaml volume mount**: Mounted read-only at `/app/config.yaml`. Changes require `docker compose restart bridge`.
 
 ### Code Quality
-- **Tests**: 1023 tests collected in total — 1008 deterministic unit tests plus 15 integration tests (12 agent-loop, 2 MCP end-to-end, 1 Phase C gate). The 64 MCP adapter unit tests and both MCP end-to-end tests need the `mcp` extra (included in `[dev]`) and skip without it. Unit tests use `MockMcpqClient` for deterministic MCPQ simulation. Integration tests use a real MCPQ server + real LLM (OpenRouter `openai/gpt-oss-20b`, or Requesty `runware/gpt-oss-120b` when only `REQUESTY_API_KEY` is set; override with `INTEGRATION_LLM_MODEL`) for end-to-end validation. The stack uses pinned Paper 26.2 build 123. Run with `pytest tests/`.
+- **Tests**: 1047 tests collected in total — 1032 deterministic unit tests plus 15 integration tests (12 agent-loop, 2 MCP end-to-end, 1 Phase C gate). The 66 MCP adapter unit tests and both MCP end-to-end tests need the `mcp` extra (included in `[dev]`) and skip without it. Unit tests use `MockMcpqClient` for deterministic MCPQ simulation. Integration tests use a real MCPQ server + real LLM (OpenRouter `openai/gpt-oss-20b`, or Requesty `runware/gpt-oss-120b` when only `REQUESTY_API_KEY` is set; override with `INTEGRATION_LLM_MODEL`) for end-to-end validation. The stack uses pinned Paper 26.2 build 123. Run with `pytest tests/`.
 - **Mypy**: runs in CI on every push and PR (`mypy minecraft_ai_bridge/ --ignore-missing-imports`) and must pass.
 - **gRPC stubs are synchronous**: MCPQ generated stubs block; dispatched via `asyncio.to_thread`. Not ideal but works.
 - **RCON client is unmaintained**: Since the MCPQ migration, `rcon.py` isn't tested. Consider removing or marking deprecated.
@@ -141,7 +141,7 @@ Some LLMs (especially smaller/local ones) can't reliably output structured JSON 
 
 ### P0: None (Testing Complete)
 The 0.5.0 release completed the testing milestone:
-- **Unit tests** (1008): MockMcpqClient covers all 36 actions, observer parsing, memory, goal fallback plans, config, inventory manager, chat commands, pathfinding, the runtime action gate, the safety supervisor, the event journal, webhook delivery, and the local authorization service
+- **Unit tests** (1032): MockMcpqClient covers all 36 actions, observer parsing, memory, goal fallback plans, config, inventory manager, chat commands, pathfinding, the runtime action gate, the safety supervisor, the event journal, webhook delivery, and the local authorization service; profile-template and smoke-runner tests validate the optional Minecraft-only Hermes configuration and timeout sequencing
 - **Integration tests** (12): Full think-act-observe loop with real MCPQ server + real LLM inference (OpenRouter `openai/gpt-oss-20b`). Covers teleport, exploration, disconnect handling, fallback decomposition, failure counting, memory recording, chat command stop, and inventory creation.
 - **Goal-verification assertions**: Integration tests verify agent behavior via:
   - `action_taken(orch, *names) → bool` — checks if the agent performed a specific action (parses `MemoryEntry.raw`)
@@ -218,7 +218,10 @@ The 0.5.0 release completed the testing milestone:
 | `docker-compose.yml` | Paper server + bridge services |
 | `docs/*.md` | Full documentation set |
 | `tests/conftest.py` | MockMcpqClient, MockLLMClient, test fixtures |
-| `tests/test_*.py` | Unit + integration tests (1023 total: 1008 unit + 15 integration) |
+| `tests/test_*.py` | Unit + integration tests (1047 total: 1032 unit + 15 integration) |
+| `profiles/steve-player/` | Secret-free v0.1.0 Minecraft-only Hermes template, SOUL and CLI-based installer |
+| `scripts/smoke-hermes-player.py` | Bounded real-profile trial runner; writes evidence outside the repository |
+| `docs/testing/hermes-steve-player-smoke.md` | Live smoke evidence, failures/fixes and MCPQ-vs-survival limitations |
 | `AGENTS.md` | This file |
 
 ## Environment Info
@@ -254,21 +257,24 @@ Helpers in `tests/test_integration.py`:
 ### Test Organization
 | Directory | Tests | Description |
 |-----------|-------|-------------|
-| `tests/test_actions.py` | 154 | All 36 action handlers with MockMcpqClient |
+| `tests/test_actions.py` | 155 | All 36 action handlers with MockMcpqClient |
 | `tests/test_self_preservation.py` | 61 | Self-preservation reflex heuristics and dispatch |
-| `tests/test_observer.py` | 43 | NBT parsing, inventory parsing, observation formatting |
+| `tests/test_observer.py` | 44 | NBT parsing, inventory parsing, observation formatting, live hunger envelope |
 | `tests/test_memory.py` | 25 | Short/long-term memory, dedup, persistence |
 | `tests/test_goal_manager.py` | 47 | Goal decomposition, malformed LLM decompositions, fallback plans patterns |
 | `tests/test_chat_commands.py` | 32 | Chat command parsing and dispatch |
 | `tests/test_prompts.py` | 17 | Prompt and state formatting |
 | `tests/test_inventory_manager.py` | 12 | Inventory manager slot tracking |
-| `tests/test_pathfinding.py` | 10 | A* pathfinding |
+| `tests/test_pathfinding.py` | 11 | A* pathfinding, including negative fractional coordinates |
+| `tests/test_walk_to_geometry.py` | 11 | Walking arrival, swept body envelope, fractional head height, footing, corner and blocked-partial-walk regressions |
+| `tests/test_player_profile.py` | 3 | Secret-free player template, tool inventory and inference routes |
+| `tests/test_smoke_hermes_player.py` | 2 | Offline smoke-batch sequencing and abort after unresolved timeout |
 | `tests/test_orchestrator.py` | 8 | Orchestrator loop and wiring |
-| `tests/test_mc_api.py` | 3 | McpqClient disconnect lifecycle |
+| `tests/test_mc_api.py` | 4 | McpqClient disconnect lifecycle and fresh position reads |
 | `tests/test_llm_client.py` | 2 | LLM provider factory wiring |
 | `tests/test_main.py` | 2 | CLI exit codes |
 | `tests/test_authz_orchestrator.py` | 27 | Optional built-in Orchestrator Authz configuration, session gating, revocation, and cleanup |
-| `tests/test_controller_service.py` | 33 | Phase B controller API gate: exclusive sessions, observers, privileged and internal actions |
+| `tests/test_controller_service.py` | 35 | Phase B controller API gate: exclusive sessions, observers, privileged/internal actions, failed walking and replay |
 | `tests/test_reach_limits.py` | 37 | Reach limits for external controllers' targeted edits and moves; finite limits; walk_to stays a walk |
 | `tests/test_reach_bypass.py` | 15 | No reach bypass via handler coercion: malformed targets refused, edits measured to the truncated block |
 | `tests/test_session_resume.py` | 10 | A restarted ControllerService resumes a still-leased session only for its holder; released, fenced and expired sessions are not revived; generation still enforced; request-ID replay within the resumed session; a late resume or renewal never undoes a newer lease |
@@ -291,7 +297,7 @@ Helpers in `tests/test_integration.py`:
 | `tests/test_condition_events.py` | 23 | Condition events: low health/hunger edge triggers and hysteresis, damage cooldown accumulation, missing/non-finite values, supervisor journaling, bounded queue under a stalled journal |
 | `tests/test_webhooks.py` | 28 | Webhook delivery, retries, and endpoint checks |
 | `tests/test_webhook_wiring.py` | 23 | Webhook config section (secrets only from env), building subscriptions, filtered-event skipping, the `run()` delivery loop |
-| `tests/test_mcp_server.py` | 64 | MCP adapter: tools, bearer-token rules, controller guarantees through MCP, event polling, Host/Origin validation, startup/shutdown cleanup, webhook sender lifecycle |
+| `tests/test_mcp_server.py` | 66 | MCP adapter: tools, bearer-token rules, controller guarantees through MCP, event polling, Host/Origin validation, startup/shutdown cleanup, webhook sender lifecycle, parameter discovery and action data/replay |
 | `tests/test_integration.py` | 12 | Full agent loop with real MCPQ + real LLM |
 | `tests/test_mcp_integration.py` | 2 | `minecraft-ai-bridge-mcp` over stdio and HTTP against live MCPQ |
 | `tests/test_phase_c_integration.py` | 1 | RFC-0001 Phase C gate against live MCPQ: attack reflex with no LLM and no client connected, events durable across a server restart, request-ID replays after the restart never mutate twice |

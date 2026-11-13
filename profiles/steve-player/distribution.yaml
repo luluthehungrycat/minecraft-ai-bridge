@@ -1,0 +1,17 @@
+name: steve-player
+version: 0.1.0
+description: Minecraft-only Hermes controller with bounded MCP access and no host tools.
+author: Minecraft AI Bridge
+license: MIT
+hermes_requires: '>=0.23.1'
+env_requires:
+  - name: MAB_MCP_URL
+    description: Operator-managed minecraft-ai-bridge Streamable HTTP endpoint.
+    required: true
+  - name: MAB_CONTROLLER_TOKEN
+    description: Steve-bound controller credential, never an administrator token.
+    required: true
+distribution_owned:
+  - SOUL.md
+  - config.yaml
+  - distribution.yaml

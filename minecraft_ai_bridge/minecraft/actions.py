@@ -445,13 +445,20 @@ async def _can_move_to(
         return False, f"Collision check failed: {exc}"
 
 
+@dataclass(frozen=True)
+class _WalkOutcome:
+    message: str
+    blocked: bool = False
+    interrupted: bool = False
+
+
 async def _walk_toward(
     mc: McpqCommandAdapter,
     target_x: float,
     target_z: float,
     step_size: float = 0.5,
     max_steps: int = 50,
-) -> str:
+) -> _WalkOutcome:
     """Walk the player toward a target coordinate, using A* pathfinding
     to navigate around obstacles when available.
 
@@ -460,14 +467,16 @@ async def _walk_toward(
     or the path is short, falls back to straight-line movement with
     collision detection.
 
-    Each step uses ``/execute as @p at @s run tp @s ^ ^ ^{step}`` for
-    proper entity-context movement.
+    Each step uses an absolute, bounded teleport after checking its swept envelope.
+    ``execute facing`` changes command context, not the entity's saved yaw;
+    splitting facing and caret-relative movement into two commands walks in the
+    old direction instead of toward the requested waypoint.
 
-    Returns a summary string describing what happened.
+    Returns an explicit outcome; callers must not infer refusal from the prose.
     """
     pos = await mc.get_player_pos()
     if pos is None:
-        return "Cannot walk — player position unknown"
+        return _WalkOutcome("Cannot walk — player position unknown", blocked=True)
 
     px, py, pz = pos[0], pos[1], pos[2]
     dx = target_x - px
@@ -475,11 +484,7 @@ async def _walk_toward(
     distance = (dx * dx + dz * dz) ** 0.5
 
     if distance < step_size:
-        # Already close enough — just face the target
-        await mc.run_as_player(
-            f"execute as @p at @s facing {target_x} {py} {target_z} run tp @s ~ ~ ~"
-        )
-        return f"Already at target ({distance:.1f}m)"
+        return _WalkOutcome(f"Already at target ({distance:.1f}m)")
 
     # Try A* pathfinding for medium-to-long distances
     waypoints: list[tuple[float, float]] | None = None
@@ -498,106 +503,66 @@ async def _walk_toward(
         except Exception as exc:
             logger.debug("Pathfinding failed — falling back to straight-line: %s", exc)
 
-    if waypoints:
-        # Pathfinding waypoint follow
-        steps_taken = 0
-        failed_at = ""
-        for wx, wz in waypoints:
-            if steps_taken >= max_steps:
-                break
-            if _safety_interrupted():
-                failed_at = _INTERRUPTED_MESSAGE
-                break
-            # Face the waypoint
-            await mc.run_as_player(f"execute as @p at @s facing {wx} {py} {wz} run tp @s ~ ~ ~")
-            # Step forward
-            await mc.run_as_player(f"execute as @p at @s run tp @s ^ ^ ^{step_size}")
-            steps_taken += 1
-
-            # Quick collision check every other step
-            if steps_taken % 2 == 0:
-                new_pos = await mc.get_player_pos()
-                if new_pos:
-                    ok, reason = await _can_move_to(
-                        mc,
-                        int(new_pos[0]),
-                        int(new_pos[1]),
-                        int(new_pos[2]),
-                    )
-                    if not ok:
-                        failed_at = reason
-                        break
-                    # Hazard check
-                    try:
-                        below = await mc.get_block(
-                            int(new_pos[0]),
-                            int(new_pos[1]) - 1,
-                            int(new_pos[2]),
-                        )
-                        if _is_hazard(below):
-                            failed_at = f"hazard below ({below})"
-                            break
-                    except Exception:
-                        pass
-
-        if failed_at:
-            return f"Pathfinding walked {steps_taken} waypoint steps before stopping: {failed_at}"
-        return f"Pathfinding completed {steps_taken} waypoint steps ({distance:.1f}m)"
-
-    # Fallback: straight-line walking with collision detection (original logic)
+    # Follow each waypoint all the way, rather than taking one half-block step
+    # and skipping ahead to the next grid cell. Append the exact requested goal.
+    destinations = [*(waypoints or []), (target_x, target_z)]
     steps_taken = 0
-    failed_at = ""
-    for step_n in range(min(max_steps, int(distance / step_size) + 1)):
-        if _safety_interrupted():
-            failed_at = _INTERRUPTED_MESSAGE
-            break
-        # Face the target
-        await mc.run_as_player(
-            f"execute as @p at @s facing {target_x} {py} {target_z} run tp @s ~ ~ ~"
-        )
-        # Take a small step forward (execute-based for entity context)
-        await mc.run_as_player(f"execute as @p at @s run tp @s ^ ^ ^{step_size}")
-
-        # Check if we've reached the target
-        new_pos = await mc.get_player_pos()
-        if new_pos is None:
-            break
-        new_dx = target_x - new_pos[0]
-        new_dz = target_z - new_pos[2]
-        new_dist = (new_dx * new_dx + new_dz * new_dz) ** 0.5
-
-        steps_taken += 1
-
-        if new_dist < step_size:
-            break
-
-        # Collision check every 2 steps
-        if step_n % 2 == 0:
-            ok, reason = await _can_move_to(
-                mc,
-                int(new_pos[0]),
-                int(new_pos[1]),
-                int(new_pos[2]),
-            )
-            if not ok:
-                failed_at = reason
-                break
-
-        # Hazard check every 2 steps
-        if step_n % 2 == 0:
-            try:
-                block_below = await mc.get_block(
-                    int(new_pos[0]), int(new_pos[1]) - 1, int(new_pos[2])
+    for wx, wz in destinations:
+        while steps_taken < max_steps:
+            if _safety_interrupted():
+                return _WalkOutcome(
+                    f"Walked {steps_taken} steps before stopping: {_INTERRUPTED_MESSAGE}",
+                    interrupted=True,
                 )
-                if _is_hazard(block_below):
-                    failed_at = f"hazard below ({block_below})"
-                    break
-            except Exception:
-                pass
-
-    if failed_at:
-        return f"Walked {steps_taken} steps toward target before stopping: {failed_at}"
-    return f"Walked {steps_taken} steps toward target ({distance:.1f}m)"
+            pos = await mc.get_player_pos()
+            if pos is None:
+                return _WalkOutcome(
+                    f"Walked {steps_taken} steps before stopping: player position unknown",
+                    blocked=True,
+                )
+            dx, dz = wx - pos[0], wz - pos[2]
+            remaining = math.hypot(dx, dz)
+            if remaining < 0.01:
+                break
+            stride = min(step_size, remaining)
+            nx, ny, nz = pos[0] + dx / remaining * stride, pos[1], pos[2] + dz / remaining * stride
+            # Conservatively check the bounding envelope of the 0.6-block-wide
+            # body throughout the segment, not just its endpoint. This may
+            # refuse a clear diagonal near a corner, but never skips that corner.
+            for bx in range(math.floor(min(pos[0], nx) - 0.3), math.ceil(max(pos[0], nx) + 0.3)):
+                for bz in range(
+                    math.floor(min(pos[2], nz) - 0.3), math.ceil(max(pos[2], nz) + 0.3)
+                ):
+                    ok, reason = await _can_move_to(mc, bx, math.floor(ny), bz)
+                    if not ok:
+                        return _WalkOutcome(
+                            f"Walked {steps_taken} steps before stopping: {reason}", blocked=True
+                        )
+                    # The integer-cell helper checks feet and the next cell.
+                    # At fractional Y, a 1.8-block body can reach a third cell.
+                    for by in range(math.floor(ny) + 2, math.ceil(ny + 1.8)):
+                        block = await mc.get_block(bx, by, bz)
+                        if not _is_passable(block) or _is_hazard(block):
+                            return _WalkOutcome(
+                                f"Walked {steps_taken} steps before stopping: "
+                                f"Head would be inside {block}",
+                                blocked=True,
+                            )
+            below = await mc.get_block(math.floor(nx), math.floor(ny) - 1, math.floor(nz))
+            if _is_passable(below):
+                return _WalkOutcome(
+                    f"Walked {steps_taken} steps before stopping: no ground support", blocked=True
+                )
+            if _safety_interrupted():
+                return _WalkOutcome(
+                    f"Walked {steps_taken} steps before stopping: {_INTERRUPTED_MESSAGE}",
+                    interrupted=True,
+                )
+            await mc.teleport_player(nx, ny, nz)
+            steps_taken += 1
+        if steps_taken >= max_steps:
+            break
+    return _WalkOutcome(f"Walked {steps_taken} steps toward target ({distance:.1f}m)")
 
 
 # ── Action execution ────────────────────────────────────────────────────
@@ -1049,22 +1014,27 @@ async def _walk_to(mc: McpqCommandAdapter, params: dict) -> ActionResult:
         )
 
     result = await _walk_toward(mc, float(x), float(z))
-    interrupted = _INTERRUPTED_MESSAGE in result
     new_pos = await mc.get_player_pos()
     new_dx = float(x) - (new_pos[0] if new_pos else pos[0])
     new_dz = float(z) - (new_pos[2] if new_pos else pos[2])
     remaining = (new_dx * new_dx + new_dz * new_dz) ** 0.5
 
     return ActionResult(
-        success=(remaining < 3 and not interrupted),  # within 3 blocks = close enough
+        success=(
+            new_pos is not None
+            and remaining < 0.5
+            and not result.blocked
+            and not result.interrupted
+        ),
         action=ActionType.WALK_TO,
-        message=result,
+        message=result.message,
         data={
             "x": x,
             "z": z,
             "distance": distance,
             "remaining": remaining,
-            "interrupted": interrupted,
+            "interrupted": result.interrupted,
+            "blocked": result.blocked,
         },
     )
 
@@ -2333,7 +2303,7 @@ async def _check_hunger(mc: McpqCommandAdapter, params: dict) -> ActionResult:
     try:
         import re as _re
 
-        m = _re.search(r"(-?\d+)", resp or "")
+        m = _re.fullmatch(r"(?:.+ has the following entity data:\s*)?(-?\d+)", (resp or "").strip())
         if m:
             # foodLevel is stored as an integer (no float suffix in the data)
             parsed = int(m.group(1))
@@ -2344,6 +2314,8 @@ async def _check_hunger(mc: McpqCommandAdapter, params: dict) -> ActionResult:
         pass
 
     if parsed is not None:
+        # Observer consumes a numeric token, not Paper's /data message envelope.
+        result_data["hunger_raw"] = str(parsed)
         return ActionResult(
             success=True,
             action=ActionType.CHECK_HUNGER,

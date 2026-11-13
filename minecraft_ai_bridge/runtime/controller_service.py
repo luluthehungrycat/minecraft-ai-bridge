@@ -477,7 +477,9 @@ class ControllerService:
             }.get(status)
             if reason_code == "POLICY_REJECTED":
                 await self._forget_if_invalid(session)
-        return self._result(credential_id, request, status, reason_code, result.message)
+        return self._result(
+            credential_id, request, status, reason_code, result.message, data=result.data
+        )
 
     # ── Tasks ────────────────────────────────────────────────────────
 
@@ -824,6 +826,8 @@ class ControllerService:
         status: ActionStatus,
         reason_code: str | None,
         message: str,
+        *,
+        data: dict[str, Any] | None = None,
     ) -> ActionResultSchema:
         return ActionResultSchema(
             action_id=_action_id(request.steve_id, credential_id, request.request_id),
@@ -832,6 +836,7 @@ class ControllerService:
             status=status,
             reason_code=reason_code,
             message=message,
+            data=data if data is not None else {},
             task_id=request.task_id,
             completed_at=datetime.now(UTC),
         )

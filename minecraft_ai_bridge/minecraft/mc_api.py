@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import re
 import uuid
 from collections.abc import Callable
@@ -145,11 +146,26 @@ class McpqClient:
             return None
 
     async def get_player_pos(self) -> tuple[float, float, float] | None:
-        """Get (x, y, z) of the configured player, or *None*."""
-        player = await self.get_player()
-        if player is not None:
-            return (player.pos.x, player.pos.y, player.pos.z)
-        return None
+        """Read fresh coordinates, bypassing MCPQ's 200 ms Player.pos cache.
+
+        Movement/reach checks cannot use a cached position after command-based
+        teleports. Read one authoritative command result off the event loop.
+        """
+        if self._mc is None:
+            return None
+        if not re.fullmatch(r"[A-Za-z0-9_]{1,16}", self._player_name):
+            return None
+        raw = await self.run_command_blocking(f"data get entity {self._player_name} Pos")
+        match = re.search(r"has the following entity data:\s*\[([^\]]*)\]\s*$", raw)
+        if match is None:
+            return None
+        try:
+            values = tuple(float(part.strip().rstrip("dDfF")) for part in match[1].split(","))
+        except ValueError:
+            return None
+        if len(values) != 3 or not all(math.isfinite(value) for value in values):
+            return None
+        return values[0], values[1], values[2]
 
     async def get_last_attacker(
         self, max_age_ticks: int = _RECENT_ATTACK_TICKS

@@ -171,6 +171,12 @@ MAB_CONTROLLER_TOKEN=... minecraft-ai-bridge-mcp --transport stdio
 
 Every call goes through the same action gate as the built-in agent: scoped credentials, one exclusive controller session per bot, reach limits, and independent attack/eat/heal safety reflexes. Its tools cover observation, single actions, event polling and acknowledgement, and durable step plans (`minecraft_create_task` and friends). See [docs/CLI.md](docs/CLI.md#mcp-server-minecraft-ai-bridge-mcp) for credentials, flags, and the tool list.
 
+For a dedicated external player, see the secret-free
+[Steve Player Hermes profile template](profiles/steve-player/README.md): Minecraft
+MCP tools only, no host terminal/filesystem tools, a PATH wrapper, and optional
+T3 Code ACP registration. The [live smoke report](docs/testing/hermes-steve-player-smoke.md)
+separates verified MCPQ control from genuine survival gameplay.
+
 ## LLM Providers
 
 | Provider | Models | Env Var | Optional Install |
@@ -424,11 +430,11 @@ pip install -e "."
 
 ## Testing
 
-The project has **1008 deterministic tests** plus 15 live integration tests organized in two tiers:
+The project has **1032 deterministic tests** plus 15 live integration tests organized in two tiers:
 
 | Tier | Count | Description | Dependencies |
 |------|-------|-------------|--------------|
-| **Deterministic** | 1008 | Action handlers, NBT parsing, memory, goal fallbacks, config, chat commands, inventory manager, observer, orchestrator, runtime (action gate, authorization, sessions, safety, events, tasks, webhooks), and MCP adapter | `MockMcpqClient` / `MockLLMClient`; MCP tests need the `[mcp]` extra (in `[dev]`) |
+| **Deterministic** | 1032 | Action handlers, NBT parsing, memory, goal fallbacks, config, chat commands, inventory manager, observer, orchestrator, runtime (action gate, authorization, sessions, safety, events, tasks, webhooks), MCP adapter, player profile template, and smoke runner | `MockMcpqClient` / `MockLLMClient`; MCP tests need the `[mcp]` extra (in `[dev]`) |
 | **Integration** | 15 | Full think-act-observe loop with real MCPQ + real LLM (12), `minecraft-ai-bridge-mcp` over stdio and HTTP (2), and the RFC-0001 Phase C gate (1) | Paper 26.2 build 123 + MCPQ v2.2 + bot plugin + OpenRouter API key |
 
 ### Test Infrastructure

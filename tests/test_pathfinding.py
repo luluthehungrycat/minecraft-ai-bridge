@@ -11,6 +11,13 @@ from tests.conftest import MockMcpqClient
 class TestPathfinderFindPath:
     """Test the pathfinder's core path-finding capability."""
 
+    async def test_negative_fractional_positions_use_containing_block(self):
+        mc = MockMcpqClient()
+        path = await Pathfinder(mc).find_path(-0.5, -0.5, -4.5, -4.5, y_level=65)
+        assert path is not None
+        assert path[0] == (-0.5, -0.5)
+        assert path[-1] == (-4.5, -4.5)
+
     @pytest.mark.asyncio
     async def test_find_path_open_terrain(self) -> None:
         """Should find a direct straight-line path across open air."""

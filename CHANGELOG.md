@@ -27,6 +27,10 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
 
 ### Added
 
+- Secret-free `steve-player` Hermes profile template v0.1.0 with Minecraft-only
+  MCP tools, a player-specific SOUL, GPT-6 Luna default, pinned official Claude
+  subscription plugin/Haiku fallback, PATH-wrapper installer, and bounded live
+  gameplay trial runner. See `profiles/steve-player/README.md`.
 - Controllers can send a `stop` action that ends the actions running at that
   moment without waiting for them. Multi-step moves (`walk_to`,
   `move_forward`, `move_back`, `sprint`) stop at their next step and return
@@ -72,6 +76,26 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
 
 ### Fixed
 
+- MCP action results now preserve JSON `data` (including inventory/scan readback)
+  through the controller envelope and request-ID replay. Tool discovery documents
+  action parameter names and nested task-step `params` instead of leaving external
+  agents to guess them.
+- MCPQ hunger observations normalize successful Paper command output to a numeric
+  value, without mistaking digits in player names for hunger.
+- MCPQ `walk_to` uses checked absolute half-block steps rather than losing its
+  facing context between commands. It follows complete waypoints, checks the
+  player's swept body envelope (including fractional-Y head height) before moving,
+  refuses unsupported footing, and requires
+  arrival within half a block. A* no longer cuts solid corners or truncates
+  negative fractional coordinates toward zero. Fresh position reads bypass
+  MCPQ's 200 ms player-property cache after command-based teleports. These remain
+  teleport-simulated movements, not a physical-player backend.
+- The Hermes gameplay smoke runner stops the batch immediately on timeout,
+  retaining the timed-out trial's evidence and requiring operator reconciliation
+  before further trials; killing the CLI does not confirm gateway/task cancellation.
+- A collision-refused `walk_to` now fails even when its partial movement ends
+  within the arrival tolerance. Explicit blocked/interrupted outcomes survive
+  controller results and request-ID replay; success is not inferred from prose.
 - Bot plugin: a summoned bot no longer starts at `(0, 0, 0)` inside the ground. `placeNewPlayer` skips the login spawn search and this path loads no saved player data, so `/botsummon` now moves the bot to the first safe spot found in square rings around the world spawn, up to 8 blocks out on each axis (solid, non-hazardous footing; free, non-liquid feet and head space). If none is found, it logs a warning instead.
 - After `minecraft-ai-bridge-mcp` restarts, a controller can keep using its
   still-leased session. Before, the restarted server did not know the

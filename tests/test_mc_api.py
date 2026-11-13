@@ -3,10 +3,33 @@
 from __future__ import annotations
 
 import threading
+from types import SimpleNamespace
 
 import pytest
 
 from minecraft_ai_bridge.minecraft.mc_api import McpqClient
+
+
+async def test_position_reads_bypass_mcpq_cached_player_properties():
+    class CachedPlayer:
+        pos = SimpleNamespace(x=0.5, y=65.0, z=0.5)
+
+    class MovingWorld:
+        x = 0.5
+
+        def getPlayer(self, name):  # noqa: N802 - mcpq API
+            return CachedPlayer()
+
+        def runCommandBlocking(self, command):  # noqa: N802 - mcpq API
+            assert command == "data get entity Steve2 Pos"
+            return f"Steve2 has the following entity data: [{self.x}d, 65.0d, 0.5d]"
+
+    client = McpqClient(host="localhost", port=1789, player_name="Steve2")
+    world = MovingWorld()
+    client._mc = world  # type: ignore[assignment]
+    assert await client.get_player_pos() == (0.5, 65, 0.5)
+    world.x = 1.5
+    assert await client.get_player_pos() == (1.5, 65, 0.5)
 
 
 class _FakeMinecraft:

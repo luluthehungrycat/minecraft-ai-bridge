@@ -134,8 +134,16 @@ def build_mcp_server(controller: ControllerService, *, stdio_token: str | None =
         name="minecraft_submit_action",
         description=(
             "Run one action under an open session. action is one of: "
-            f"{_ACTION_NAMES}. The result status is succeeded, failed, or rejected "
-            "(with a reason_code)."
+            f"{_ACTION_NAMES}. The result status is succeeded, failed, rejected, or interrupted "
+            "(with a reason_code). params is an object with action-specific keys: "
+            "place_block: {x,y,z,block_type} (use block_type, not block; default is stone); "
+            "break_block: {x,y,z}; move_to/teleport/walk_to: {x,y,z}; "
+            "move_forward/move_back/sprint: {steps}; equip_item: {slot}; "
+            "craft_item/drop_item: {item_type,amount}; attack: {entity_type}; "
+            "chat/done: {message}; wait: {seconds}; scan/scan_entities: {radius}. "
+            "scan samples around the bot, not an arbitrary center, and is not a full block map. "
+            "check_* and list_players take {}. Read capabilities first; MCPQ edits and crafting "
+            "are privileged simulations, not survival inventory consumption."
         ),
     )
     async def submit_action(
@@ -206,7 +214,16 @@ def build_mcp_server(controller: ControllerService, *, stdio_token: str | None =
         steps: list[dict[str, Any]],
         ctx: Context,
     ) -> dict[str, Any]:
-        """Run a durable bounded sequential plan independently of this connection."""
+        """Run a durable bounded sequential plan independently of this connection.
+
+        steps must be objects with action and nested params, for example
+        [{"action":"wait","params":{"seconds":10}},
+         {"action":"chat","params":{"message":"finished"}}].
+        Do not put seconds/message/x/y/z at the step's top level. At most
+        100 steps; waits are at most 30 seconds. Supported task actions:
+        chat, done, wait, check_*, list_players, teleport, move_to,
+        break_block and place_block (edits/moves require explicit x,y,z).
+        """
         try:
             task = await controller.create_task(
                 token_for(ctx), session_id, generation, request_id, title, steps
