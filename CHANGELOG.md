@@ -31,6 +31,13 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
   MCP tools, a player-specific SOUL, GPT-6 Luna default, pinned official Claude
   subscription plugin/Haiku fallback, PATH-wrapper installer, and bounded live
   gameplay trial runner. See `profiles/steve-player/README.md`.
+- `scripts/reset-smoke-arena.py` rebuilds the disposable smoke arena over MCPQ
+  and reads it back (floor, walls, play space, fixtures, position, inventory),
+  exiting non-zero on any mismatch. It changes the difficulty only when
+  `--difficulty` is given, so the Phase C gate can still use easy.
+- The smoke runner checks the world is peaceful before each trial a hostile mob
+  would disrupt (`wall`, `navigation`, `gather_craft`, `task_lifecycle`) and
+  stops the batch otherwise; `policy` and `containment` run at any difficulty.
 - Controllers can send a `stop` action that ends the actions running at that
   moment without waiting for them. Multi-step moves (`walk_to`,
   `move_forward`, `move_back`, `sprint`) stop at their next step and return

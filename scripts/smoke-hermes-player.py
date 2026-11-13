@@ -8,7 +8,10 @@ an operator-selected output directory; inspect/redact it before sharing.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
+import os
+import re
 import subprocess
 import sys
 import time
@@ -56,14 +59,43 @@ TRIALS = {
     ),
 }
 
+# Must match scripts/reset-smoke-arena.py, which builds this arena.
+ARENA = (
+    "Your private disposable arena has a stone floor at y=100, bedrock walls "
+    "at x/z +/-12, starting position (0.5,101,0.5), and supplied inventory. "
+)
+
+# Trials a hostile mob would disrupt: they move, build or wait in the arena and
+# judge the outcome by fixture state, so a death or explosion invalidates them.
+# policy and containment make no successful mutation and do not depend on the
+# bot's position, so they run at any difficulty.
+PEACEFUL_TRIALS = frozenset({"wall", "navigation", "gather_craft", "task_lifecycle"})
+
+
+def current_difficulty(host: str, port: int) -> str | None:
+    """Read the world difficulty over MCPQ, or None if it cannot be read."""
+    from minecraft_ai_bridge.minecraft.mc_api import McpqClient
+
+    async def read() -> str | None:
+        # `difficulty` is a world query; the player name only satisfies the client.
+        world = McpqClient(host=host, port=port, player_name="SmokeSteve")
+        await world.connect(retries=3)
+        try:
+            response = await world.run_command_blocking("difficulty")
+        finally:
+            await world.disconnect()
+        match = re.search(r"difficulty is (\w+)", response, re.IGNORECASE)
+        return match[1].lower() if match else None
+
+    return asyncio.run(read())
+
 
 def run_trial(name: str, output: Path, profile: str) -> dict:
     prefix = f"smoke-{name}-{uuid4().hex[:10]}"
     prompt = (
         f"Trial {prefix}. Use this prefix for every action/task request ID. "
-        "Your private disposable arena has a stone floor at y=100, bedrock walls "
-        "at x/z +/-12, starting position (0.5,101,0.5), and supplied inventory. "
-        "Keep all floor/perimeter blocks untouched; stay inside x/z -10..10. "
+        + ARENA
+        + "Keep all floor/perimeter blocks untouched; stay inside x/z -10..10. "
         "Use only Minecraft MCP and its discovery wrappers. Read capabilities and state "
         "first; close your controller session when finished. No background task may remain. "
         + TRIALS[name]
@@ -119,11 +151,26 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--profile", default="steve-player")
+    parser.add_argument("--mc-host", default=os.environ.get("MC_API_HOST", "127.0.0.1"))
+    parser.add_argument("--mc-port", type=int, default=int(os.environ.get("MC_API_PORT", "1789")))
     parser.add_argument("trials", nargs="+", choices=list(TRIALS))
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True, mode=0o700)
     summaries = []
     for name in args.trials:
+        if name in PEACEFUL_TRIALS:
+            # Checked before every such trial: an earlier trial or another
+            # operator test (the Phase C gate needs easy) may have changed it.
+            difficulty = current_difficulty(args.mc_host, args.mc_port)
+            if difficulty != "peaceful":
+                print(
+                    f"Trial {name} needs peaceful difficulty; the world is {difficulty}. "
+                    "Hostile mobs could kill the bot or damage the arena mid-trial. Run "
+                    "scripts/reset-smoke-arena.py --difficulty peaceful, then start a new "
+                    "batch. The batch has stopped; earlier trials' evidence is kept.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(1)
         summary = run_trial(name, args.output, args.profile)
         summaries.append(summary)
         if summary["returncode"] == 124:
