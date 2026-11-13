@@ -80,6 +80,21 @@ def parse_difficulty(response: str) -> str | None:
     return match[1].lower() if match else None
 
 
+def parse_item_count(response: str) -> int | None:
+    """Read the count from a ``clear <player> <item> 0`` response.
+
+    Only the two known forms are accepted, anchored to their wording so digits
+    in a player name are never taken for a count. Anything else (player not
+    found, command error) is None, and verification fails.
+    """
+    match = re.match(r"\s*Found (\d+) matching item", response)
+    if match:
+        return int(match[1])
+    if re.match(r"\s*No items were found", response):
+        return 0
+    return None
+
+
 def expected_block(x: int, y: int, z: int) -> str | None:
     """The block the arena must hold at (x, y, z), or None if unchecked."""
     if not (-HALF <= x <= HALF and -HALF <= z <= HALF):
@@ -114,9 +129,10 @@ async def verify(world: World, player: str, difficulty: str | None) -> list[str]
     for item, count in INVENTORY.items():
         # `clear <player> <item> 0` counts matching items without removing them.
         response = await world.run_command_blocking(f"clear {player} minecraft:{item} 0")
-        match = re.search(r"(\d+)", response)
-        found = int(match[1]) if match else 0
-        if found != count:
+        found = parse_item_count(response)
+        if found is None:
+            problems.append(f"unrecognized inventory response for {item}: {response!r}")
+        elif found != count:
             problems.append(f"{player} has {found} {item}, expected {count}")
     actual = parse_difficulty(await world.run_command_blocking("difficulty"))
     if difficulty is not None and actual != difficulty:

@@ -127,8 +127,11 @@ class _ArenaWorld:
             return f"The difficulty is {self.difficulty.capitalize()}"
         if command.startswith("clear ") and command.endswith(" 0"):
             item = command.split()[2].removeprefix("minecraft:")
+            player = command.split()[1]
             count = self.inventory.get(item, 0)
-            return f"Found {count} matching item(s) on player" if count else "No items were found"
+            if count:
+                return f"Found {count} matching item(s) on player {player}"
+            return f"No items were found on player {player}"
         return ""
 
 
@@ -206,3 +209,29 @@ async def test_reset_runs_commands_then_reports(monkeypatch):
     sent = [entry["command"] for entry in report["commands"]]
     assert sent == reset.reset_commands("SmokeSteve", "peaceful")
     assert world.commands[: len(sent)] == sent
+
+
+async def test_verify_inventory_ignores_digits_in_the_player_name():
+    # "No items were found on player Steve8" must read as 0, not 8.
+    reset = _load("reset-smoke-arena.py", "reset_smoke_arena")
+    world = _ArenaWorld(reset)
+    world.inventory["bread"] = 0
+    problems = await reset.verify(world, "Steve8", None)
+    assert problems == ["Steve8 has 0 bread, expected 8"]
+
+
+@pytest.mark.parametrize("response", ["No player was found", "Unknown or incomplete command", ""])
+async def test_verify_rejects_unrecognized_inventory_responses(monkeypatch, response):
+    reset = _load("reset-smoke-arena.py", "reset_smoke_arena")
+    world = _ArenaWorld(reset)
+    original = world.run_command_blocking
+
+    async def run(command):
+        if command.startswith("clear ") and command.endswith(" 0"):
+            return response
+        return await original(command)
+
+    monkeypatch.setattr(world, "run_command_blocking", run)
+    problems = await reset.verify(world, "SmokeSteve", None)
+    assert len(problems) == len(reset.INVENTORY)
+    assert all("unrecognized inventory response" in p for p in problems), problems
