@@ -201,10 +201,12 @@ class TestMovement:
     async def test_walk_to_nearby(self, mock_mc):
         """walk_to should walk step-by-step for short distances."""
         mock_mc.set_position(10.0, 65.0, 10.0)
+        for x in range(9, 14):
+            for z in range(9, 14):
+                await mock_mc.set_block("stone", x, 64, z)
         result = await execute_action(mock_mc, ActionType.WALK_TO, {"x": 12, "z": 12})
         assert result.success is True
-        # Should have used execute facing to orient
-        mock_mc.assert_command_contains("execute as AIBot at @s facing")
+        assert await mock_mc.get_player_pos() == pytest.approx((12, 65, 12))
 
     async def test_walk_to_far(self, mock_mc):
         """walk_to should teleport for distances > 50 blocks."""
@@ -819,6 +821,18 @@ class TestInformation:
         result = await execute_action(mock_mc, ActionType.CHECK_HUNGER, {})
         assert result.success is True
         assert "7/20" in result.message
+
+    async def test_check_hunger_ignores_digits_in_player_name(self, mock_mc, monkeypatch):
+        original = mock_mc._run_command_blocking
+
+        async def live_hunger(command: str) -> str:
+            if command.startswith("data get entity AIBot foodLevel"):
+                return "Steve2 has the following entity data: 7"
+            return await original(command)
+
+        monkeypatch.setattr(mock_mc, "_run_command_blocking", live_hunger)
+        result = await execute_action(mock_mc, ActionType.CHECK_HUNGER, {})
+        assert result.data["hunger_raw"] == "7"
 
     async def test_check_hunger_starving(self, mock_mc):
         """Hunger at 0 should still report validly (no clamping error)."""

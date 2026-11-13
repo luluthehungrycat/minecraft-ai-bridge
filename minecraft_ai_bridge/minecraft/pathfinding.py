@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import heapq
 import logging
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -94,8 +95,8 @@ class Pathfinder:
         list of (x, z) waypoints (including start and goal), or *None* if
         no path exists within ``max_nodes``.
         """
-        sx, sz = int(start_x), int(start_z)
-        gx, gz = int(goal_x), int(goal_z)
+        sx, sz = math.floor(start_x), math.floor(start_z)
+        gx, gz = math.floor(goal_x), math.floor(goal_z)
 
         # Clamp to a reasonable bounding box
         min_x = min(sx, gx) - 8  # margin around the corridor
@@ -364,6 +365,17 @@ class Pathfinder:
                     continue
                 # Check if walkable
                 if not walkable.get(neighbour, False):
+                    continue
+
+                # A diagonal edge sweeps across both adjoining cardinal cells.
+                # Point-only waypoints otherwise cut through solid corners.
+                if (
+                    dx
+                    and dz
+                    and not (
+                        walkable.get((cx + dx, cz), False) and walkable.get((cx, cz + dz), False)
+                    )
+                ):
                     continue
 
                 # Movement cost

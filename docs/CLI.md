@@ -171,6 +171,14 @@ retry never runs it twice. A retry returns the original result only within
 the session that sent it; from a new session the request ID is refused
 (`POLICY_REJECTED`), still without running it again.
 
+Action results include a JSON `data` object with the backend's structured output,
+such as `raw_inventory` for `check_inventory` or the sampling fields for `scan`.
+Replays preserve the observation; per-call correlation metadata may change.
+Use `block_type` (not `block`) for `place_block` and nested `params` objects in
+task steps. MCP discovery documents the supported parameter shapes. A successful
+placement response is not independent block-state verification, and MCPQ crafting
+does not prove survival recipe consumption.
+
 If the server restarts, keep using your session: while its lease lasts, the
 restarted server resumes it for the credential that opened it, with the same
 `session_id` and `generation`.

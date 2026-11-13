@@ -1,0 +1,17 @@
+# This directory is a secret-free authored template, never a live profile export.
+.env
+.env.*
+auth.json*
+*.sqlite*
+*.db*
+memories/
+sessions/
+logs/
+cache/
+workspace/
+home/
+backups/
+state-snapshots/
+cron/
+mcp-tokens/
+vault/

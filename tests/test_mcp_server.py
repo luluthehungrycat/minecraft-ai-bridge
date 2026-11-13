@@ -127,6 +127,18 @@ async def test_exposes_exactly_the_controller_tools(env):
     assert {tool.name for tool in tools.tools} == TOOLS
 
 
+async def test_action_discovery_documents_parameter_names(env):
+    async with Client(build_mcp_server(env.service(), stdio_token=env.controller)) as client:
+        tools = (await client.list_tools()).tools
+    description = next(t.description for t in tools if t.name == "minecraft_submit_action")
+    assert "block_type" in description
+    assert "item_type" in description
+    assert "center" in description and "not" in description
+    assert "interrupted" in description
+    task_description = next(t.description for t in tools if t.name == "minecraft_create_task")
+    assert '"params"' in task_description and '"seconds"' in task_description
+
+
 async def test_stdio_flow_submits_through_the_controller(env):
     server = build_mcp_server(env.service(), stdio_token=env.controller)
     async with Client(server) as client:
@@ -144,6 +156,19 @@ async def test_stdio_flow_submits_through_the_controller(env):
     assert env.world.chat_messages_sent == ["hi"]
     assert not state.is_error and "health" in state.structured_content
     assert not closed.is_error
+
+
+async def test_observation_action_data_survives_mcp_and_replay(env):
+    env.world.set_inventory([{"item_id": "oak_planks", "count": 4, "slot": 0}])
+    server = build_mcp_server(env.service(), stdio_token=env.controller)
+    async with Client(server) as client:
+        session = await _open(client)
+        args = _submit_args(session, "check_inventory", request_id="inventory-data")
+        first = (await client.call_tool("minecraft_submit_action", args)).structured_content
+        replay = (await client.call_tool("minecraft_submit_action", args)).structured_content
+    assert "oak_planks" in first["data"]["raw_inventory"]
+    assert replay["data"]["raw_inventory"] == first["data"]["raw_inventory"]
+    assert replay["data"]["replayed"] is True
 
 
 async def test_stdio_without_a_configured_token_is_refused(env):

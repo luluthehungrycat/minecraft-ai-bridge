@@ -346,6 +346,7 @@ class ActionResultSchema(ContractModel):
     reason_code: str | None = Field(default=None, max_length=128)
     message: str = ""
     task_id: EntityId | None = None
+    data: JsonPayload = Field(default_factory=dict)
     safety_action: str | None = Field(default=None, max_length=64)
     state_revision: int | None = Field(default=None, ge=0)
     resumable: bool = False

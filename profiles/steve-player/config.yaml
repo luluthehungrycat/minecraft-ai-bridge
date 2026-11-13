@@ -1,0 +1,83 @@
+model:
+  provider: openai-codex
+  default: gpt-6-luna
+  max_tokens: 4096
+fallback_providers:
+  - provider: claude-subscription-directsdk-experimental
+    model: claude-haiku-5-5
+agent:
+  max_turns: 60
+  run_budget_seconds: 600
+  reasoning_effort: medium
+  coding_context: 'off'
+  disabled_toolsets:
+    - terminal
+    - file
+    - web
+    - browser
+    - delegation
+    - code_execution
+    - cronjob
+    - skills
+    - memory
+    - session_search
+    - connections
+    - kanban
+    - todo
+    - clarify
+toolsets: []
+platform_toolsets:
+  cli: [mcp-minecraft]
+  acp: [mcp-minecraft]
+  local: [mcp-minecraft]
+  tui: [mcp-minecraft]
+memory:
+  memory_enabled: false
+  user_profile_enabled: false
+approvals:
+  mode: manual
+security:
+  redact_secrets: true
+plugins:
+  enabled: [claude-subscription-directsdk-experimental]
+  auto_apply: false
+auxiliary:
+  compression:
+    provider: claude-subscription-directsdk-experimental
+    model: claude-haiku-5-5
+  title_generation:
+    provider: claude-subscription-directsdk-experimental
+    model: claude-haiku-5-5
+  approval:
+    provider: claude-subscription-directsdk-experimental
+    model: claude-haiku-5-5
+mcp_servers:
+  minecraft:
+    url: '${MAB_MCP_URL}'
+    headers:
+      Authorization: 'Bearer ${MAB_CONTROLLER_TOKEN}'
+    timeout: 120
+    connect_timeout: 30
+    supports_parallel_tool_calls: false
+    trust: full
+    sampling:
+      enabled: false
+    elicitation:
+      enabled: false
+    tools:
+      resources: false
+      prompts: false
+      include:
+        - minecraft_get_capabilities
+        - minecraft_get_state
+        - minecraft_open_session
+        - minecraft_renew_session
+        - minecraft_close_session
+        - minecraft_submit_action
+        - minecraft_get_events
+        - minecraft_ack_events
+        - minecraft_create_task
+        - minecraft_get_task
+        - minecraft_pause_task
+        - minecraft_resume_task
+        - minecraft_cancel_task

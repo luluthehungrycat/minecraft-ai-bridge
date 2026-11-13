@@ -27,6 +27,10 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
 
 ### Added
 
+- Secret-free `steve-player` Hermes profile template v0.1.0 with Minecraft-only
+  MCP tools, a player-specific SOUL, GPT-6 Luna default, pinned official Claude
+  subscription plugin/Haiku fallback, PATH-wrapper installer, and bounded live
+  gameplay trial runner. See `profiles/steve-player/README.md`.
 - Controllers can send a `stop` action that ends the actions running at that
   moment without waiting for them. Multi-step moves (`walk_to`,
   `move_forward`, `move_back`, `sprint`) stop at their next step and return
@@ -70,8 +74,54 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
   entity hurt the bot in the last 3 seconds, otherwise `environment`, or
   `unknown` if the server could not be asked (#18).
 
+### Changed
+
+- `WorldAdapter` (the transport-independent backend protocol) no longer
+  declares `run_as_player`, `run_command_blocking`, `teleport_player` or
+  `set_block`. They moved to the MCPQ-only `McpqCommandAdapter`, which
+  `McpqWorldAdapter` implements alongside `WorldAdapter`. Code that typed
+  against `WorldAdapter` and called those methods must use
+  `McpqCommandAdapter` instead; new backends no longer implement them.
+- `walk_to` walks on the current height only. A `y` more than 0.5 blocks from
+  the current height is now refused before moving
+  (`vertical_target_unsupported` in the result data) instead of reporting a
+  horizontal arrival as success. Omitting `y` keeps the old behaviour. The
+  teleport fallback beyond 50 blocks still uses `y`.
+
 ### Fixed
 
+- `walk_to` now walks its whole advertised 50-block range. Its step budget
+  follows the route, including A* detours, instead of a fixed 50 half-block
+  steps that stopped at 25 blocks; routes longer than 100 blocks are refused
+  before moving. Running out of steps is reported as `budget_exhausted`, and
+  results carry `steps_taken` so a failed walk that moved is not mistaken for
+  a no-op.
+- `walk_to` checks footing at half-block heights in the right cell: standing
+  on bottom slabs or stairs works, and floating at a fractional height is
+  refused. Other fractional heights are refused rather than guessed, since
+  block IDs carry no collision shape.
+- `McpqClient.get_player_pos()` returns `None` (and logs a warning) when the
+  position command fails, as before the fresh-read change, instead of raising.
+- MCP action results now preserve JSON `data` (including inventory/scan readback)
+  through the controller envelope and request-ID replay. Tool discovery documents
+  action parameter names and nested task-step `params` instead of leaving external
+  agents to guess them.
+- MCPQ hunger observations normalize successful Paper command output to a numeric
+  value, without mistaking digits in player names for hunger.
+- MCPQ `walk_to` uses checked absolute half-block steps rather than losing its
+  facing context between commands. It follows complete waypoints, checks the
+  player's swept body envelope (including fractional-Y head height) before moving,
+  refuses unsupported footing, and requires
+  arrival within half a block. A* no longer cuts solid corners or truncates
+  negative fractional coordinates toward zero. Fresh position reads bypass
+  MCPQ's 200 ms player-property cache after command-based teleports. These remain
+  teleport-simulated movements, not a physical-player backend.
+- The Hermes gameplay smoke runner stops the batch immediately on timeout,
+  retaining the timed-out trial's evidence and requiring operator reconciliation
+  before further trials; killing the CLI does not confirm gateway/task cancellation.
+- A collision-refused `walk_to` now fails even when its partial movement ends
+  within the arrival tolerance. Explicit blocked/interrupted outcomes survive
+  controller results and request-ID replay; success is not inferred from prose.
 - Bot plugin: a summoned bot no longer starts at `(0, 0, 0)` inside the ground. `placeNewPlayer` skips the login spawn search and this path loads no saved player data, so `/botsummon` now moves the bot to the first safe spot found in square rings around the world spawn, up to 8 blocks out on each axis (solid, non-hazardous footing; free, non-liquid feet and head space). If none is found, it logs a warning instead.
 - After `minecraft-ai-bridge-mcp` restarts, a controller can keep using its
   still-leased session. Before, the restarted server did not know the
