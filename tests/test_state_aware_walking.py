@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
 from types import SimpleNamespace
 
 import pytest
 from mcpq import Block
+from mcpq.exception import UnknownError
 
-from minecraft_ai_bridge.minecraft.actions import ActionType, execute_action
+from minecraft_ai_bridge.minecraft.actions import (
+    ActionType,
+    BackendOutcomeUnknownError,
+    execute_action,
+)
 from minecraft_ai_bridge.minecraft.mc_api import McpqClient
 from minecraft_ai_bridge.minecraft.pathfinding import Pathfinder
 from minecraft_ai_bridge.runtime.world_adapter import McpqWorldAdapter
@@ -28,6 +34,63 @@ def world_at(y=65, x=0.5):
     mc.set_position(x, y, 0.5)
     mc.set_block_map({(bx, 64, bz): "stone" for bx in range(-12, 13) for bz in range(-12, 13)})
     return mc
+
+
+@pytest.mark.parametrize(("slab_type", "feet_y"), [("bottom", 65.5), ("top", 65)])
+async def test_unknown_slab_cannot_prove_walking_or_astar_support(slab_type, feet_y):
+    mc = world_at(feet_y)
+    support_y = math.floor(feet_y) if feet_y % 1 else int(feet_y) - 1
+    mc.set_block_map(
+        {
+            (x, support_y, z): f"future_slab[type={slab_type},waterlogged=false]"
+            for x in range(-12, 13)
+            for z in range(-12, 13)
+        }
+    )
+    result = await execute_action(mc, ActionType.WALK_TO, {"x": 2.5, "z": 0.5})
+    assert not result.success
+    assert result.data["blocked"] is True
+    assert result.data["steps_taken"] == 0
+    assert await mc.get_player_pos() == (0.5, feet_y, 0.5)
+    assert await Pathfinder(mc).find_path(0.5, 0.5, 7.5, 0.5, feet_y) is None
+
+
+async def test_sdk_read_failure_preserves_partial_walk_progress():
+    mc = world_at()
+    read = mc.get_block_state
+    teleport = mc.teleport_player
+    moved = False
+
+    async def move(x, y, z):
+        nonlocal moved
+        await teleport(x, y, z)
+        moved = True
+
+    async def read_after_move(x, y, z):
+        if moved:
+            raise UnknownError("state query failed")
+        return await read(x, y, z)
+
+    mc.teleport_player = move
+    mc.get_block_state = read_after_move
+    result = await execute_action(mc, ActionType.WALK_TO, {"x": 2.5, "z": 0.5})
+    assert not result.success
+    assert result.data["blocked"] is True
+    assert result.data["steps_taken"] == 1
+    assert result.data["remaining"] == 1.5
+    assert await mc.get_player_pos() == (1.0, 65, 0.5)
+
+
+@pytest.mark.parametrize("error_type", [asyncio.CancelledError, BackendOutcomeUnknownError])
+async def test_geometry_does_not_swallow_cancellation_or_unknown_outcome(error_type):
+    mc = world_at()
+
+    async def broken(x, y, z):
+        raise error_type("not an ordinary read failure")
+
+    mc.get_block_state = broken
+    with pytest.raises(error_type):
+        await execute_action(mc, ActionType.WALK_TO, {"x": 2.5, "z": 0.5})
 
 
 @pytest.mark.parametrize(

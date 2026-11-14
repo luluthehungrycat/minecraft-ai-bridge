@@ -10,6 +10,7 @@ import math
 import re
 
 from grpc import RpcError
+from mcpq.exception import MCPQError
 
 from .world_types import WorldAdapter
 
@@ -102,6 +103,26 @@ _FULL = {
     "smoker",
     "barrel",
 }
+# Properties alone cannot establish the shape of an unfamiliar block.
+# Unsupported materials remain obstacles until explicitly classified.
+_SLABS = {
+    "stone_slab",
+    "smooth_stone_slab",
+    "cobblestone_slab",
+    "mossy_cobblestone_slab",
+    "stone_brick_slab",
+    "mossy_stone_brick_slab",
+    "brick_slab",
+    "sandstone_slab",
+    "smooth_sandstone_slab",
+    "red_sandstone_slab",
+    "smooth_red_sandstone_slab",
+    "quartz_slab",
+    "smooth_quartz_slab",
+    "nether_brick_slab",
+    "red_nether_brick_slab",
+    "purpur_slab",
+}
 for _wood in (
     "oak",
     "spruce",
@@ -132,6 +153,7 @@ for _wood in (
             f"stripped_{_wood}_wood",
         }
     )
+    _SLABS.add(f"{_wood}_slab")
 _STATE = re.compile(r"(?:minecraft:)?([a-z0-9_]+)(?:\[([a-z0-9_=,]+)\])?")
 
 
@@ -156,12 +178,12 @@ async def _read(mc: WorldAdapter, x: int, y: int, z: int) -> str:
         reader = getattr(mc, "get_block_state", None)
         value = await reader(x, y, z) if reader is not None else await mc.get_block(x, y, z)
         return value if isinstance(value, str) else "unknown"
-    except (RuntimeError, ValueError, TypeError, AttributeError, OSError, RpcError):
+    except (RuntimeError, ValueError, TypeError, AttributeError, OSError, RpcError, MCPQError):
         return "unknown"
 
 
 def _slab_height(bid: str, props: dict[str, str]) -> float | None:
-    if not bid.endswith("_slab") or props.get("waterlogged") != "false":
+    if bid not in _SLABS or props.get("waterlogged") != "false":
         return None
     if set(props) != {"type", "waterlogged"}:
         return None

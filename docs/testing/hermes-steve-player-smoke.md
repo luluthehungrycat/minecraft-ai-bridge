@@ -114,7 +114,9 @@ slabs support integer feet, bottom slabs support half-block feet, with the full
 1.8-block body checked by both A* and the actual walker. Stairs, carpets, snow,
 scaffolding, repeaters, pressure plates and other unmodeled partial geometry
 are conservatively refused. Support is limited to known full cubes and proven
-slabs; unknown blocks and failed/malformed state reads cannot establish safety.
+slabs from an explicit material allowlist; unknown blocks (including unfamiliar
+`*_slab` IDs) and failed/malformed state reads cannot establish safety. MCPQ SDK
+read errors preserve blocked/partial-progress results rather than discarding them.
 The walker rechecks each step; the read/check/teleport sequence is not atomic
 against players, other processes or world ticks. No #59 read optimization or
 cross-step cache is included. Future cognition (#61) still uses authoritative

@@ -116,7 +116,7 @@ examples and the conventions block at the top.
 - **config.yaml volume mount**: Mounted read-only at `/app/config.yaml`. Changes require `docker compose restart bridge`.
 
 ### Code Quality
-- **Tests**: 1152 tests collected in total — 1137 deterministic unit tests plus 15 integration tests (12 agent-loop, 2 MCP end-to-end, 1 Phase C gate). The 66 MCP adapter unit tests and both MCP end-to-end tests need the `mcp` extra (included in `[dev]`) and skip without it. Unit tests use `MockMcpqClient` for deterministic MCPQ simulation. Integration tests use a real MCPQ server + real LLM (OpenRouter `openai/gpt-oss-20b`, or Requesty `runware/gpt-oss-120b` when only `REQUESTY_API_KEY` is set; override with `INTEGRATION_LLM_MODEL`) for end-to-end validation. The stack uses pinned Paper 26.2 build 123. Run with `pytest tests/`.
+- **Tests**: 1157 tests collected in total — 1142 deterministic unit tests plus 15 integration tests (12 agent-loop, 2 MCP end-to-end, 1 Phase C gate). The 66 MCP adapter unit tests and both MCP end-to-end tests need the `mcp` extra (included in `[dev]`) and skip without it. Unit tests use `MockMcpqClient` for deterministic MCPQ simulation. Integration tests use a real MCPQ server + real LLM (OpenRouter `openai/gpt-oss-20b`, or Requesty `runware/gpt-oss-120b` when only `REQUESTY_API_KEY` is set; override with `INTEGRATION_LLM_MODEL`) for end-to-end validation. The stack uses pinned Paper 26.2 build 123. Run with `pytest tests/`.
 - **Mypy**: runs in CI on every push and PR (`mypy minecraft_ai_bridge/ --ignore-missing-imports`) and must pass.
 - **gRPC stubs are synchronous**: MCPQ generated stubs block; dispatched via `asyncio.to_thread`. Not ideal but works.
 - **RCON client is unmaintained**: Since the MCPQ migration, `rcon.py` isn't tested. Consider removing or marking deprecated.
@@ -142,7 +142,7 @@ Some LLMs (especially smaller/local ones) can't reliably output structured JSON 
 
 ### P0: None (Testing Complete)
 The 0.5.0 release completed the testing milestone:
-- **Unit tests** (1137): MockMcpqClient covers all 36 actions, observer parsing, memory, goal fallback plans, config, inventory manager, chat commands, pathfinding, the runtime action gate, the safety supervisor, the event journal, webhook delivery, and the local authorization service; profile-template and smoke-runner tests validate the optional Minecraft-only Hermes configuration and timeout sequencing
+- **Unit tests** (1142): MockMcpqClient covers all 36 actions, observer parsing, memory, goal fallback plans, config, chat commands, pathfinding, the runtime action gate, the safety supervisor, the event journal, webhook delivery, and the local authorization service; profile-template and smoke-runner tests validate the optional Minecraft-only Hermes configuration and timeout sequencing
 - **Integration tests** (12): Full think-act-observe loop with real MCPQ server + real LLM inference (OpenRouter `openai/gpt-oss-20b`). Covers teleport, exploration, disconnect handling, fallback decomposition, failure counting, memory recording, chat command stop, and inventory creation.
 - **Goal-verification assertions**: Integration tests verify agent behavior via:
   - `action_taken(orch, *names) → bool` — checks if the agent performed a specific action (parses `MemoryEntry.raw`)
@@ -219,7 +219,7 @@ The 0.5.0 release completed the testing milestone:
 | `docker-compose.yml` | Paper server + bridge services |
 | `docs/*.md` | Full documentation set |
 | `tests/conftest.py` | MockMcpqClient, MockLLMClient, test fixtures |
-| `tests/test_*.py` | Unit + integration tests (1152 total: 1137 unit + 15 integration) |
+| `tests/test_*.py` | Unit + integration tests (1157 total: 1142 unit + 15 integration) |
 | `profiles/steve-player/` | Secret-free v0.1.0 Minecraft-only Hermes template, SOUL and CLI-based installer |
 | `scripts/smoke-hermes-player.py` | Bounded real-profile trial runner; writes evidence outside the repository; refuses mob-sensitive trials unless the world is peaceful |
 | `scripts/reset-smoke-arena.py` | Operator-only reset and independent readback of the disposable smoke arena; changes difficulty only with `--difficulty` |
@@ -269,7 +269,7 @@ Helpers in `tests/test_integration.py`:
 | `tests/test_inventory_manager.py` | 12 | Inventory manager slot tracking |
 | `tests/test_pathfinding.py` | 11 | A* pathfinding, including negative fractional coordinates |
 | `tests/test_walk_to_geometry.py` | 25 | Walking arrival, swept body envelope, fractional head height, slab/half-block footing, corner and blocked-partial-walk regressions, route-derived step budget and exhaustion, requested-Y refusal |
-| `tests/test_state_aware_walking.py` | 72 | MCPQ state reads, fail-closed collision/support, slab surfaces, A* consistency, unknown geometry, per-step freshness and conservative door/gate orientation |
+| `tests/test_state_aware_walking.py` | 77 | MCPQ state reads, fail-closed collision/support, slab surfaces, A* consistency, unknown geometry, per-step freshness, SDK failures preserving partial progress, exception propagation and conservative door/gate orientation |
 | `tests/test_player_profile.py` | 3 | Secret-free player template, tool inventory and inference routes |
 | `tests/test_smoke_hermes_player.py` | 18 | Offline smoke-batch sequencing and abort after unresolved timeout; peaceful preflight for mob-sensitive trials only; arena reset commands and readback verification, strict inventory-count parsing |
 | `tests/test_orchestrator.py` | 8 | Orchestrator loop and wiring |
