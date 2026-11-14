@@ -106,9 +106,34 @@ A* previously permitted diagonal corner cutting and rounded negative fractional
 positions toward zero. Both have regressions and fixes. This is still a fixed-Y,
 teleport-simulated walker, not Minecraft client physics or a full movement-safety
 solution. The swept bounding box may refuse a physically clear diagonal; the
-inherited passability classifier also treats some collidable partial/transparent
-blocks (such as fences, doors and stained glass) as passable. Those limitations
-remain open rather than being advertised as physical collision safety.
+state-aware MCPQ checks added for #58 now refuse fences, walls, glass, panes,
+doors, trapdoors and gates. Open doors/trapdoors/gates are also refused: this
+bounded fix does not model their orientation-dependent collision boxes. Slabs
+need MCPQ `getBlockWithData` proof (`type` and `waterlogged=false`): top/double
+slabs support integer feet, bottom slabs support half-block feet, with the full
+1.8-block body checked by both A* and the actual walker. Stairs, carpets, snow,
+scaffolding, repeaters, pressure plates and other unmodeled partial geometry
+are conservatively refused. Support is limited to known full cubes and proven
+slabs; unknown blocks and failed/malformed state reads cannot establish safety.
+The walker rechecks each step; the read/check/teleport sequence is not atomic
+against players, other processes or world ticks. No #59 read optimization or
+cross-step cache is included. Future cognition (#61) still uses authoritative
+backend observations; a physical Mineflayer backend will own its handlers.
+
+An operator probe against disposable Paper 26.2 exercised 22 cases with fresh
+MCPQ position readback: fence/wall/pane/stained-glass barriers and a head-height
+slab refused movement; doors, trapdoors and gates were refused open and closed
+in north/east facings; top/double-slab routes at integer height and a bottom-slab
+route at half height succeeded (negative X coordinates). A* detoured around a
+pane, and a pane inserted after the first step stopped the next step with
+partial progress preserved. These calls used the real dispatcher and MCPQ
+adapter, not an LLM or the controller transport; controller/replay and unknown
+read cases remain covered by offline tests. Full directional/hinge coverage,
+negative-Y fixtures and a separate live stop/safety campaign were not run.
+The smoke arena was reset and independently verified afterwards. Evidence is
+outside the repository in `steve-player/issue58/probe.py`, `probe.log` and
+`results.json` under the local evidence directory described below. Historical
+results below describe earlier code and are not evidence for these changes.
 Directional `move_forward`/`move_back`/`sprint` handlers were not redesigned
 or qualified by this campaign.
 

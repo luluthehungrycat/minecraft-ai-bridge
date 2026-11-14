@@ -51,11 +51,11 @@ class Node:
 
 
 class Pathfinder:
-    """Grid-based pathfinder that queries block types via MCPQ.
+    """Grid-based pathfinder using the MCPQ walker's conservative state checks.
 
     The pathfinder operates on a 2D grid of (x, z) coordinates at a fixed
     Y-level (determined from the start position).  Every cell is checked
-    for walkability via three block queries (head, feet, below).
+    for full body clearance and proven support at the current feet height.
 
     Once the walkability grid is built, A* finds the shortest route from
     start to goal, respecting obstacles.
@@ -79,7 +79,7 @@ class Pathfinder:
         start_z: float,
         goal_x: float,
         goal_z: float,
-        y_level: int | None = None,
+        y_level: float | None = None,
     ) -> list[tuple[float, float]] | None:
         """Find a path from (start_x, start_z) to (goal_x, goal_z).
 
@@ -137,7 +137,7 @@ class Pathfinder:
             if pos is None:
                 logger.warning("Cannot determine Y-level for pathfinding")
                 return None
-            y_level = int(pos[1])
+            y_level = pos[1]
 
         # Scan walkability grid
         walkable, y_base = await self._scan_grid(
@@ -186,8 +186,8 @@ class Pathfinder:
         max_x: int,
         min_z: int,
         max_z: int,
-        y_level: int,
-    ) -> tuple[dict[tuple[int, int], bool], int] | tuple[None, None]:
+        y_level: float,
+    ) -> tuple[dict[tuple[int, int], bool], float] | tuple[None, None]:
         """Scan a rectangular area and return a walkability map.
 
         Returns
@@ -200,93 +200,25 @@ class Pathfinder:
         total = width * height
         logger.debug("Scanning %d×%d = %d blocks for pathfinding", width, height, total)
 
-        # Try multiple Y offsets if the initial level isn't walkable for the start
-        for y_offset in range(3):
-            result = await self._scan_at_y(min_x, max_x, min_z, max_z, y_level + y_offset)
-            if result is not None:
-                return result, y_level + y_offset
-
-        # Final attempt at original level
+        # This walker stays at the authoritative current feet height.
         result = await self._scan_at_y(min_x, max_x, min_z, max_z, y_level)
-        if result is not None:
-            return result, y_level
-        return None, None
+        return result, y_level
 
     async def _scan_at_y(
-        self,
-        min_x: int,
-        max_x: int,
-        min_z: int,
-        max_z: int,
-        y: int,
-    ) -> dict[tuple[int, int], bool] | None:
-        """Scan the grid at a fixed Y and return walkability."""
+        self, min_x: int, max_x: int, min_z: int, max_z: int, y: float
+    ) -> dict[tuple[int, int], bool]:
+        from ._mcpq_geometry import column_clear
 
-        # Build coordinate list
-        coords = []
-        for x in range(min_x, max_x + 1):
-            for z in range(min_z, max_z + 1):
-                coords.append((x, y, z))
-
-        # Fetch blocks in batches
-        head_map: dict[tuple[int, int], str] = {}
-        feet_map: dict[tuple[int, int], str] = {}
-        below_map: dict[tuple[int, int], str] = {}
-
-        try:
-            for i in range(0, len(coords), self._batch_size):
-                batch = coords[i : i + self._batch_size]
-                # Fire all 3 queries concurrently for the batch
-                heads = await asyncio.gather(
-                    *(self._safe_get_block(x, y + 1, z) for x, y, z in batch),
-                    return_exceptions=True,
-                )
-                feets = await asyncio.gather(
-                    *(self._safe_get_block(x, y, z) for x, y, z in batch),
-                    return_exceptions=True,
-                )
-                belows = await asyncio.gather(
-                    *(self._safe_get_block(x, y - 1, z) for x, y, z in batch),
-                    return_exceptions=True,
-                )
-
-                for (x, _, z), h, f, b in zip(batch, heads, feets, belows, strict=False):
-                    head_map[(x, z)] = str(h) if not isinstance(h, Exception) else "unknown"
-                    feet_map[(x, z)] = str(f) if not isinstance(f, Exception) else "unknown"
-                    below_map[(x, z)] = str(b) if not isinstance(b, Exception) else "unknown"
-        except Exception as exc:
-            logger.warning("Pathfinding grid scan failed: %s", exc)
-            return None
-
-        # Evaluate walkability
-        from .actions import _is_hazard, _is_passable
-
+        coords = [(x, z) for x in range(min_x, max_x + 1) for z in range(min_z, max_z + 1)]
         walkable: dict[tuple[int, int], bool] = {}
-        for x, z in head_map:
-            head = head_map[(x, z)]
-            feet = feet_map[(x, z)]
-            below = below_map[(x, z)]
-
-            # Player needs passable space at head and feet
-            if not _is_passable(head) or not _is_passable(feet):
-                walkable[(x, z)] = False
-                continue
-
-            # Hazard check
-            if _is_hazard(below) or _is_hazard(feet) or _is_hazard(head):
-                walkable[(x, z)] = False
-                continue
-
-            walkable[(x, z)] = True
-
+        for i in range(0, len(coords), self._batch_size):
+            batch = coords[i : i + self._batch_size]
+            results = await asyncio.gather(
+                *(column_clear(self._mc, x, y, z, support=True) for x, z in batch)
+            )
+            for coord, (clear, _) in zip(batch, results, strict=True):
+                walkable[coord] = clear
         return walkable
-
-    async def _safe_get_block(self, x: int, y: int, z: int) -> str:
-        """Get a block, returning 'unknown' on any error."""
-        try:
-            return await self._mc.get_block(x, y, z)
-        except Exception:
-            return "unknown"
 
     # ── A* algorithm ───────────────────────────────────────────────────
 
@@ -415,7 +347,7 @@ async def find_walk_path(
     start_z: float,
     goal_x: float,
     goal_z: float,
-    y_level: int | None = None,
+    y_level: float | None = None,
 ) -> list[tuple[float, float]] | None:
     """Convenience wrapper: create a Pathfinder and find a path."""
     finder = Pathfinder(mc)

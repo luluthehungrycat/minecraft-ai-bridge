@@ -336,6 +336,12 @@ class McpqClient:
         block = await self._run(self._mc.getBlock, Vec3(x, y, z))
         return str(block.name) if block else "unknown"
 
+    async def get_block_state(self, x: int, y: int, z: int) -> str:
+        """Return MCPQ's ID plus block data, without changing get_block's IDs."""
+        assert self._mc is not None
+        block = await self._run(self._mc.getBlockWithData, Vec3(x, y, z))
+        return str(block) if block is not None else "unknown"
+
     async def set_block(
         self,
         block_type: str,

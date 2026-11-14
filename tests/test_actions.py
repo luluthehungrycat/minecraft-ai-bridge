@@ -900,7 +900,7 @@ class TestHelpers:
         assert _is_passable("air") is True
         assert _is_passable("water") is True
         assert _is_passable("stone") is False
-        assert _is_passable("oak_fence") is True  # fences are walk-throughable in simplified model
+        assert _is_passable("oak_fence") is False  # collision blocks MCPQ walking
         assert _is_passable("grass") is True
         assert _is_passable("tall_grass") is True
         assert _is_passable("torch") is True

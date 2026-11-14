@@ -8,11 +8,17 @@ from minecraft_ai_bridge.minecraft.pathfinding import Pathfinder, find_walk_path
 from tests.conftest import MockMcpqClient
 
 
+def _supported_world() -> MockMcpqClient:
+    mc = MockMcpqClient()
+    mc.set_block_map({(x, 64, z): "stone" for x in range(-20, 41) for z in range(-20, 41)})
+    return mc
+
+
 class TestPathfinderFindPath:
     """Test the pathfinder's core path-finding capability."""
 
     async def test_negative_fractional_positions_use_containing_block(self):
-        mc = MockMcpqClient()
+        mc = _supported_world()
         path = await Pathfinder(mc).find_path(-0.5, -0.5, -4.5, -4.5, y_level=65)
         assert path is not None
         assert path[0] == (-0.5, -0.5)
@@ -21,9 +27,9 @@ class TestPathfinderFindPath:
     @pytest.mark.asyncio
     async def test_find_path_open_terrain(self) -> None:
         """Should find a direct straight-line path across open air."""
-        mc = MockMcpqClient()
+        mc = _supported_world()
         mc.set_position(0.0, 65.0, 0.0)
-        # Empty world = all air, free path
+        # Flat supported floor with clear body space
 
         finder = Pathfinder(mc, max_nodes=200)
         path = await finder.find_path(0.0, 0.0, 10.0, 10.0, y_level=65)
@@ -40,7 +46,7 @@ class TestPathfinderFindPath:
     @pytest.mark.asyncio
     async def test_find_path_around_wall(self) -> None:
         """Should navigate around a wall instead of walking through it."""
-        mc = MockMcpqClient()
+        mc = _supported_world()
         mc.set_position(0.0, 65.0, 0.0)
 
         # Build a wall from x=5 to x=6, z=3 to z=8 at y=65 (feet) and y=66 (head)
@@ -65,7 +71,7 @@ class TestPathfinderFindPath:
     @pytest.mark.asyncio
     async def test_no_path_impassable(self) -> None:
         """Should return None when the goal is completely walled off."""
-        mc = MockMcpqClient()
+        mc = _supported_world()
         mc.set_position(0.0, 65.0, 0.0)
 
         # Seal off the goal area with a solid box
@@ -82,7 +88,7 @@ class TestPathfinderFindPath:
     @pytest.mark.asyncio
     async def test_hazard_avoidance(self) -> None:
         """Should not path through hazardous blocks (lava, fire)."""
-        mc = MockMcpqClient()
+        mc = _supported_world()
         mc.set_position(0.0, 65.0, 0.0)
 
         # Place lava between start and goal
@@ -104,7 +110,7 @@ class TestPathfinderFindPath:
     @pytest.mark.asyncio
     async def test_mcpq_failure_handling(self) -> None:
         """Should handle MCPQ get_block failures gracefully."""
-        mc = MockMcpqClient()
+        mc = _supported_world()
         mc.set_position(0.0, 65.0, 0.0)
 
         # Patch get_block to raise on one coordinate
@@ -126,8 +132,9 @@ class TestPathfinderFindPath:
     @pytest.mark.asyncio
     async def test_no_y_level_provided(self) -> None:
         """Should auto-detect Y-level from player position."""
-        mc = MockMcpqClient()
+        mc = _supported_world()
         mc.set_position(12.0, 72.0, -5.0)
+        mc.set_block_map({(x, 71, z): "stone" for x in range(-10, 41) for z in range(-20, 21)})
 
         finder = Pathfinder(mc, max_nodes=200)
         path = await finder.find_path(12.0, -5.0, 20.0, 5.0)
@@ -142,7 +149,7 @@ class TestFindWalkPath:
     @pytest.mark.asyncio
     async def test_convenience_wrapper(self) -> None:
         """Should create a Pathfinder and find a path."""
-        mc = MockMcpqClient()
+        mc = _supported_world()
         mc.set_position(0.0, 65.0, 0.0)
 
         path = await find_walk_path(mc, 0.0, 0.0, 15.0, 15.0, y_level=65)
@@ -152,7 +159,7 @@ class TestFindWalkPath:
     @pytest.mark.asyncio
     async def test_pathfinder_reuse(self) -> None:
         """Multiple calls should work on the same Pathfinder instance."""
-        mc = MockMcpqClient()
+        mc = _supported_world()
         mc.set_position(0.0, 65.0, 0.0)
 
         finder = Pathfinder(mc, max_nodes=200)
@@ -172,7 +179,7 @@ class TestAStarEdgeCases:
     @pytest.mark.asyncio
     async def test_same_start_and_goal(self) -> None:
         """Start == goal should return a single-point path."""
-        mc = MockMcpqClient()
+        mc = _supported_world()
         mc.set_position(5.0, 65.0, 5.0)
 
         finder = Pathfinder(mc, max_nodes=100)
@@ -184,7 +191,7 @@ class TestAStarEdgeCases:
     @pytest.mark.asyncio
     async def test_diagonal_movement(self) -> None:
         """Should use diagonal moves for a more direct path."""
-        mc = MockMcpqClient()
+        mc = _supported_world()
         mc.set_position(0.0, 65.0, 0.0)
 
         finder = Pathfinder(mc, max_nodes=200)

@@ -71,7 +71,7 @@ async def test_walk_to_checks_full_head_height_at_fractional_y(mock_mc):
     mock_mc.set_position(*start)
     for x in range(-2, 4):
         await mock_mc.set_block("stone", x, 64, 0)
-        await mock_mc.set_block("stone_slab", x, 65, 0)
+        await mock_mc.set_block("stone_slab[type=bottom,waterlogged=false]", x, 65, 0)
     await mock_mc.set_block("bedrock", 1, 67, 0)
     result = await execute_action(mock_mc, ActionType.WALK_TO, {"x": 1.5, "y": 65.5, "z": 0.5})
     assert not result.success
@@ -83,7 +83,7 @@ async def test_walk_to_walks_along_slab_tops(mock_mc):
     mock_mc.set_position(0.5, 65.5, 0.5)
     for x in range(-2, 6):
         await mock_mc.set_block("air", x, 64, 0)
-        await mock_mc.set_block("oak_slab", x, 65, 0)
+        await mock_mc.set_block("oak_slab[type=bottom,waterlogged=false]", x, 65, 0)
     result = await execute_action(mock_mc, ActionType.WALK_TO, {"x": 3.5, "y": 65.5, "z": 0.5})
     assert result.success, result
     assert await mock_mc.get_player_pos() == pytest.approx((3.5, 65.5, 0.5))
@@ -107,7 +107,7 @@ async def test_walk_to_refuses_hazard_sharing_the_fractional_feet_cell(mock_mc):
     mock_mc.set_position(*start)
     for x in range(-2, 4):
         await mock_mc.set_block("stone", x, 64, 0)
-        await mock_mc.set_block("stone_slab", x, 65, 0)
+        await mock_mc.set_block("stone_slab[type=bottom,waterlogged=false]", x, 65, 0)
     await mock_mc.set_block("fire", 1, 65, 0)
     result = await execute_action(mock_mc, ActionType.WALK_TO, {"x": 2.5, "z": 0.5})
     assert not result.success
