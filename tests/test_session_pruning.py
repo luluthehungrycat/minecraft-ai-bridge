@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import threading
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -15,8 +16,39 @@ from minecraft_ai_bridge.runtime import (
     AuthzService,
     ControllerService,
 )
+from minecraft_ai_bridge.runtime import authz as authz_module
+from minecraft_ai_bridge.runtime import controller_service as controller_module
 from minecraft_ai_bridge.runtime.world_adapter import McpqWorldAdapter
 from tests.conftest import MockMcpqClient
+
+
+class _Clock:
+    """Lease time for these tests; it moves only when a test advances it.
+
+    Leases here are tens of milliseconds, so on a loaded machine real time
+    could expire a session before the call that opened it returned.
+    """
+
+    def __init__(self) -> None:
+        self.now = datetime.now(UTC)
+
+    def advance(self, seconds: float) -> None:
+        self.now += timedelta(seconds=seconds)
+
+
+@pytest.fixture(autouse=True)
+def clock(monkeypatch):
+    current = _Clock()
+
+    class _Datetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return current.now if tz is not None else current.now.replace(tzinfo=None)
+
+    # Authz and ControllerService read lease time only through datetime.now.
+    monkeypatch.setattr(authz_module, "datetime", _Datetime)
+    monkeypatch.setattr(controller_module, "datetime", _Datetime)
+    return current
 
 
 @pytest.fixture
@@ -55,14 +87,14 @@ def _chat(session, request_id: str = "req-1", *, generation: int | None = None):
     )
 
 
-async def test_sessions_stay_bounded_across_open_expire_cycles(setup):
+async def test_sessions_stay_bounded_across_open_expire_cycles(setup, clock):
     auth, world, _, token, _ = setup
     service = _service(auth, world, lease=0.02)
 
     for _ in range(25):
         await service.open_session(token)
         assert len(service._sessions) == 1
-        await asyncio.sleep(0.03)
+        clock.advance(0.03)
 
     # The last session expired without a new open; a request removes it.
     last = next(iter(service._sessions.values()))
@@ -127,12 +159,12 @@ async def test_valid_sessions_are_kept_when_a_request_is_refused(setup):
     assert ok.status is ActionStatus.SUCCEEDED
 
 
-async def test_an_entry_replaced_by_renewal_is_not_forgotten(setup):
+async def test_an_entry_replaced_by_renewal_is_not_forgotten(setup, clock):
     auth, world, _, token, _ = setup
     service = _service(auth, world)
     opened = await service.open_session(token)
     stale = service._sessions[opened.session_id]
-    await asyncio.sleep(0.01)
+    clock.advance(0.01)
     await service.renew_session(token, opened.session_id)
 
     # A request that raced the renewal validated the old lease and failed.
@@ -158,11 +190,11 @@ async def test_an_unverifiable_session_is_kept(setup, monkeypatch):
     assert session.session_id in service._sessions
 
 
-async def test_expired_sessions_are_swept_by_any_request(setup):
+async def test_expired_sessions_are_swept_by_any_request(setup, clock):
     auth, world, _, token, other = setup
     service = _service(auth, world, lease=0.02)
     session = await service.open_session(token)
-    await asyncio.sleep(0.03)
+    clock.advance(0.03)
 
     # A request that never reaches the policy still sweeps expired leases.
     result = await service.submit_action(other, _chat(session, "foreign"))
@@ -192,7 +224,7 @@ async def test_a_renewal_during_validation_is_not_forgotten(setup, monkeypatch):
 
 
 @pytest.mark.parametrize("invalidate", ["fence", "expiry"])
-async def test_a_late_open_does_not_evict_a_newer_session(setup, monkeypatch, invalidate):
+async def test_a_late_open_does_not_evict_a_newer_session(setup, monkeypatch, clock, invalidate):
     # Round-1 review of #35: an open whose response arrives after a newer
     # open completed must not replace the newer, still-valid session.
     auth, world, admin, older, newer = setup
@@ -215,7 +247,7 @@ async def test_a_late_open_does_not_evict_a_newer_session(setup, monkeypatch, in
         if invalidate == "fence":
             _fence(auth, admin)
         else:
-            await asyncio.sleep(0.25)
+            clock.advance(0.25)
         current = await service.open_session(newer)
         resume.set()
         await late
@@ -258,7 +290,9 @@ async def test_a_late_renewal_does_not_restore_a_dropped_session(setup, monkeypa
         await asyncio.gather(late, return_exceptions=True)
 
 
-async def test_pruning_during_a_renewal_does_not_lose_the_renewed_session(setup, monkeypatch):
+async def test_pruning_during_a_renewal_does_not_lose_the_renewed_session(
+    setup, monkeypatch, clock
+):
     # Round-2 review of #35: a request with the old lease prunes the entry
     # after the renewal committed but before it returned.
     auth, world, _, token, _ = setup
@@ -275,6 +309,7 @@ async def test_pruning_during_a_renewal_does_not_lose_the_renewed_session(setup,
         return fresh
 
     monkeypatch.setattr(auth, "renew_session", delayed_renew)
+    clock.advance(1)  # the renewal extends the lease past the old one
     pending = asyncio.create_task(service.renew_session(token, opened.session_id))
     try:
         assert await asyncio.to_thread(committed.wait, 5)
@@ -292,7 +327,7 @@ async def test_pruning_during_a_renewal_does_not_lose_the_renewed_session(setup,
         await asyncio.gather(pending, return_exceptions=True)
 
 
-async def test_a_close_that_loses_to_a_renewal_keeps_the_renewed_session(setup, monkeypatch):
+async def test_a_close_that_loses_to_a_renewal_keeps_the_renewed_session(setup, monkeypatch, clock):
     # #36: the close looked the session up with the old lease, then a renewal
     # committed before its release ran, so Authz refuses the stale release.
     auth, world, _, token, _ = setup
@@ -311,6 +346,7 @@ async def test_a_close_that_loses_to_a_renewal_keeps_the_renewed_session(setup, 
     closing = asyncio.create_task(service.close_session(token, opened.session_id))
     try:
         assert await asyncio.to_thread(looked_up.wait, 5)
+        clock.advance(1)  # the renewal extends the lease past the old one
         await service.renew_session(token, opened.session_id)
         resume.set()
         with pytest.raises(PermissionError, match="stale"):
