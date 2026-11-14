@@ -83,6 +83,12 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
 
 ### Changed
 
+- Dependencies are now pinned in a committed `uv.lock`. CI (lint, unit and
+  integration jobs) and the Docker image install from it with
+  `uv sync --locked`, which fails when the lock is out of date with
+  `pyproject.toml`; CI also runs `uv lock --check`. `pip install -e .` still
+  works for users and resolves the newest allowed versions. See
+  `docs/SETUP.md` for updating the lock.
 - `WorldAdapter` (the transport-independent backend protocol) no longer
   declares `run_as_player`, `run_command_blocking`, `teleport_player` or
   `set_block`. They moved to the MCPQ-only `McpqCommandAdapter`, which

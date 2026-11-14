@@ -147,6 +147,20 @@ For dev tools (testing, linting):
 pip install -e ".[dev]"
 ```
 
+CI and the Docker image install the exact versions pinned in `uv.lock`. To match
+them locally, use [uv](https://docs.astral.sh/uv/):
+
+```bash
+uv sync --locked --extra dev
+```
+
+#### Updating dependencies
+
+After changing dependencies in `pyproject.toml`, run `uv lock` and commit the
+updated `uv.lock` with it; CI and the Docker build fail with `--locked` while the
+lock is out of date. `uv lock --upgrade` (or `--upgrade-package <name>`) moves
+locked versions forward within the `pyproject.toml` ranges.
+
 ### Step 2: Configure
 
 ```bash
@@ -349,7 +363,7 @@ The bridge Docker image is built automatically by `docker compose`. To build man
 docker build -t minecraft-ai-bridge .
 ```
 
-The image uses `python:3.13-slim`, copies the package source, and installs via `pip install -e .`. The entrypoint is `minecraft-ai-bridge`.
+The image uses `python:3.13-slim` with a pinned `uv`, installs the dependencies pinned in `uv.lock` (`uv sync --locked`, no dev extras), then installs the package non-editable into `/app/.venv`. The entrypoint is `minecraft-ai-bridge`.
 
 ## Verifying the Setup
 
