@@ -83,6 +83,12 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
 
 ### Changed
 
+- MCPQ walking reads each swept-envelope cell once per movement step, with
+  at most eight concurrent state reads; A* reuses its per-column support read
+  without increasing its existing 25-column concurrency. This bounded #59 slice
+  retains fresh position reads, per-step geometry checks and independent final
+  readback. Cross-step caches and position reuse remain deferred. Dispatched
+  movement-read batches settle before cancellation or unknown outcomes propagate.
 - Dependencies are now pinned in a committed `uv.lock`. CI (lint, unit and
   integration jobs) and the Docker image install from it with
   `uv sync --locked`, which fails when the lock is out of date with

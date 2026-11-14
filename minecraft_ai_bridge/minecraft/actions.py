@@ -477,16 +477,21 @@ async def _walk_toward(
             # Conservatively check the bounding envelope of the 0.6-block-wide
             # body throughout the segment, not just its endpoint. This may
             # refuse a clear diagonal near a corner, but never skips that corner.
-            for bx in range(math.floor(min(pos[0], nx) - 0.3), math.ceil(max(pos[0], nx) + 0.3)):
-                for bz in range(
-                    math.floor(min(pos[2], nz) - 0.3), math.ceil(max(pos[2], nz) + 0.3)
-                ):
-                    from ._mcpq_geometry import column_clear
+            from ._mcpq_geometry import column_clear, read_step_states
 
-                    ok, reason = await column_clear(mc, bx, ny, bz)
-                    if not ok:
-                        return stopped(reason, blocked=True)
-            ok, reason = await column_clear(mc, math.floor(nx), ny, math.floor(nz), support=True)
+            columns = [
+                (bx, bz)
+                for bx in range(math.floor(min(pos[0], nx) - 0.3), math.ceil(max(pos[0], nx) + 0.3))
+                for bz in range(math.floor(min(pos[2], nz) - 0.3), math.ceil(max(pos[2], nz) + 0.3))
+            ]
+            states = await read_step_states(mc, columns, ny)
+            for bx, bz in columns:
+                ok, reason = await column_clear(mc, bx, ny, bz, states=states)
+                if not ok:
+                    return stopped(reason, blocked=True)
+            ok, reason = await column_clear(
+                mc, math.floor(nx), ny, math.floor(nz), support=True, states=states
+            )
             if not ok:
                 return stopped(reason, blocked=True)
             if _safety_interrupted():

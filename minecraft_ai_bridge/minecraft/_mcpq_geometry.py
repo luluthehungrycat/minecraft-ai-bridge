@@ -6,6 +6,7 @@ body cells and cannot prove footing. Reads are fresh; there is no world cache.
 
 from __future__ import annotations
 
+import asyncio
 import math
 import re
 
@@ -211,17 +212,32 @@ def provides_support(raw: str, feet_y: float) -> bool:
 
 
 async def column_clear(
-    mc: WorldAdapter, x: int, feet_y: float, z: int, *, support: bool = False
+    mc: WorldAdapter,
+    x: int,
+    feet_y: float,
+    z: int,
+    *,
+    support: bool = False,
+    states: dict[tuple[int, int, int], str] | None = None,
 ) -> tuple[bool, str]:
     """Check a whole 1.8-high body column, including tall geometry below it."""
+    if states is None:
+        states = {}
+
+    async def read(by: int) -> str:
+        key = (x, by, z)
+        if key not in states:
+            states[key] = await _read(mc, x, by, z)
+        return states[key]
+
     for by in range(math.floor(feet_y), math.ceil(feet_y + 1.8)):
-        block = await _read(mc, x, by, z)
+        block = await read(by)
         if not body_clear(block, by, feet_y):
             return (
                 False,
                 f"Head would be inside {block}" if by > feet_y else f"Feet would be inside {block}",
             )
-    below = await _read(mc, x, math.floor(feet_y) - 1, z)
+    below = await read(math.floor(feet_y) - 1)
     bid, props = _parse(below)
     if any(h in bid for h in ("lava", "fire")) or bid in {
         "cactus",
@@ -239,10 +255,50 @@ async def column_clear(
     ):
         return False, f"Unproven clearance above {below}"
     if support:
-        block = await _read(mc, x, support_cell_y(feet_y), z)
+        block = await read(support_cell_y(feet_y))
         if not provides_support(block, feet_y):
             return False, f"no ground support ({block})"
     return True, "passable"
+
+
+async def read_step_states(
+    mc: WorldAdapter, columns: list[tuple[int, int]], feet_y: float
+) -> dict[tuple[int, int, int], str]:
+    """Read one swept envelope, at most eight independent cells at a time.
+
+    Results belong only to the caller's current movement step. A* keeps its
+    existing column batching and does not call this helper (no nested fanout).
+    Both possible support cells are already in the body/below range.
+    """
+    coords = list(
+        dict.fromkeys(
+            (x, y, z)
+            for x, z in columns
+            for y in range(math.floor(feet_y) - 1, math.ceil(feet_y + 1.8))
+        )
+    )
+    states: dict[tuple[int, int, int], str] = {}
+    for offset in range(0, len(coords), 8):
+        batch = coords[offset : offset + 8]
+        reads = asyncio.gather(*(_read(mc, *coord) for coord in batch), return_exceptions=True)
+        try:
+            values = await asyncio.shield(reads)
+        except asyncio.CancelledError:
+            # Cancelling a to_thread await does not stop its dispatched SDK
+            # call. Keep the batch alive and join it, even on repeated cancel,
+            # before propagating cancellation. No later batch is dispatched.
+            while not reads.done():
+                try:
+                    await asyncio.shield(reads)
+                except asyncio.CancelledError:
+                    continue
+            reads.result()
+            raise
+        for coord, value in zip(batch, values, strict=True):
+            if isinstance(value, BaseException):
+                raise value
+            states[coord] = value
+    return states
 
 
 def support_cell_y(feet_y: float) -> int:
