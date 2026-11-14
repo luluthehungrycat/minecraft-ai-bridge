@@ -56,7 +56,8 @@
 - `contracts.py` — RFC-0001 Phase A contract schemas (Pydantic v2): SteveIdentity, ControllerSession, Capabilities, Task, Event, and the ActionRequestSchema/ActionResultSchema action envelope. Schema definitions only: strict IDs/statuses, timezone-aware timestamps; no authorization, persistence, event journal, task service, or MCP wiring (later phases). The Schema suffix avoids collision with the unchanged runtime ActionRequest/ActionResult dataclasses.
 
 ### Infrastructure
-- `Dockerfile` — `python:3.13-slim`, pip installs the package
+- `Dockerfile` — `python:3.13-slim` plus pinned uv; installs the exact dependency versions from `uv.lock` (`uv sync --locked`)
+- `uv.lock` — committed lockfile; CI and the Docker image install from it with `--locked`, which fails if it is stale. Run `uv lock` after changing dependencies.
 - `docker-compose.yml` — Paper server (pinned itzg Java 25 image with Paper 26.2 build 123) + bridge service. MCPQ on port 1789. Custom bot plugin mount. OPS env var with operator usernames. `MC_BIND_ADDRESS` sets the published-port host address.
 - `compose.podman.yml` — rootless Podman override (container-root UID/GID, `:Z` mounts); use with `MC_BIND_ADDRESS=127.0.0.1`
 - `scripts/download-plugins.sh` — downloads MCPQ v2.2 jar and builds the bot plugin

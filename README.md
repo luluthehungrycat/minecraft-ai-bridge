@@ -83,6 +83,14 @@ pip install -e ".[anthropic]"
 pip install -e ".[dev]"
 ```
 
+`pip` resolves the newest versions allowed by `pyproject.toml`. To get the exact
+versions CI and the Docker image use, install from the committed `uv.lock` with
+[uv](https://docs.astral.sh/uv/) instead:
+
+```bash
+uv sync --locked --extra dev   # creates .venv; run tools with `uv run pytest ...`
+```
+
 ### 3. Download the MCPQ Plugin
 
 ```bash
@@ -453,7 +461,7 @@ These helpers operate on in-memory Python dicts — essentially zero cost, no ex
 ### Running Tests
 
 ```bash
-# Install dev dependencies
+# Install dev dependencies (or `uv sync --locked --extra dev` for the locked versions)
 pip install -e ".[dev]"
 
 # All tests
