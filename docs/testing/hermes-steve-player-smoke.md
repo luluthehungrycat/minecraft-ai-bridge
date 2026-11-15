@@ -118,12 +118,36 @@ slabs from an explicit material allowlist; unknown blocks (including unfamiliar
 `*_slab` IDs) and failed/malformed state reads cannot establish safety. MCPQ SDK
 read errors preserve blocked/partial-progress results rather than discarding them.
 The walker rechecks each step; the read/check/teleport sequence is not atomic
-against players, other processes or world ticks. No #59 read optimization or
-cross-step cache is included. Future cognition (#61) still uses authoritative
+against players, other processes or world ticks. The bounded #59 optimization
+deduplicates state reads only within one movement step and reads independent
+cells in batches of at most eight. Each new step reads the world again; position
+reads and independent final readback remain unchanged. A* still batches at most
+25 columns, with support reusing a body/below read within that column; it does
+not nest the movement batching. Cancellation and backend-unknown outcomes wait
+for the dispatched movement batch to settle, including thread-backed SDK reads,
+before propagating. A stalled SDK read can therefore delay cancellation; this
+slice introduces no RPC deadline. The full conservative #58 geometry and known
+support checks remain in force. Cross-step/TTL caches, assumed teleport positions
+and position-read reduction are deliberately deferred, so #59 remains open.
+An operator live comparison on the same disposable 40-block corridor measured
+28.0 s / 4,676 state reads before this slice versus 17.9 s / 3,387 state reads
+afterwards (27.6% fewer reads). Both runs took 80 steps, retained 125 position
+reads, confirmed the same endpoint independently, and restored the corridor
+without readback mismatches. These are single runs on a shared host, not a
+statistical speedup estimate. Offline instrumentation separates movement reads
+(800 to 480) from A* reads (3,876 to 2,907); total live counts include both.
+The 22-case geometry probe also passed on this slice, including the obstacle
+inserted after the first step. The arena was reset and verified afterwards.
+Evidence is in `issue59/before.json`, `after.json`, `geometry-after.json`,
+`geometry-after.log` and `reset-after.json` under the local evidence directory.
+The benchmark's after-run HEAD identifies its base because the implementation
+was still uncommitted; the reviewed PR contains that measured source.
+Future cognition (#61) still uses authoritative
 backend observations; a physical Mineflayer backend will own its handlers.
 
-An operator probe against disposable Paper 26.2 exercised 22 cases with fresh
-MCPQ position readback: fence/wall/pane/stained-glass barriers and a head-height
+An operator probe against an earlier #58 candidate on disposable Paper 26.2
+exercised 22 cases with fresh MCPQ position readback:
+fence/wall/pane/stained-glass barriers and a head-height
 slab refused movement; doors, trapdoors and gates were refused open and closed
 in north/east facings; top/double-slab routes at integer height and a bottom-slab
 route at half height succeeded (negative X coordinates). A* detoured around a
@@ -136,6 +160,8 @@ The smoke arena was reset and independently verified afterwards. Evidence is
 outside the repository in `steve-player/issue58/probe.py`, `probe.log` and
 `results.json` under the local evidence directory described below. Historical
 results below describe earlier code and are not evidence for these changes.
+These earlier-candidate results do not qualify the final #58 candidate or this
+#59 optimization.
 Directional `move_forward`/`move_back`/`sprint` handlers were not redesigned
 or qualified by this campaign.
 
