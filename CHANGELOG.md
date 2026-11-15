@@ -103,6 +103,13 @@ section. This is enforced by the AGENTS.md "CHANGELOG.md" rule.
 
 ### Fixed
 
+- MCPQ walking and A* now share state-aware body clearance and proven slab
+  support: fences, walls, panes, glass, doors/trapdoors/gates (including open
+  states, conservatively), head-height slabs and unknown geometry cannot be
+  entered. Top/double slabs support integer feet; dry bottom slabs support
+  half-block feet. Failed state reads refuse movement; each step rechecks the
+  world. This remains fixed-height teleport simulation, not client physics (#58).
+
 - `walk_to` now walks its whole advertised 50-block range. Its step budget
   follows the route, including A* detours, instead of a fixed 50 half-block
   steps that stopped at 25 blocks; routes longer than 100 blocks are refused

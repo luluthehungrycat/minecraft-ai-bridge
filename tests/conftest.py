@@ -200,6 +200,10 @@ class MockMcpqClient:
     async def get_block(self, x: int, y: int, z: int) -> str:
         return self._block_map.get((x, y, z), "air")
 
+    async def get_block_state(self, x: int, y: int, z: int) -> str:
+        # Stored values may be MCPQ ID[state] strings. Bare IDs prove no slab state.
+        return await self.get_block(x, y, z)
+
     async def set_block(self, block_type: str, x: int, y: int, z: int) -> None:
         self._block_map[(int(x), int(y), int(z))] = block_type
         self._command_log.append(f"set_block {block_type} at ({x}, {y}, {z})")

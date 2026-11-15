@@ -243,57 +243,6 @@ def _food_value(item_id: str) -> tuple[float, float]:
     return _FOOD_LOOKUP.get(item_id.lower().replace("minecraft:", ""), (0.0, 0.0))
 
 
-_PASSABLE_BLOCKS: set[str] = {
-    "air",
-    "cave_air",
-    "void_air",
-    "grass",
-    "tall_grass",
-    "fern",
-    "large_fern",
-    "dead_bush",
-    "water",
-    "flowing_water",
-    "lava",
-    "flowing_lava",  # passable but hazardous!
-    "snow",
-    "vine",
-    "torch",
-    "wall_torch",
-    "soul_torch",
-    "redstone_torch",
-    "redstone_wire",
-    "repeater",
-    "comparator",
-    "lever",
-    "button",
-    "stone_button",
-    "oak_button",
-    "pressure_plate",
-    "stone_pressure_plate",
-    "oak_pressure_plate",
-    "rail",
-    "powered_rail",
-    "detector_rail",
-    "activator_rail",
-    "red_mushroom",
-    "brown_mushroom",
-    "dandelion",
-    "poppy",
-    "blue_orchid",
-    "oxeye_daisy",
-    "cornflower",
-    "lily_of_the_valley",
-    "wheat",
-    "carrots",
-    "potatoes",
-    "beetroots",
-    "nether_wart",
-    "cobweb",
-    "ladder",
-    "scaffolding",
-}
-
 _HAZARD_BLOCKS: set[str] = {
     "lava",
     "flowing_lava",
@@ -354,37 +303,10 @@ _STRUCTURE_BLOCKS: set[str] = {
 
 
 def _is_passable(block_id: str) -> bool:
-    """Check whether a block can be walked through."""
-    bid = block_id.lower().replace("minecraft:", "")
-    if bid in _PASSABLE_BLOCKS:
-        return True
-    # Any "air" variant is passable
-    if bid.endswith("air"):
-        return True
-    # Transparent blocks that don't block movement
-    passable_suffixes = (
-        "_slab",
-        "_stairs",
-        "_door",
-        "_trapdoor",
-        "_fence",
-        "_fence_gate",
-        "_wall",
-        "_sign",
-        "sign",
-        "_button",
-        "_plate",
-        "_carpet",
-        "_glass",
-        "_pane",
-        "_sapling",
-        "_seed",
-        "seed",
-        "_coral",
-        "_kelp",
-        "_seagrass",
-    )
-    return bid.endswith(passable_suffixes)
+    """Conservative body clearance for an entire cell (no partial footing)."""
+    from ._mcpq_geometry import body_clear
+
+    return body_clear(block_id, 0, 0)
 
 
 def _is_hazard(block_id: str) -> bool:
@@ -423,62 +345,9 @@ async def _can_move_to(
 
     Returns (can_occupy, reason) where reason describes any blockage.
     """
-    try:
-        head = await mc.get_block(x, y + 1, z)
-        feet = await mc.get_block(x, y, z)
-        below = await mc.get_block(x, y - 1, z)
+    from ._mcpq_geometry import column_clear
 
-        if not _is_passable(head):
-            return False, f"Head would be inside {head}"
-
-        if not _is_passable(feet):
-            return False, f"Feet would be inside {feet}"
-
-        if _is_hazard(below):
-            return False, f"Ground below is hazardous ({below})"
-
-        if _is_hazard(head) or _is_hazard(feet):
-            return False, f"Player would be inside hazard ({head or feet})"
-
-        return True, "passable"
-    except Exception as exc:
-        return False, f"Collision check failed: {exc}"
-
-
-# Partial blocks _is_passable lets the body enter but whose top carries a
-# player at half-block height (bottom slab, stairs). Block IDs carry no
-# block state, so a top slab cannot be told from a bottom slab.
-_HALF_BLOCK_SUPPORT_SUFFIXES = ("_slab", "_stairs")
-
-
-def _support_cell_y(feet_y: float) -> int:
-    """Return the Y of the cell whose top would carry feet at ``feet_y``.
-
-    Integer feet stand on the block below (``y - 1``). Fractional feet stand
-    on a partial block inside their own cell (``floor(y)``), such as a bottom
-    slab at ``y + 0.5``.
-    """
-    return math.floor(feet_y) - 1 if feet_y == math.floor(feet_y) else math.floor(feet_y)
-
-
-def _provides_support(block_id: str, feet_y: float) -> bool:
-    """Whether ``block_id`` in the support cell carries feet at ``feet_y``.
-
-    Block IDs are not collision shapes, so this is deliberately narrow:
-    integer feet need a non-passable block below; feet at exactly half a
-    block need a slab or stairs in their own cell. Any other fractional
-    height (carpet, snow layers, fence tops, mid-air) is refused rather than
-    guessed.
-    """
-    bid = block_id.lower().replace("minecraft:", "")
-    if _is_hazard(bid):
-        return False
-    fraction = feet_y - math.floor(feet_y)
-    if fraction == 0:
-        return not _is_passable(bid)
-    if fraction == 0.5:
-        return bid.endswith(_HALF_BLOCK_SUPPORT_SUFFIXES)
-    return False
+    return await column_clear(mc, x, y, z)
 
 
 # A walk follows at most this many blocks of route. Detours around obstacles
@@ -557,7 +426,7 @@ async def _walk_toward(
         try:
             from .pathfinding import find_walk_path
 
-            found = await find_walk_path(mc, px, pz, target_x, target_z, int(py))
+            found = await find_walk_path(mc, px, pz, target_x, target_z, py)
             if found and len(found) > 1:
                 waypoints = found
                 logger.info(
@@ -612,18 +481,14 @@ async def _walk_toward(
                 for bz in range(
                     math.floor(min(pos[2], nz) - 0.3), math.ceil(max(pos[2], nz) + 0.3)
                 ):
-                    ok, reason = await _can_move_to(mc, bx, math.floor(ny), bz)
+                    from ._mcpq_geometry import column_clear
+
+                    ok, reason = await column_clear(mc, bx, ny, bz)
                     if not ok:
                         return stopped(reason, blocked=True)
-                    # The integer-cell helper checks feet and the next cell.
-                    # At fractional Y, a 1.8-block body can reach a third cell.
-                    for by in range(math.floor(ny) + 2, math.ceil(ny + 1.8)):
-                        block = await mc.get_block(bx, by, bz)
-                        if not _is_passable(block) or _is_hazard(block):
-                            return stopped(f"Head would be inside {block}", blocked=True)
-            support = await mc.get_block(math.floor(nx), _support_cell_y(ny), math.floor(nz))
-            if not _provides_support(support, ny):
-                return stopped(f"no ground support ({support})", blocked=True)
+            ok, reason = await column_clear(mc, math.floor(nx), ny, math.floor(nz), support=True)
+            if not ok:
+                return stopped(reason, blocked=True)
             if _safety_interrupted():
                 return stopped(_INTERRUPTED_MESSAGE, interrupted=True)
             await mc.teleport_player(nx, ny, nz)

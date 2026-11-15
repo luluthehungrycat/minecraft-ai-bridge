@@ -89,6 +89,8 @@ class McpqCommandAdapter(WorldAdapter, Protocol):
     gets its own handler table instead (RFC-0001 Phase D spike, section 2).
     """
 
+    async def get_block_state(self, x: int, y: int, z: int) -> str: ...
+
     async def run_as_player(self, command: str) -> str: ...
 
     async def run_command_blocking(self, command: str) -> str: ...
@@ -169,6 +171,9 @@ class McpqWorldAdapter:
 
     async def teleport_player(self, x: float, y: float, z: float) -> None:
         await self._client.teleport_player(x, y, z)
+
+    async def get_block_state(self, x: int, y: int, z: int) -> str:
+        return await self._client.get_block_state(x, y, z)
 
     async def get_block(self, x: int, y: int, z: int) -> str:
         return await self._client.get_block(x, y, z)
