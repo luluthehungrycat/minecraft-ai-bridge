@@ -125,3 +125,33 @@ No automatic escalation between gates. A noteworthy social event is not evidence
 
 ## 11. Non-goals
 Do not force agents to form settlements, trade, democracy, hierarchies or war; do not anthropomorphize LLM actions as sentience; do not give access to broader Hermes/social networks by default; do not operate on public multiplayer servers without player consent; do not promise deterministic LLM outcomes or perfect causal inference.
+
+## Appendix A. Optional controller comparison
+
+**Status:** Proposed experiment for [#61](https://github.com/luluthehungrycat/minecraft-ai-bridge/issues/61). The first comparison uses one Steve. The multi-Steve and human-player gates in this RFC apply to any later studies.
+
+### Controller boundary
+
+Use the [RFC-0001 runtime](RFC-0001-harness-agnostic-agent-runtime.md) for every controller. Each Steve has one fenced strategic session. The controller consumes scoped observations and events through `ControllerService` or its MCP adapter, submits action requests through the same service, and receives action outcomes. `ActionService` retains execution authority. The independent safety supervisor can interrupt strategic work even while the controller is deliberating or disconnected. Backend choice and advertised capabilities belong to `WorldAdapter`.
+
+| Profile | Decision-making during play |
+| --- | --- |
+| Existing LLM agent | The built-in loop or a configured external harness chooses goals or actions. Pick one harness for each comparison arm and record its configuration. |
+| PIANO-inspired controller with an LLM | Per-Steve modules manage perception, memory, and action outcomes. An LLM selects or revises intentions from a bounded view of their outputs. Add social beliefs when the study has multiple Steves. |
+| PIANO-inspired controller with a symbolic planner | A utility policy and symbolic or hierarchical planner choose intentions and replan from structured observations and outcomes. Accept a human-authored structured goal or one translated by an LLM before play. |
+
+[Project Sid §2](https://arxiv.org/html/2411.00114v1#S2) motivates concurrent modules and selective information flow into a single deliberate decision-maker. Module scheduling, memory and belief representation, and intention selection are controller internals. Keep per-Steve beliefs distinct from observed game facts. For tracked actions, correlate intent and expected effects with the runtime outcome and fresh game observations. On interruption, partial progress, or an unknown outcome, reconcile observed state before replanning. Record unresolved effects as unknown.
+
+### First pilot and subsequent comparisons
+
+Use a single objective, such as surviving the first night through a fixed game-tick endpoint. Give a PIANO-inspired LLM controller and a symbolic controller the same validated structured goal, the same scoped observations and actions, and the same backend and safety policy. Reuse the same module outputs where both controllers can consume them. Treat any remaining differences in planner knowledge or inputs as limits on what the comparison can attribute to the decision-maker. The existing loop can be added as a reference arm. Comparing it against the modular LLM profile evaluates the complete profiles unless their other differences are controlled.
+
+Run separate episodes from reset worlds on matched seeds and starting conditions, including comparable spawn and inventory. Use a common game-tick horizon and action limits. Record controller-specific budgets and actual cost, including LLM calls and latency. Measure survival to the endpoint, independently verified milestones, action failures and interruptions, and recovery after an unexpected result. Log backend failures separately from controller failures. Version the controller, module and planner configuration, goal schema and payload, capability set, world settings, and seed in the run manifest.
+
+In a separate comparison, hold the symbolic planner and run conditions fixed and vary the source of the goal. Use the same schema for a human-authored goal and a goal translated once from natural language before the episode. Validate goals against the schema and available capabilities, record the source prompt and translator configuration when applicable, and freeze the resolved payload before starting. The symbolic arm should run with zero model calls during play. Identical payloads provide a check that the goal source has no effect at runtime.
+
+### Gameplay prerequisite and social experiment controls
+
+Use a mock backend or simulated MCPQ operations to test controller interchangeability, outcome reconciliation, and safety interruption. Before interpreting live runs as survival results, verify the real movement, harvesting, crafting, and combat capabilities required by [#61](https://github.com/luluthehungrycat/minecraft-ai-bridge/issues/61) on the same pinned backend for both arms. Refuse unavailable capabilities for measured survival runs. Mineflayer exposes signals such as `forcedMove` and `diggingAborted` and a crafting API, but the bridge still needs to verify the resulting positions and inventory changes. See the [backend roadmap](../../ROADMAP.md) and [Mineflayer API](https://github.com/PrismarineJS/mineflayer/blob/master/docs/api.md).
+
+For the later Walking Dead study, use the same minimal structured survival objective across controller profiles in the main comparison. Adding alliances, settlement goals, or social preferences during translation would change the treatment. Review resolved goals for this kind of priming and keep game rules, including permadeath and the episode’s PvP policy, under server or coordinator control. Record prompt framing, policy preferences, and communication affordances as experimental variables when they differ. Assess social outcomes using the server-observed measures in §6.
